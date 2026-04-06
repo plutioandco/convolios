@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-infra-connections"
+description = "Allows Unipile and Gemini connectivity check commands (keys read from .env.local on the host)."
+commands.allow = ["check_unipile_connection", "check_gemini_connection"]

@@ -1,0 +1,41 @@
+---
+description: Convolios project context — read this before any task
+globs: **/*
+alwaysApply: true
+---
+
+# Convolios — Project Context
+
+## What is this?
+Convolios is a desktop app (Tauri 2 + React) that merges all messaging channels into one AI-enriched inbox, organized by Person, not by App.
+
+## Read first
+- `PLAN.md` — the master plan. Stack, architecture, data model, build phases, everything.
+- `README.md` — product overview and feature spec.
+
+## Stack
+- **Shell:** Tauri 2 (Rust + React)
+- **Frontend:** React 19 + TypeScript + Tailwind + shadcn/ui + chatscope/chat-ui-kit-react
+- **State:** Zustand
+- **Auth:** Clerk
+- **DB:** Supabase (Postgres + pgvector)
+- **Messaging API:** Unipile (WhatsApp, LinkedIn, Instagram, Telegram, Email) + X API v2 + Slack Bolt + ClickUp API
+- **AI:** Gemini 2.5 Pro (triage, summaries, drafts) + Gemini Embedding 2 (semantic search)
+- **Scaffold:** Use `create-tauri-ui` (agmmnn/tauri-ui) for initial setup
+
+## Current phase
+**Phase 1 — Foundation.** Scaffold Tauri app, set up Supabase schema, Clerk auth, push to GitHub.
+
+## Secrets
+All secrets are in 1Password vault `P&Co — Convolios`. Use `op read` or `op inject` to access. NEVER hardcode secrets. Use `.env.local` (gitignored).
+
+## Key decisions
+- Dark mode first, "financial terminal" aesthetic
+- Never auto-send messages (ban risk) — AI drafts, human confirms
+- Partition messages table by user_id from day one
+- Abstract channel providers behind a `ChannelProvider` interface
+- Study Chatwoot (MIT, 22k⭐) for channel architecture patterns
+
+## Repo
+- GitHub: `github.com/plutioandco/convolios`
+- Local: `/Users/leo/Projects/convolios`

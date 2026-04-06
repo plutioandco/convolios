@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS messages (
   sent_at TIMESTAMPTZ NOT NULL,
   synced_at TIMESTAMPTZ DEFAULT now(),
   triage TEXT DEFAULT 'unclassified', -- 'urgent' | 'human' | 'newsletter' | 'notification' | 'noise'
-  embedding vector(3072)
+  embedding vector(2000)
 );
 
 CREATE INDEX IF NOT EXISTS messages_person_idx ON messages(person_id, sent_at DESC);
@@ -66,6 +66,8 @@ CREATE INDEX IF NOT EXISTS messages_user_triage_idx ON messages(user_id, triage,
 CREATE INDEX IF NOT EXISTS messages_channel_idx ON messages(user_id, channel, sent_at DESC);
 
 -- HNSW index for semantic search (cosine similarity)
+-- Note: pgvector HNSW supports max 2000 dimensions. Using 2000-dim embeddings.
+-- If using Gemini Embedding 2 (3072-dim), truncate or use IVFFlat index instead.
 CREATE INDEX IF NOT EXISTS messages_embedding_idx ON messages
   USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 

@@ -268,3 +268,19 @@ convolios/
 - **Name**: Convolios (The Conversation Operating System)
 - **Tone**: Human, professional, and "no-BS"
 - **Aesthetic**: Clean, high-contrast, dark mode by default — less "social app", more "financial terminal" for conversations
+
+---
+
+## Setup
+
+```bash
+npm install
+```
+
+## Scripts
+
+- `npm run build` — compile TypeScript to `dist/`
+- `npm run dev` — watch and recompile
+- `npm start` — run `dist/index.js`
+- `npm run typecheck` — type-check without emitting
+- `npm run clean` — remove `dist/`

@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- ============================================================
 CREATE TABLE IF NOT EXISTS persons (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id TEXT NOT NULL,              -- Convolios user (Supabase Auth UUID)
+  user_id TEXT NOT NULL,              -- Convolios user (Clerk ID)
   display_name TEXT NOT NULL,
   avatar_url TEXT,
   notes TEXT,
@@ -97,7 +97,7 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE connected_accounts ENABLE ROW LEVEL SECURITY;
 
 -- Policies: users can only access their own data
--- (user_id is the Supabase Auth UUID, passed via Supabase auth or service role)
+-- (user_id is the Clerk user ID, passed via Supabase auth or service role)
 
 CREATE POLICY "Users can view own persons"
   ON persons FOR SELECT

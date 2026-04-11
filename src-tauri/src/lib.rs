@@ -1159,7 +1159,7 @@ async fn resolve_chat(
   let sb_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
 
   let ident_url = format!(
-    "{sb_url}/rest/v1/identities?select=handle,channel&person_id=eq.{person_id}&channel=eq.{channel}&limit=1"
+    "{sb_url}/rest/v1/identities?select=handle,channel&person_id=eq.{person_id}&channel=eq.{channel}&handle=not.like.*%40g.us&limit=1"
   );
   let ident_resp = client.get(&ident_url)
     .header("apikey", &sb_key)

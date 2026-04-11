@@ -966,17 +966,18 @@ export function ThreadView() {
     setEditingMsg(null)
   }, [pid])
 
-  const scrollRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: 'auto' })
-  }, [thread.length, pid])
+    const el = scrollContainerRef.current
+    if (el) el.scrollTop = 0
+  }, [pid])
 
   if (!pid) return <EmptyState />
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: '#313338' }}>
-      <div className="chat-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+      <div ref={scrollContainerRef} className="chat-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column-reverse' }}>
         <div>
           {person && (
             <div style={{ padding: '16px 16px 0' }}>
@@ -1061,7 +1062,6 @@ export function ThreadView() {
               )
             })}
           </div>
-          <div ref={scrollRef} />
         </div>
       </div>
 

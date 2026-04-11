@@ -30,3 +30,7 @@ src-tauri/target
 
 # Supabase temp
 supabase/.temp
+
+# Shared rules (installed via plutioandco-handbook/setup.sh)
+.cursor/rules/implementation-standards.mdc
+.cursor/rules/review-checklist.mdc

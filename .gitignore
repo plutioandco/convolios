@@ -23,3 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 .env.local
+.env
+
+# Rust build artifacts
+src-tauri/target
+
+# Supabase temp
+supabase/.temp

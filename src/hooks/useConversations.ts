@@ -1,0 +1,148 @@
+import { useQuery } from '@tanstack/react-query'
+import _ from 'lodash'
+import { supabase } from '../lib/supabase'
+import { queryClient } from '../lib/queryClient'
+import type { ConversationPreview, Channel, Message, Person, TriageLevel } from '../types'
+
+function rowToPreview(row: Record<string, unknown>, userId: string): ConversationPreview {
+  const person: Person = {
+    id: row.person_id as string,
+    user_id: userId,
+    display_name: (row.display_name as string) ?? '',
+    avatar_url: null,
+    notes: (row.notes as string | null) ?? null,
+    ai_summary: (row.ai_summary as string | null) ?? null,
+    ai_summary_updated_at: null,
+    created_at: '',
+    updated_at: '',
+  }
+
+  const lastMessage: Message = {
+    id: row.last_message_id as string,
+    user_id: userId,
+    person_id: row.person_id as string,
+    identity_id: null,
+    external_id: (row.last_external_id as string | null) ?? null,
+    channel: row.last_channel as Channel,
+    direction: row.last_direction as 'inbound' | 'outbound',
+    message_type: (row.last_message_type as string) ?? 'individual',
+    subject: (row.last_subject as string | null) ?? null,
+    body_text: (row.last_body_text as string | null) ?? null,
+    body_html: null,
+    attachments: (row.last_attachments as unknown[]) ?? [],
+    thread_id: (row.last_thread_id as string | null) ?? null,
+    sender_name: (row.last_sender_name as string | null) ?? null,
+    reactions: [],
+    sent_at: row.last_sent_at as string,
+    synced_at: '',
+    triage: (row.last_triage as TriageLevel) ?? 'unclassified',
+    seen: (row.last_seen as boolean) ?? false,
+    delivered: (row.last_delivered as boolean) ?? false,
+    seen_by: null,
+    edited: false,
+    deleted: false,
+    hidden: false,
+    is_event: false,
+    event_type: null,
+    quoted_text: null,
+    quoted_sender: null,
+    provider_id: null,
+    chat_provider_id: null,
+    in_reply_to_message_id: null,
+    smtp_message_id: null,
+    unipile_account_id: null,
+    folder: null,
+    read_at: null,
+  }
+
+  return {
+    person,
+    lastMessage,
+    unreadCount: Number(row.unread_count) || 0,
+    prevInboundBody: null,
+    prevInboundSender: null,
+  }
+}
+
+function enrichPrevInbound(previews: ConversationPreview[], userId: string, batchMap: Record<string, Record<string, unknown>>): ConversationPreview[] {
+  return previews.map((c) => {
+    if (c.lastMessage.direction !== 'outbound') return c
+
+    const cached = queryClient.getQueryData<Message[]>(['thread', c.person.id, userId])
+    if (cached) {
+      const inbound = _.findLast(cached, (m) => m.direction === 'inbound')
+      if (inbound?.body_text) {
+        return { ...c, prevInboundBody: inbound.body_text, prevInboundSender: inbound.sender_name }
+      }
+    }
+
+    const fromBatch = batchMap[c.person.id]
+    if (fromBatch && _.isString(fromBatch.body_text)) {
+      return { ...c, prevInboundBody: fromBatch.body_text as string, prevInboundSender: (fromBatch.sender_name as string | null) ?? null }
+    }
+
+    return c
+  })
+}
+
+async function fetchConversations(userId: string): Promise<ConversationPreview[]> {
+  const { data: rows, error } = await supabase.rpc('get_conversations', { p_user_id: userId })
+
+  if (error) throw error
+  if (!rows?.length) return []
+
+  let previews = (rows as Record<string, unknown>[]).map((r) => rowToPreview(r, userId))
+
+  const personIds = previews.map((c) => c.person.id)
+
+  if (personIds.length > 0) {
+    const { data: persons } = await supabase
+      .from('persons')
+      .select('id,avatar_url')
+      .in('id', personIds)
+
+    if (persons) {
+      const avatarMap: Record<string, string> = {}
+      for (const p of persons) {
+        if (_.isString(p.avatar_url) && p.avatar_url.length > 10) {
+          avatarMap[p.id] = p.avatar_url
+        }
+      }
+      previews = previews.map((c) => {
+        const av = avatarMap[c.person.id]
+        return av ? { ...c, person: { ...c.person, avatar_url: av } } : c
+      })
+    }
+  }
+
+  const outboundPersonIds = previews
+    .filter((c) => c.lastMessage.direction === 'outbound')
+    .map((c) => c.person.id)
+
+  let batchMap: Record<string, Record<string, unknown>> = {}
+  if (outboundPersonIds.length > 0) {
+    const { data: inboundRows } = await supabase.rpc('get_prev_inbound_batch', {
+      p_user_id: userId,
+      p_person_ids: outboundPersonIds,
+    })
+    if (inboundRows) {
+      for (const row of inboundRows as Record<string, unknown>[]) {
+        batchMap[row.person_id as string] = row
+      }
+    }
+  }
+
+  previews = enrichPrevInbound(previews, userId, batchMap)
+
+  return previews
+}
+
+export function useConversations(userId: string | undefined, realtimeConnected?: boolean) {
+  const interval = realtimeConnected === false ? 8_000 : 30_000
+  return useQuery({
+    queryKey: ['conversations', userId],
+    queryFn: () => fetchConversations(userId!),
+    enabled: _.isString(userId),
+    refetchInterval: interval,
+  })
+}

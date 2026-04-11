@@ -56,9 +56,28 @@ export interface Message {
   body_html: string | null
   attachments: unknown[]
   thread_id: string | null
+  sender_name: string | null
+  reactions: { value?: string; emoji?: string; sender_id?: string; is_sender?: boolean }[]
   sent_at: string
   synced_at: string
   triage: TriageLevel
+  seen: boolean
+  seen_by: Record<string, boolean | string> | null
+  delivered: boolean
+  edited: boolean
+  deleted: boolean
+  hidden: boolean
+  is_event: boolean
+  event_type: string | null
+  quoted_text: string | null
+  quoted_sender: string | null
+  provider_id: string | null
+  chat_provider_id: string | null
+  in_reply_to_message_id: string | null
+  smtp_message_id: string | null
+  unipile_account_id: string | null
+  folder: string | null
+  read_at: string | null
 }
 
 export interface ConnectedAccount {
@@ -67,7 +86,15 @@ export interface ConnectedAccount {
   provider: string
   channel: Channel
   account_id: string | null
-  status: 'active' | 'disconnected' | 'expired'
+  status: 'active' | 'disconnected' | 'expired' | 'credentials' | 'error'
+  display_name: string | null
+  email: string | null
+  phone: string | null
+  username: string | null
+  avatar_url: string | null
+  provider_type: string | null
+  connection_params: Record<string, unknown>
+  last_synced_at: string | null
   created_at: string
   updated_at: string
 }
@@ -76,4 +103,6 @@ export interface ConversationPreview {
   person: Person
   lastMessage: Message
   unreadCount: number
+  prevInboundBody: string | null
+  prevInboundSender: string | null
 }

@@ -7,6 +7,9 @@
   ],
   "permissions": [
     "core:default",
-    "allow-infra-connections"
+    "shell:allow-open",
+    "allow-infra-connections",
+    "allow-account-management",
+    "deep-link:default"
   ]
 }

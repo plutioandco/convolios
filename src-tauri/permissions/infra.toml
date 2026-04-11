@@ -2,3 +2,8 @@
 identifier = "allow-infra-connections"
 description = "Allows Unipile and Gemini connectivity check commands (keys read from .env.local on the host)."
 commands.allow = ["check_unipile_connection", "check_gemini_connection"]
+
+[[permission]]
+identifier = "allow-account-management"
+description = "Allows Unipile account management, connect flow, webhook registration, and sync."
+commands.allow = ["fetch_unipile_accounts", "register_unipile_webhook", "create_connect_link", "sync_unipile_accounts", "disconnect_account", "startup_sync", "backfill_messages", "send_message", "send_attachment", "send_voice_message", "add_reaction", "edit_message", "fetch_attachment", "fetch_chat_avatars"]

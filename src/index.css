@@ -1,45 +1,69 @@
 @import "tailwindcss";
 
-:root {
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #12121a;
-  --bg-tertiary: #1a1a26;
-  --text-primary: #e4e4e7;
-  --text-secondary: #a1a1aa;
-  --text-muted: #52525b;
-  --accent: #6366f1;
-  --accent-hover: #818cf8;
-  --border: #27272a;
-  --success: #22c55e;
-  --warning: #eab308;
-  --danger: #ef4444;
-}
-
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body, #root {
   height: 100%;
-  background-color: var(--bg-primary);
-  color: var(--text-primary);
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #313338;
+  color: #dbdee1;
+  font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 1rem;
+  line-height: 1.375rem;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Scrollbar styling for the terminal aesthetic */
-::-webkit-scrollbar {
-  width: 6px;
+input, select, textarea, button { font: inherit; color: inherit; }
+button { border: none; background: none; cursor: pointer; }
+::selection { background: rgba(88, 101, 242, 0.3); }
+
+/* thin scrollbar for sidebar */
+.thin-scroll { scrollbar-width: none; overflow-y: auto; }
+.thin-scroll:hover { scrollbar-width: thin; }
+.thin-scroll::-webkit-scrollbar { width: 0; }
+.thin-scroll:hover::-webkit-scrollbar { width: 4px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: #1a1b1e; border-radius: 4px; }
+.thin-scroll::-webkit-scrollbar-track { background: transparent; }
+
+/* chat area scrollbar */
+.chat-scroll { overflow-y: scroll; scrollbar-color: #1a1b1e #2b2d31; }
+.chat-scroll::-webkit-scrollbar { width: 16px; }
+.chat-scroll::-webkit-scrollbar-track { background: #2b2d31; background-clip: padding-box; border: 4px solid transparent; border-radius: 8px; }
+.chat-scroll::-webkit-scrollbar-thumb { background: #1a1b1e; background-clip: padding-box; border: 4px solid transparent; border-radius: 8px; min-height: 40px; }
+
+/* avatar palette */
+.av-1 { background: #5865f2; }
+.av-2 { background: #eb459e; }
+.av-3 { background: #57f287; }
+.av-4 { background: #fee75c; color: #1e1f22 !important; }
+.av-5 { background: #ed4245; }
+.av-6 { background: #3ba55d; }
+.av-7 { background: #9b59b6; }
+.av-8 { background: #e67e22; }
+
+/* server rail pill */
+.guild-pill {
+  position: absolute; left: 0; width: 4px;
+  border-radius: 0 4px 4px 0; background: #fff;
+  transition: height .2s ease-out, opacity .2s ease-out;
 }
-::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+
+/* server icon */
+.guild-icon {
+  width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; transition: border-radius .2s ease-out, background .2s ease-out;
+  overflow: hidden; cursor: pointer;
 }
-::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 3px;
+.guild-icon:hover, .guild-icon.active { border-radius: 16px; }
+
+/* hover timestamp for compact messages */
+.msg-compact:hover .msg-hover-ts { opacity: 1; }
+
+/* recording pulse animation */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
 }
-::-webkit-scrollbar-thumb:hover {
-  background: var(--text-muted);
+
+.pulse-dot {
+  animation: pulse 1.2s ease-in-out infinite;
 }

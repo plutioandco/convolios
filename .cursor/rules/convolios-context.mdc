@@ -10,31 +10,39 @@ alwaysApply: true
 Convolios is a desktop app (Tauri 2 + React) that merges all messaging channels into one AI-enriched inbox, organized by Person, not by App.
 
 ## Read first
-- `PLAN.md` — the master plan. Stack, architecture, data model, build phases, everything.
-- `README.md` — product overview and feature spec.
+- `ARCHITECTURE.md` — full technical reference: data flows, schema, Tauri commands, Edge Functions, known issues.
+- `PLAN.md` — master plan with vision, channel support, build progress, and tech debt.
+- `README.md` — product overview, project structure, and setup instructions.
 
-## Stack
+## Stack (actual, as of April 2026)
 - **Shell:** Tauri 2 (Rust + React)
-- **Frontend:** React 19 + TypeScript + Tailwind + shadcn/ui + chatscope/chat-ui-kit-react
-- **State:** Zustand
-- **Auth:** Clerk
-- **DB:** Supabase (Postgres + pgvector)
-- **Messaging API:** Unipile (WhatsApp, LinkedIn, Instagram, Telegram, Email) + X API v2 + Slack Bolt + ClickUp API
-- **AI:** Gemini 2.5 Pro (triage, summaries, drafts) + Gemini Embedding 2 (semantic search)
-- **Scaffold:** Use `create-tauri-ui` (agmmnn/tauri-ui) for initial setup
+- **Frontend:** React 19 + TypeScript + Tailwind v4 (custom UI, no component library)
+- **State:** Zustand + @tauri-store/zustand (persistent)
+- **Data fetching:** React Query v5 + LocalStorage persistence
+- **Auth:** Supabase Auth (OTP magic link) — originally Clerk, pivoted
+- **DB:** Supabase (Postgres + pgvector + Realtime)
+- **Messaging API:** Unipile (direct REST from Rust, no SDK)
+- **AI:** Gemini 2.5 Flash (triage on ingest) + Gemini Embedding 2 (planned, not yet active)
+- **Deep linking:** tauri-plugin-deep-link (`convolios://auth`)
 
 ## Current phase
-**Phase 1 — Foundation.** Scaffold Tauri app, set up Supabase schema, Clerk auth, push to GitHub.
+**Phase 3 — Core UI (mostly complete).** Inbox, thread view, compose, settings all functional. Triage classification and filtering working. Semantic search, context briefs, and reply drafting not started.
 
 ## Secrets
 All secrets are in 1Password vault `P&Co — Convolios`. Use `op read` or `op inject` to access. NEVER hardcode secrets. Use `.env.local` (gitignored).
 
 ## Key decisions
-- Dark mode first, "financial terminal" aesthetic
+- **Single-user app** — always one user, never multi-tenant. Mobile app may come later but syncs the same account.
+- Dark mode first, Discord-inspired dark aesthetic
 - Never auto-send messages (ban risk) — AI drafts, human confirms
-- Partition messages table by user_id from day one
-- Abstract channel providers behind a `ChannelProvider` interface
-- Study Chatwoot (MIT, 22k⭐) for channel architecture patterns
+- Unipile is the sole messaging provider (no ChannelProvider abstraction yet)
+- All Unipile calls go through the Rust backend (not the frontend)
+- Webhooks are processed by Supabase Edge Functions (Deno)
+- Realtime updates via Supabase Realtime + fallback polling
+
+## Known issues
+- Embedding column is vector(2000) but Gemini outputs 3072-dim (irrelevant until embedding pipeline is built)
+- Base64 avatars stored in persons.avatar_url (works, bloats rows)
 
 ## Repo
 - GitHub: `github.com/plutioandco/convolios`

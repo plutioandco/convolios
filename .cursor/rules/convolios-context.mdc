@@ -10,8 +10,9 @@ alwaysApply: true
 Convolios is a desktop app (Tauri 2 + React) that merges all messaging channels into one AI-enriched inbox, organized by Person, not by App.
 
 ## Read first
-- `PLAN.md` — the master plan. Stack, architecture, data model, build phases, everything.
-- `README.md` — product overview and feature spec.
+- `ARCHITECTURE.md` — **start here.** Codebase patterns section at the top defines how things are built. Full reference below it.
+- `PLAN.md` — the master plan. Stack, data model, build phases, milestones.
+- `README.md` — product overview and setup instructions.
 
 ## Stack
 - **Shell:** Tauri 2 (Rust + React)

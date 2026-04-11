@@ -5,6 +5,68 @@ This document describes the actual implementation as it exists today. For the vi
 
 ---
 
+## Codebase Patterns
+
+**Read this section first.** It defines how things are built in this project. All new code must follow these patterns — do not invent new ones.
+
+### Component Patterns
+
+- **One feature per file** — `Sidebar.tsx`, `InboxList.tsx`, `ThreadView.tsx`, `Settings.tsx`. No deep component tree.
+- **Helper components live in the same file** as their parent — `GifPlayer`, `AttachmentMedia`, `ComposeBox` all live inside `ThreadView.tsx`.
+- **Named exports** for components: `export function Sidebar()`, not default exports (except `App`).
+- **Inline styles** for layout, colors, and spacing. Use the Discord-like palette: `#1e1f22` (darkest), `#2b2d31` (dark), `#313338` (base), `#3f4147` (border), `#5865f2` (accent blue), `#949ba4` (muted text), `#dbdee1` (body text), `#f2f3f5` (bright text).
+- **CSS classes** only for reusable behaviors: `thin-scroll`, `chat-scroll`, `guild-pill`, `guild-icon`, `av-1`–`av-8`, `msg-compact`, `pulse-dot`.
+- **Conditional rendering** uses `&&` (never `? : null`).
+- **Zustand selectors** pull one field per call: `useInboxStore((s) => s.activeChannel)`.
+
+### Scroll & Chat UI
+
+- **`flex-direction: column-reverse`** on chat scroll containers — the browser natively starts at the bottom and stays there as content loads. No JavaScript scroll management.
+- **`ResizeObserver` is not needed** — `column-reverse` handles async content growth (images, embeds).
+
+### Hook Patterns
+
+- **React Query for all server data** — conversations, threads, accounts. Zustand only for UI state (selection, filters).
+- **Query keys**: `['conversations', userId]`, `['thread', personId, userId]`.
+- **Fetching**: use `supabase.rpc()` for aggregations/lists, `supabase.from().select()` for simple reads.
+- **`enabled` guards**: use `_.isString(id)` (Lodash), not `typeof` or `!!`.
+- **Polling fallback**: `refetchInterval` switches between 8s (realtime down) and 30s (realtime healthy). Use `realtimeConnected` from `useRealtimeConnected()`.
+- **Optimistic updates**: `queryClient.setQueryData` to append/modify cache, then `invalidateQueries` on error to reconcile.
+
+### Rust IPC Patterns
+
+- **`#[tauri::command] async fn`** with `Result<T, String>` return type.
+- **All HTTP via `reqwest`** — shared client in `AppState` with connection pool.
+- **Unipile calls**: `X-API-KEY` header, base URL from env. `serde_json::Value` for parsing.
+- **Supabase from Rust**: direct REST to `/rest/v1/...` with `apikey` + `Authorization: Bearer <service_role>`. NOT the Supabase SDK.
+- **RPC from Rust**: `POST /rest/v1/rpc/{function_name}` with JSON body using `p_`-prefixed parameters.
+- **Error handling**: `.map_err(|e| format!("context: {e}"))` — errors become strings for the frontend.
+- **Pagination**: use `fetch_paginated()` for Unipile list endpoints (handles `items` + `cursor`).
+
+### Supabase Patterns
+
+- **Migration naming**: `NNN_snake_case_description.sql` (e.g. `005_conversations_rpc.sql`).
+- **RPC parameters**: always `p_`-prefixed (`p_user_id`, `p_person_id`).
+- **RPC functions**: `LANGUAGE sql`, `STABLE`, explicit `RETURNS TABLE(...)`.
+- **Edge Functions**: `Deno.serve`, `createClient` from `esm.sh/@supabase/supabase-js@2`, service role key from `Deno.env.get`.
+- **Auth on webhooks**: check `x-webhook-secret` header against env secret.
+
+### Type & Import Conventions
+
+- **Types**: single barrel in `src/types/index.ts`. Interfaces match DB column names.
+- **Utils**: single barrel in `src/utils/index.ts`. All display/channel helpers.
+- **Lodash**: `_.isString()`, `_.isArray()`, `_.isNil()` — never `typeof`, never `Array.isArray()`.
+- **Imports**: `from '../../types'`, `from '../../stores/inboxStore'`, `from '../../hooks/useThread'`. Path aliases not yet configured.
+
+### Styling Conventions
+
+- **Tailwind v4** is imported but not the primary layout system. Most layout is inline styles.
+- **Hex color palette** from Discord: use the constants above, do not introduce new colors.
+- **Hover states** use `onMouseEnter`/`onMouseLeave` mutating `e.currentTarget.style`.
+- **Scrollbars**: use `chat-scroll` for main scroll areas, `thin-scroll` for narrow sidebars.
+
+---
+
 ## Table of Contents
 
 1. [System Overview](#system-overview)

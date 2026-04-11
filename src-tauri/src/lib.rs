@@ -550,13 +550,19 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
       let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) == 1;
       let msg_type = if is_group { "group" } else { "dm" };
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
-      let display_name = if !chat_name.is_empty() { chat_name.to_string() } else { "Unknown".to_string() };
       let sender_handle_raw = chat.get("attendee_public_identifier")
         .or(chat.get("attendee_provider_id"))
         .or(chat.get("provider_id"))
         .and_then(|v| v.as_str())
         .unwrap_or(chat_id);
       let sender_handle = normalize_handle(sender_handle_raw, channel);
+      let display_name = if !chat_name.is_empty() {
+        chat_name.to_string()
+      } else if is_group {
+        "Group Chat".to_string()
+      } else {
+        sender_handle.clone()
+      };
 
       let person_resp = client
         .post(format!("{supabase_url}/rest/v1/rpc/backfill_find_or_create_person"))

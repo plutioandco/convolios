@@ -730,6 +730,13 @@ async function findOrCreatePerson(
     .single();
 
   if (existingIdentity) {
+    if (displayName && displayName !== "Unknown" && displayName !== "unknown") {
+      await supabase
+        .from("persons")
+        .update({ display_name: displayName })
+        .eq("id", existingIdentity.person_id)
+        .eq("display_name", "Unknown");
+    }
     return {
       personId: existingIdentity.person_id,
       identityId: existingIdentity.id,
@@ -754,6 +761,13 @@ async function findOrCreatePerson(
     .single();
 
   if (variantIdentity) {
+    if (displayName && displayName !== "Unknown" && displayName !== "unknown") {
+      await supabase
+        .from("persons")
+        .update({ display_name: displayName })
+        .eq("id", variantIdentity.person_id)
+        .eq("display_name", "Unknown");
+    }
     return {
       personId: variantIdentity.person_id,
       identityId: variantIdentity.id,

@@ -10,6 +10,7 @@ const CHANNELS: { id: Channel; label: string; abbr: string }[] = [
   { id: 'linkedin',  label: 'LinkedIn',  abbr: 'LI' },
   { id: 'instagram', label: 'Instagram', abbr: 'IG' },
   { id: 'telegram',  label: 'Telegram',  abbr: 'TG' },
+  { id: 'x',         label: 'X',         abbr: 'X'  },
 ]
 
 export function Sidebar() {

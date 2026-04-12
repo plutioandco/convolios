@@ -2,7 +2,8 @@ import { useState, useEffect, createContext, useContext, Component, useMemo } fr
 import type { ReactNode, ErrorInfo } from 'react'
 import { Routes, Route } from 'react-router-dom'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
-import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister'
+import { createAsyncStoragePersister } from '@tanstack/query-async-storage-persister'
+import { get, set, del } from 'idb-keyval'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Sidebar } from './components/sidebar/Sidebar'
@@ -20,10 +21,19 @@ import { channelLabel, channelColor, accountDisplayLabel } from './utils'
 import type { ConnectedAccount } from './types'
 import _ from 'lodash'
 
-const persister = createSyncStoragePersister({
-  storage: window.localStorage,
-  key: 'convolios-query-cache-v6',
+const persister = createAsyncStoragePersister({
+  storage: {
+    getItem: async (key) => {
+      const val = await get<string>(key)
+      return val ?? null
+    },
+    setItem: async (key, value) => { await set(key, value) },
+    removeItem: async (key) => { await del(key) },
+  },
+  key: 'convolios-query-cache-v7',
 })
+
+window.localStorage.removeItem('convolios-query-cache-v6')
 
 const RealtimeContext = createContext(true)
 export const useRealtimeConnected = () => useContext(RealtimeContext)
@@ -79,7 +89,16 @@ function App() {
 
   return (
     <ErrorBoundary>
-    <PersistQueryClientProvider client={queryClient} persistOptions={{ persister, maxAge: 24 * 60 * 60 * 1000 }}>
+    <PersistQueryClientProvider client={queryClient} persistOptions={{
+      persister,
+      maxAge: 24 * 60 * 60 * 1000,
+      dehydrateOptions: {
+        shouldDehydrateQuery: (query) => {
+          if (query.queryKey[0] === 'attachment') return false
+          return query.state.status === 'success'
+        },
+      },
+    }}>
       <div style={{ display: 'flex', width: '100%', height: '100vh', overflow: 'hidden', background: '#1e1f22' }}>
         {!user ? <SignInScreen /> : <Authenticated userId={user.id} />}
       </div>
@@ -260,7 +279,7 @@ function Authenticated({ userId }: { userId: string }) {
 
     const unlisten = listen('account-disconnected', () => {
       queryClient.clear()
-      window.localStorage.removeItem('convolios-query-cache-v6')
+      del('convolios-query-cache-v7').catch(() => {})
       useInboxStore.getState().selectPerson(null)
       fetchAccounts(userId)
     })

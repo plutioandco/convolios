@@ -15,6 +15,7 @@ const PROVIDERS = [
   { providers: ['INSTAGRAM'], label: 'Instagram',  desc: 'Sign in',  channel: 'instagram' },
   { providers: ['TELEGRAM'],  label: 'Telegram',   desc: 'QR code',  channel: 'telegram' },
   { providers: ['MICROSOFT'], label: 'Outlook',    desc: 'OAuth',    channel: 'email' },
+  { providers: ['X'],         label: 'X',          desc: 'OAuth',    channel: 'x' },
 ]
 
 export function Settings() {
@@ -35,6 +36,12 @@ export function Settings() {
   }, [user?.id, fetchAccounts])
 
   useEffect(() => { refresh() }, [refresh])
+
+  useEffect(() => {
+    const onFocus = () => refresh()
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [refresh])
 
   const sync = async () => {
     if (!user?.id) return
@@ -183,7 +190,7 @@ function Hint({ children }: { children: string }) {
 function ProviderCard({ providers, label, desc, channel, userId }: {
   providers: string[]; label: string; desc: string; channel: string; userId?: string
 }) {
-  const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'done' | 'err'>('idle')
+  const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err'>('idle')
   const accounts = useAccountsStore((s) => s.accounts)
   const countBefore = useRef(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -198,22 +205,37 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
     if (st !== 'waiting') return
     const current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     if (current > countBefore.current) {
-      setSt('done')
-      timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+      setSt('syncing')
+      if (userId) {
+        invoke<string>('backfill_messages', { userId }).then(() => {
+          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+        }).catch(() => {}).finally(() => {
+          setSt('done')
+          timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+        })
+      } else {
+        setSt('done')
+        timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+      }
     }
-  }, [st, accounts, channel])
+  }, [st, accounts, channel, userId])
 
   const go = async () => {
     if (!userId) return
     setSt('loading')
     countBefore.current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     try {
-      const url = import.meta.env.VITE_SUPABASE_URL
-      const link = await invoke<string>('create_connect_link', {
-        userId, providers,
-        notifyUrl: `${url}/functions/v1/unipile-account-callback`,
-        successRedirectUrl: null,
-      })
+      let link: string
+      if (channel === 'x') {
+        link = await invoke<string>('connect_x_account', { userId })
+      } else {
+        const url = import.meta.env.VITE_SUPABASE_URL
+        link = await invoke<string>('create_connect_link', {
+          userId, providers,
+          notifyUrl: `${url}/functions/v1/unipile-account-callback`,
+          successRedirectUrl: null,
+        })
+      }
       if (!link) throw new Error('No link')
       await open(link)
       setSt('waiting')
@@ -223,9 +245,10 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
     }
   }
 
-  const stColor = st === 'done' ? '#23a559' : st === 'err' ? '#ed4245' : st === 'waiting' ? '#f0b132' : '#949ba4'
+  const stColor = st === 'done' ? '#23a559' : st === 'err' ? '#ed4245' : st === 'waiting' || st === 'syncing' ? '#f0b132' : '#949ba4'
   const stText = st === 'loading' ? 'Opening...'
     : st === 'waiting' ? 'Waiting...'
+    : st === 'syncing' ? 'Syncing messages...'
     : st === 'done' ? 'Connected!'
     : st === 'err' ? 'Error' : desc
 

@@ -2,7 +2,7 @@ import { useRef, useEffect, useState, createElement, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import _ from 'lodash'
 import { useAuth } from '../../lib/auth'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
@@ -53,12 +53,14 @@ interface Attachment {
   size?: number | { width: number; height: number }
   voice_note?: boolean
   duration?: number
+  post?: { url?: string; author?: string; description?: string }
 }
 
 function attType(att: Attachment): string {
   if (att.gif || isGif(att)) return 'gif'
   const t = (att.type ?? '').toLowerCase()
   const mime = att.mimetype ?? att.mime_type ?? ''
+  if (t === 'media_share') return 'media_share'
   if (t === 'video' || t === 'vid' || mime.startsWith('video/')) return 'video'
   if (att.voice_note || t === 'ptt') return 'voicenote'
   if (t === 'audio' || mime.startsWith('audio/')) return 'audio'
@@ -137,22 +139,58 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
 }
 
 function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachment }) {
-  const [src, setSrc] = useState<string | null>(null)
-  const [err, setErr] = useState(false)
   const [lightbox, setLightbox] = useState(false)
   const kind = attType(att)
   const gif = isGif(att)
 
-  useEffect(() => {
-    if (!att.id || !messageId || att.unavailable) { setErr(true); return }
-    let cancelled = false
-    invoke<string>('fetch_attachment', { messageId, attachmentId: att.id })
-      .then((data) => { if (!cancelled) setSrc(data) })
-      .catch((e) => { if (import.meta.env.DEV) console.error('fetch_attachment failed:', messageId, att.id, e); if (!cancelled) setErr(true) })
-    return () => { cancelled = true }
-  }, [messageId, att.id, att.unavailable])
+  const { data: src, isLoading, isError } = useQuery({
+    queryKey: ['attachment', messageId, att.id],
+    queryFn: async () => {
+      const data = await invoke<string>('fetch_attachment', { messageId, attachmentId: att.id })
+      if (!data) throw new Error('empty')
+      return data
+    },
+    enabled: !!att.id && !!messageId && !att.unavailable && kind !== 'media_share',
+    staleTime: Infinity,
+    gcTime: 60 * 60_000,
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+    refetchOnWindowFocus: false,
+  })
 
-  if (err) {
+  if (kind === 'media_share' && att.post?.url) {
+    const author = att.post.author ?? ''
+    const desc = att.post.description ?? ''
+    return (
+      <a
+        href={att.post.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{
+          display: 'flex', flexDirection: 'column', gap: 4,
+          padding: '10px 14px', borderRadius: 8, background: '#2b2d31',
+          marginTop: 4, maxWidth: 320, textDecoration: 'none',
+          border: '1px solid #3f4147', transition: 'border-color .15s',
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#5865f2' }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#3f4147' }}
+      >
+        <span style={{ fontSize: 12, color: '#949ba4' }}>
+          {'\uD83D\uDD17'} {author ? `@${author}` : 'Shared post'}
+        </span>
+        {desc && <span style={{ fontSize: 13, color: '#dbdee1', lineHeight: 1.4 }}>
+          {desc.length > 120 ? `${desc.slice(0, 120)}...` : desc}
+        </span>}
+        <span style={{ fontSize: 11, color: '#5865f2', wordBreak: 'break-all' }}>
+          {att.post.url}
+        </span>
+      </a>
+    )
+  }
+
+  const unavailable = !att.id || att.unavailable
+
+  if (unavailable || isError) {
     const label = att.name ?? `${kind} attachment`
     const icon = kind === 'audio' ? '\uD83C\uDFB5' : kind === 'document' ? '\uD83D\uDCC4' : kind === 'video' ? '\uD83C\uDFAC' : '\uD83D\uDCCE'
     return (
@@ -166,7 +204,7 @@ function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachmen
     )
   }
 
-  if (!src) {
+  if (isLoading) {
     return (
       <div style={{
         width: 200, height: 100, borderRadius: 8, background: '#1e1f22',
@@ -714,7 +752,10 @@ function EmailBody({ msg }: { msg: Message }) {
 
 function MessageBody({ msg }: { msg: Message }) {
   const text = msg.body_text
-  const isUndisplayable = _.isString(text) && text.startsWith('-- Unipile cannot display')
+  const isUndisplayable = _.isString(text) && (
+    text.startsWith('-- Unipile cannot display') ||
+    text.toLowerCase().startsWith("unipile can't render")
+  )
   const isEmpty = !_.isString(text) || text.trim() === ''
   const attachments = parseAttachments(msg.attachments)
   const hasAttachments = attachments.length > 0
@@ -881,9 +922,11 @@ export function ThreadView() {
   const [editingMsg, setEditingMsg] = useState<Message | null>(null)
   const qc = useQueryClient()
 
-  const person = convos.find((c) => c.person.id === pid)?.person
+  const convo = convos.find((c) => c.person.id === pid)
+  const person = convo?.person
   const isGroup = thread.some((m) => m.message_type === 'group')
   const chatId = _.last(thread)?.thread_id
+    ?? convo?.lastMessage?.thread_id
 
   const mySenderNames = isGroup
     ? new Set([
@@ -1068,7 +1111,7 @@ export function ThreadView() {
         </div>
       </div>
 
-      <ComposeBox personId={pid} thread={thread} personName={person?.display_name} replyTo={replyTo} onClearReply={() => setReplyTo(null)} />
+      <ComposeBox personId={pid} thread={thread} chatId={chatId} convoLastMessage={convo?.lastMessage} personName={person?.display_name} replyTo={replyTo} onClearReply={() => setReplyTo(null)} />
     </div>
   )
 }
@@ -1266,8 +1309,8 @@ function MsgCompact({ msg, onReply, onEdit }: { msg: Message; onReply: (msg: Mes
   )
 }
 
-function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
-  personId: string; thread: Message[]; personName?: string
+function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, replyTo, onClearReply }: {
+  personId: string; thread: Message[]; chatId?: string; convoLastMessage?: Message; personName?: string
   replyTo: Message | null; onClearReply: () => void
 }) {
   const [text, setText] = useState('')
@@ -1285,8 +1328,8 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
   const qc = useQueryClient()
   const addOptimistic = useAddOptimisticMessage(personId, user?.id)
 
-  const last = _.last(thread)
-  const chatId = last?.thread_id
+  const last = _.last(thread) ?? convoLastMessage
+  const resolvedChatId = chatId ?? last?.thread_id
 
   const failedMessages = thread.filter((m) => m.id.startsWith('opt-') && sendErrors.current.has(m.id))
 
@@ -1307,6 +1350,14 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
     el.style.height = '0'
     el.style.height = Math.min(el.scrollHeight, 200) + 'px'
   }, [text])
+
+  useEffect(() => {
+    ref.current?.focus()
+  }, [personId])
+
+  useEffect(() => {
+    if (replyTo) ref.current?.focus()
+  }, [replyTo])
 
   const addFiles = (fileList: FileList | null) => {
     if (!fileList) return
@@ -1380,7 +1431,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
   }
 
   const sendVoice = async () => {
-    if (!chatId) return
+    if (!resolvedChatId) return
     const result = await stopRecording()
     if (!result) return
     const meta = {
@@ -1395,7 +1446,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
       id: optId, user_id: meta.userId, person_id: personId, identity_id: null,
       external_id: null, channel: last?.channel ?? 'whatsapp', direction: 'outbound',
       message_type: meta.messageType, subject: null, body_text: 'Voice message',
-      body_html: null, attachments: [{ type: 'ptt' }], thread_id: chatId,
+      body_html: null, attachments: [{ type: 'ptt' }], thread_id: resolvedChatId,
       sender_name: null, reactions: [], sent_at: new Date().toISOString(),
       synced_at: '', triage: 'unclassified', seen: false, seen_by: null,
       delivered: false, edited: false, deleted: false, hidden: false,
@@ -1405,7 +1456,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
     })
     try {
       await invoke('send_voice_message', {
-        chatId, voiceData: result.data, voiceMime: result.mime, ...meta,
+        chatId: resolvedChatId, voiceData: result.data, voiceMime: result.mime, ...meta,
       })
       qc.invalidateQueries({ queryKey: ['thread', personId] })
     } catch (e) {
@@ -1414,7 +1465,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
   }
 
   const sendText = (body: string) => {
-    if (!body || !chatId) return
+    if (!body || !resolvedChatId) return
 
     const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
 
@@ -1431,7 +1482,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
       body_text: body,
       body_html: null,
       attachments: [],
-      thread_id: chatId,
+      thread_id: resolvedChatId,
       sender_name: null,
       reactions: [],
       sent_at: new Date().toISOString(),
@@ -1468,7 +1519,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
 
     ;(async () => {
       try {
-        await invoke<string>('send_message', { chatId, text: body, ...meta })
+        await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         sendErrors.current.delete(optId)
         qc.invalidateQueries({ queryKey: ['thread', personId] })
       } catch (e) {
@@ -1483,7 +1534,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
 
   const send = () => {
     const body = text.trim()
-    if ((!body && files.length === 0) || !chatId) return
+    if ((!body && files.length === 0) || !resolvedChatId) return
 
     const filesToSend = [...files]
     const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
@@ -1501,7 +1552,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
       body_text: body || (filesToSend.length > 0 ? `Sending ${filesToSend.length} file(s)...` : null),
       body_html: null,
       attachments: [],
-      thread_id: chatId,
+      thread_id: resolvedChatId,
       sender_name: null,
       reactions: [],
       sent_at: new Date().toISOString(),
@@ -1545,7 +1596,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
         if (filesToSend.length > 0) {
           for (const f of filesToSend) {
             await invoke<string>('send_attachment', {
-              chatId,
+              chatId: resolvedChatId,
               text: body || null,
               fileName: f.name,
               fileData: f.data,
@@ -1554,7 +1605,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
             })
           }
         } else {
-          await invoke<string>('send_message', { chatId, text: body, ...meta })
+          await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         }
         sendErrors.current.delete(optId)
         qc.invalidateQueries({ queryKey: ['thread', personId] })
@@ -1594,7 +1645,7 @@ function ComposeBox({ personId, thread, personName, replyTo, onClearReply }: {
     }
   }
 
-  if (!chatId) {
+  if (!resolvedChatId) {
     return (
       <div style={{ padding: '0 16px 24px' }}>
         <div style={{ borderRadius: 8, padding: '11px 16px', background: '#383a40', color: '#949ba4', fontSize: 16 }}>

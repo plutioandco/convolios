@@ -20,7 +20,9 @@ pub fn run() {
         .pool_max_idle_per_host(5)
         .build()
         .expect("failed to build HTTP client");
-      app.manage(AppState { http: client });
+      app.manage(AppState {
+        http: client,
+      });
 
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -48,7 +50,8 @@ pub fn run() {
       edit_message,
       fetch_attachment,
       fetch_chat_avatars,
-      reconcile_chats
+      reconcile_chats,
+      connect_x_account
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -67,6 +70,14 @@ fn unipile_config() -> Result<(String, String), String> {
   let base = std::env::var("UNIPILE_API_URL")
     .map_err(|_| "UNIPILE_API_URL is not set".to_string())?;
   Ok((api_key, base.trim_end_matches('/').to_string()))
+}
+
+fn x_config() -> Result<(String, String), String> {
+  let client_id =
+    std::env::var("X_API_CLIENT_ID").map_err(|_| "X_API_CLIENT_ID is not set".to_string())?;
+  let client_secret =
+    std::env::var("X_API_CLIENT_SECRET").map_err(|_| "X_API_CLIENT_SECRET is not set".to_string())?;
+  Ok((client_id, client_secret))
 }
 
 async fn fetch_paginated(
@@ -623,6 +634,12 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
+  match backfill_x_dms(client, &user_id, &supabase_url, &service_key).await {
+    Ok((m, c)) if m > 0 => eprintln!("[startup_sync] X: {m} msgs from {c} chats"),
+    Err(e) => eprintln!("[startup_sync] X DM error: {e}"),
+    _ => {}
+  }
+
   let active_accounts: Vec<&UnipileAccount> = keep.iter()
     .filter(|a| a.status == "OK" || a.status == "RUNNING")
     .cloned()
@@ -645,7 +662,9 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
         let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
         rows.first()
           .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
-          .map(String::from)
+          .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
+            .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
+          .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
       }
       _ => None,
     };
@@ -774,12 +793,15 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
       };
 
       let msgs_url = match &msg_cutoff {
-        Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=20&after={ts}"),
+        Some(ts) => {
+          eprintln!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
+          format!("{base}/api/v1/chats/{chat_id}/messages?limit=20&after={ts}")
+        }
         None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=20"),
       };
       let messages = match fetch_paginated(client, &msgs_url, &api_key, 1).await {
-        Ok(m) => m,
-        Err(_) => continue,
+        Ok(m) => { if !m.is_empty() { eprintln!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
+        Err(e) => { eprintln!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
       };
 
       for msg in &messages {
@@ -847,6 +869,7 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
   let mut result = format!("Synced {synced} accounts");
   if !to_remove.is_empty() { result.push_str(&format!(", cleaned {}", to_remove.len())); }
   if msgs_synced > 0 { result.push_str(&format!(", backfilled {msgs_synced} msgs (24h)")); }
+
   eprintln!("[startup_sync] {result}");
   Ok(result)
 }
@@ -886,6 +909,7 @@ fn channel_from_type(t: &str) -> &'static str {
     "MAIL" | "GMAIL" | "GOOGLE" | "GOOGLE_OAUTH" => "email",
     "OUTLOOK" | "MICROSOFT" => "email",
     "IMAP" => "email",
+    "X" | "TWITTER" => "x",
     _ => "unknown",
   }
 }
@@ -1234,6 +1258,14 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
     }
   }
 
+  match backfill_x_dms(client, &user_id, &supabase_url, &service_key).await {
+    Ok((msgs, chats)) => {
+      total_messages += msgs;
+      total_chats += chats;
+    }
+    Err(e) => errors.push(format!("X DMs: {e}")),
+  }
+
   let mut result = format!("Backfilled {} messages from {} chats", total_messages, total_chats);
   if !errors.is_empty() {
     let first_errors: Vec<&str> = errors.iter().take(3).map(|s| s.as_str()).collect();
@@ -1255,6 +1287,13 @@ async fn send_message(
   typing_duration: Option<String>,
   state: State<'_, AppState>,
 ) -> Result<String, String> {
+  if channel == "x" {
+    return send_x_dm(
+      &state.http, &chat_id, &text, &user_id, &person_id,
+      account_id.as_deref(),
+    ).await;
+  }
+
   let (api_key, base) = unipile_config()?;
   let client = &state.http;
 
@@ -1613,6 +1652,457 @@ async fn send_voice_message(
   Ok(final_body)
 }
 
+// ─── X / TWITTER INTEGRATION ─────────────────────────────────────────────────
+
+fn generate_code_verifier() -> String {
+  let mut bytes = [0u8; 32];
+  getrandom::getrandom(&mut bytes).expect("failed to get random bytes");
+  base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+fn generate_code_challenge(verifier: &str) -> String {
+  use sha2::Digest;
+  let hash = sha2::Sha256::digest(verifier.as_bytes());
+  base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, hash)
+}
+
+fn generate_random_state() -> String {
+  let mut bytes = [0u8; 24];
+  getrandom::getrandom(&mut bytes).expect("failed to get random bytes");
+  base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+#[tauri::command]
+async fn connect_x_account(
+  user_id: String,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  let (client_id, _) = x_config()?;
+
+  let code_verifier = generate_code_verifier();
+  let code_challenge = generate_code_challenge(&code_verifier);
+  let oauth_state = generate_random_state();
+
+  let supabase_url = std::env::var("VITE_SUPABASE_URL")
+    .map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let sb_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+
+  let row = serde_json::json!({
+    "state": oauth_state,
+    "code_verifier": code_verifier,
+    "user_id": user_id,
+  });
+
+  let resp = state.http
+    .post(format!("{supabase_url}/rest/v1/x_oauth_state"))
+    .header("apikey", &sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .header("Content-Type", "application/json")
+    .json(&row)
+    .send()
+    .await
+    .map_err(|e| format!("Failed to store PKCE state: {e}"))?;
+
+  if !resp.status().is_success() {
+    let b = resp.text().await.unwrap_or_default();
+    return Err(format!("Failed to store PKCE state: {b}"));
+  }
+
+  let redirect_uri = format!("{supabase_url}/functions/v1/x-account-callback");
+  let scopes = "dm.read dm.write tweet.read users.read offline.access";
+  let auth_url = format!(
+    "https://twitter.com/i/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+    urlencoding::encode(&client_id),
+    urlencoding::encode(&redirect_uri),
+    urlencoding::encode(scopes),
+    urlencoding::encode(&oauth_state),
+    urlencoding::encode(&code_challenge),
+  );
+
+  Ok(auth_url)
+}
+
+async fn get_x_access_token(
+  client: &reqwest::Client,
+  sb_url: &str,
+  sb_key: &str,
+  user_id: &str,
+) -> Result<(String, String), String> {
+  let url = format!(
+    "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&status=eq.active&select=account_id,connection_params&limit=1"
+  );
+  let resp = client
+    .get(&url)
+    .header("apikey", sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .send()
+    .await
+    .map_err(|e| format!("X account lookup: {e}"))?;
+
+  let rows: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+  let row = rows.first().ok_or_else(|| "No active X account connected".to_string())?;
+
+  let params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let token = params.get("access_token").and_then(|v| v.as_str())
+    .ok_or_else(|| "No X access_token stored".to_string())?;
+  let account_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+  Ok((token.to_string(), account_id))
+}
+
+async fn refresh_and_store_x_token(
+  client: &reqwest::Client,
+  sb_url: &str,
+  sb_key: &str,
+  user_id: &str,
+) -> Result<(String, String), String> {
+  let url = format!(
+    "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&status=eq.active&select=account_id,connection_params&limit=1"
+  );
+  let resp = client
+    .get(&url)
+    .header("apikey", sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .send()
+    .await
+    .map_err(|e| format!("X account lookup for refresh: {e}"))?;
+
+  let rows: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+  let row = rows.first().ok_or_else(|| "No active X account for refresh".to_string())?;
+  let params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let refresh_token = params.get("refresh_token").and_then(|v| v.as_str())
+    .ok_or_else(|| "No refresh_token stored".to_string())?;
+  let account_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+
+  let (client_id, client_secret) = x_config()?;
+
+  let token_resp = client
+    .post("https://api.twitter.com/2/oauth2/token")
+    .basic_auth(&client_id, Some(&client_secret))
+    .form(&[
+      ("grant_type", "refresh_token"),
+      ("refresh_token", refresh_token),
+    ])
+    .send()
+    .await
+    .map_err(|e| format!("X token refresh failed: {e}"))?;
+
+  let status = token_resp.status();
+  let token_body: serde_json::Value = token_resp.json().await.unwrap_or_default();
+
+  if !status.is_success() {
+    return Err(format!("X token refresh error {status}: {token_body}"));
+  }
+
+  let new_access = token_body.get("access_token").and_then(|v| v.as_str())
+    .ok_or_else(|| "No access_token in refresh response".to_string())?;
+  let new_refresh = token_body.get("refresh_token").and_then(|v| v.as_str())
+    .unwrap_or(refresh_token);
+
+  let mut new_params = params.clone();
+  new_params["access_token"] = serde_json::Value::String(new_access.to_string());
+  new_params["refresh_token"] = serde_json::Value::String(new_refresh.to_string());
+
+  let update_url = format!(
+    "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&account_id=eq.{account_id}"
+  );
+  let _ = client
+    .patch(&update_url)
+    .header("apikey", sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({
+      "connection_params": new_params,
+      "updated_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .send()
+    .await;
+
+  Ok((new_access.to_string(), account_id.to_string()))
+}
+
+async fn x_authed_get(
+  client: &reqwest::Client,
+  url: &str,
+  sb_url: &str,
+  sb_key: &str,
+  user_id: &str,
+) -> Result<serde_json::Value, String> {
+  let (token, _) = get_x_access_token(client, sb_url, sb_key, user_id).await?;
+
+  let resp = client.get(url)
+    .header("Authorization", format!("Bearer {token}"))
+    .send().await.map_err(|e| format!("X API: {e}"))?;
+
+  if resp.status().as_u16() == 401 {
+    let (new_token, _) = refresh_and_store_x_token(client, sb_url, sb_key, user_id).await?;
+    let retry = client.get(url)
+      .header("Authorization", format!("Bearer {new_token}"))
+      .send().await.map_err(|e| format!("X API retry: {e}"))?;
+    if !retry.status().is_success() {
+      let b = retry.text().await.unwrap_or_default();
+      return Err(format!("X API error: {b}"));
+    }
+    return retry.json().await.map_err(|e| format!("X parse: {e}"));
+  }
+  if !resp.status().is_success() {
+    let s = resp.status();
+    let b = resp.text().await.unwrap_or_default();
+    return Err(format!("X API error {s}: {b}"));
+  }
+  resp.json().await.map_err(|e| format!("X parse: {e}"))
+}
+
+async fn send_x_dm(
+  client: &reqwest::Client,
+  dm_conversation_id: &str,
+  text: &str,
+  user_id: &str,
+  person_id: &str,
+  _account_id: Option<&str>,
+) -> Result<String, String> {
+  let sb_url = std::env::var("VITE_SUPABASE_URL")
+    .map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let sb_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+
+  let (access_token, _) = get_x_access_token(client, &sb_url, &sb_key, user_id).await?;
+
+  let url = format!(
+    "https://api.twitter.com/2/dm_conversations/{dm_conversation_id}/messages"
+  );
+  let payload = serde_json::json!({ "text": text });
+
+  let resp = client.post(&url)
+    .header("Authorization", format!("Bearer {access_token}"))
+    .header("Content-Type", "application/json")
+    .json(&payload)
+    .send().await
+    .map_err(|e| format!("X DM send failed: {e}"))?;
+
+  let status = resp.status();
+
+  if status.as_u16() == 401 {
+    let (new_token, _) = refresh_and_store_x_token(client, &sb_url, &sb_key, user_id).await?;
+    let retry = client.post(&url)
+      .header("Authorization", format!("Bearer {new_token}"))
+      .header("Content-Type", "application/json")
+      .json(&payload)
+      .send().await
+      .map_err(|e| format!("X DM retry failed: {e}"))?;
+
+    let s2 = retry.status();
+    let b2: serde_json::Value = retry.json().await.unwrap_or_default();
+    if !s2.is_success() {
+      return Err(format!("X DM error {s2}: {b2}"));
+    }
+    let event_id = b2.get("data")
+      .and_then(|d| d.get("dm_event_id"))
+      .and_then(|v| v.as_str()).unwrap_or("");
+    persist_outbound(
+      client, user_id, person_id, "x", "dm", text,
+      dm_conversation_id, event_id, &serde_json::json!([]), None,
+    ).await.unwrap_or_else(|e| eprintln!("[send_x_dm] persist: {e}"));
+    return Ok(serde_json::to_string(&b2).unwrap_or_default());
+  }
+
+  let body: serde_json::Value = resp.json().await.unwrap_or_default();
+  if !status.is_success() {
+    return Err(format!("X DM error {status}: {body}"));
+  }
+
+  let event_id = body.get("data")
+    .and_then(|d| d.get("dm_event_id"))
+    .and_then(|v| v.as_str()).unwrap_or("");
+  persist_outbound(
+    client, user_id, person_id, "x", "dm", text,
+    dm_conversation_id, event_id, &serde_json::json!([]), None,
+  ).await.unwrap_or_else(|e| eprintln!("[send_x_dm] persist: {e}"));
+
+  Ok(serde_json::to_string(&body).unwrap_or_default())
+}
+
+async fn backfill_x_dms(
+  client: &reqwest::Client,
+  user_id: &str,
+  sb_url: &str,
+  sb_key: &str,
+) -> Result<(u32, u32), String> {
+  let (_, my_x_id) = match get_x_access_token(client, sb_url, sb_key, user_id).await {
+    Ok(t) => t,
+    Err(_) => return Ok((0, 0)),
+  };
+
+  let dm_url = "https://api.twitter.com/2/dm_events?dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id&event_types=MessageCreate&max_results=100";
+  let dm_body = x_authed_get(client, dm_url, sb_url, sb_key, user_id).await?;
+
+  let events = dm_body.get("data")
+    .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+  if events.is_empty() {
+    return Ok((0, 0));
+  }
+
+  let mut convos: std::collections::HashMap<String, Vec<serde_json::Value>> =
+    std::collections::HashMap::new();
+  for event in &events {
+    let convo_id = event.get("dm_conversation_id")
+      .and_then(|v| v.as_str()).unwrap_or("");
+    if !convo_id.is_empty() {
+      convos.entry(convo_id.to_string()).or_default().push(event.clone());
+    }
+  }
+
+  let mut other_user_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+  let mut convo_other: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+  for (convo_id, msgs) in &convos {
+    let mut other_id = String::new();
+    for msg in msgs {
+      let sender = msg.get("sender_id").and_then(|v| v.as_str()).unwrap_or("");
+      if !sender.is_empty() && sender != my_x_id {
+        other_id = sender.to_string();
+        other_user_ids.insert(sender.to_string());
+        break;
+      }
+    }
+    if other_id.is_empty() {
+      let parts: Vec<&str> = convo_id.split('-').collect();
+      if parts.len() == 2 {
+        let cand = if parts[0] == my_x_id { parts[1] } else { parts[0] };
+        if !cand.is_empty() && cand != my_x_id {
+          other_id = cand.to_string();
+          other_user_ids.insert(cand.to_string());
+        }
+      }
+    }
+    if !other_id.is_empty() {
+      convo_other.insert(convo_id.clone(), other_id);
+    }
+  }
+
+  let user_ids_vec: Vec<&str> = other_user_ids.iter().map(|s| s.as_str()).collect();
+  let user_info: std::collections::HashMap<String, serde_json::Value> = if !user_ids_vec.is_empty() {
+    let ids_param = user_ids_vec.join(",");
+    let users_url = format!(
+      "https://api.twitter.com/2/users?ids={ids_param}&user.fields=name,username,profile_image_url"
+    );
+    match x_authed_get(client, &users_url, sb_url, sb_key, user_id).await {
+      Ok(body) => body.get("data").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|u| {
+          let id = u.get("id").and_then(|v| v.as_str())?;
+          Some((id.to_string(), u.clone()))
+        }).collect()
+      }).unwrap_or_default(),
+      Err(_) => std::collections::HashMap::new(),
+    }
+  } else {
+    std::collections::HashMap::new()
+  };
+
+  let mut total_msgs = 0u32;
+  let convo_count = convos.len() as u32;
+
+  for (convo_id, msgs) in &convos {
+    let other_id = match convo_other.get(convo_id) {
+      Some(id) => id,
+      None => continue,
+    };
+
+    let user = user_info.get(other_id);
+    let display_name = user
+      .and_then(|u| u.get("name").and_then(|v| v.as_str()))
+      .unwrap_or(other_id);
+    let username = user
+      .and_then(|u| u.get("username").and_then(|v| v.as_str()))
+      .unwrap_or("");
+    let handle = if !username.is_empty() { username.to_string() } else { other_id.clone() };
+
+    let person_url = format!("{sb_url}/rest/v1/rpc/backfill_find_or_create_person");
+    let person_resp = client
+      .post(&person_url)
+      .header("apikey", sb_key)
+      .header("Authorization", format!("Bearer {sb_key}"))
+      .header("Content-Type", "application/json")
+      .header("Accept", "application/vnd.pgrst.object+json")
+      .json(&serde_json::json!({
+        "p_user_id": user_id,
+        "p_channel": "x",
+        "p_handle": handle,
+        "p_display_name": display_name,
+        "p_unipile_account_id": my_x_id,
+      }))
+      .send()
+      .await;
+
+    let person_id = match person_resp {
+      Ok(r) if r.status().is_success() => {
+        let b: serde_json::Value = r.json().await.unwrap_or_default();
+        let pid = b.get("person_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if pid.is_empty() { continue; }
+        pid
+      }
+      _ => continue,
+    };
+
+    let avatar_url = user
+      .and_then(|u| u.get("profile_image_url").and_then(|v| v.as_str()));
+    if let Some(url) = avatar_url {
+      let _ = client
+        .patch(format!("{sb_url}/rest/v1/persons?id=eq.{person_id}"))
+        .header("apikey", sb_key)
+        .header("Authorization", format!("Bearer {sb_key}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "avatar_url": url }))
+        .send()
+        .await;
+    }
+
+    for msg in msgs {
+      let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+      if external_id.is_empty() { continue; }
+
+      let sender_id = msg.get("sender_id").and_then(|v| v.as_str()).unwrap_or("");
+      let direction = if sender_id == my_x_id { "outbound" } else { "inbound" };
+      let text = msg.get("text").and_then(|v| v.as_str());
+      let created_at = msg.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+
+      let row = serde_json::json!({
+        "user_id": user_id,
+        "person_id": person_id,
+        "external_id": external_id,
+        "channel": "x",
+        "direction": direction,
+        "message_type": "dm",
+        "body_text": text,
+        "attachments": [],
+        "thread_id": convo_id,
+        "sent_at": created_at,
+        "triage": "unclassified",
+      });
+
+      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
+      let msg_resp = client
+        .post(&msg_url)
+        .header("apikey", sb_key)
+        .header("Authorization", format!("Bearer {sb_key}"))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "resolution=merge-duplicates,return=minimal")
+        .json(&row)
+        .send()
+        .await;
+
+      if let Ok(r) = msg_resp {
+        if r.status().is_success() || r.status().as_u16() == 409 {
+          total_msgs += 1;
+        }
+      }
+    }
+  }
+
+  Ok((total_msgs, convo_count))
+}
+
 async fn persist_outbound(
   client: &reqwest::Client,
   user_id: &str,
@@ -1715,7 +2205,20 @@ async fn persist_outbound(
 }
 
 #[tauri::command]
-async fn fetch_attachment(message_id: String, attachment_id: String, state: State<'_, AppState>) -> Result<String, String> {
+async fn fetch_attachment(message_id: String, attachment_id: String, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+  let cache_dir = app.path().app_cache_dir().map_err(|e| format!("Cache dir error: {e}"))?
+    .join("attachments");
+  let cache_key = format!("{message_id}_{attachment_id}");
+  let cache_file = cache_dir.join(&cache_key);
+  let meta_file = cache_dir.join(format!("{cache_key}.meta"));
+
+  if cache_file.exists() && meta_file.exists() {
+    if let (Ok(bytes), Ok(ct)) = (std::fs::read(&cache_file), std::fs::read_to_string(&meta_file)) {
+      let b64 = base64_encode(&bytes);
+      return Ok(format!("data:{ct};base64,{b64}"));
+    }
+  }
+
   let (api_key, base) = unipile_config()?;
   let url = format!("{base}/api/v1/messages/{message_id}/attachments/{attachment_id}");
 
@@ -1738,6 +2241,18 @@ async fn fetch_attachment(message_id: String, attachment_id: String, state: Stat
     .to_string();
 
   let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
+
+  if bytes.is_empty() {
+    return Ok(String::new());
+  }
+
+  if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+    eprintln!("[attachment-cache] Failed to create cache dir: {e}");
+  } else {
+    let _ = std::fs::write(&cache_file, &bytes);
+    let _ = std::fs::write(&meta_file, &content_type);
+  }
+
   let b64 = base64_encode(&bytes);
   Ok(format!("data:{content_type};base64,{b64}"))
 }

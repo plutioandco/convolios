@@ -399,7 +399,7 @@ Edge Functions and Rust backend use the **service role key** which bypasses RLS.
 | `get_conversations(p_user_id)` | Returns one row per person with latest message, seen/delivered status, and real unread count based on `read_at IS NULL`. Prev-inbound stubbed to NULL (fetched separately via batch RPC). |
 | `get_prev_inbound_batch(p_user_id, p_person_ids)` | Batch fetch latest inbound message per person for outbound conversation previews. |
 | `mark_conversation_read(p_user_id, p_person_id)` | Sets `read_at = now()` on all unread inbound messages for a person. |
-| `backfill_find_or_create_person(...)` | Find or create a person + identity during backfill. Multi-step: exact handle → display name fallback → create new. Race-condition safe. |
+| `backfill_find_or_create_person(...)` | Find or create a person + identity during backfill. Handle-only matching (no display name fallback). Race-condition safe. EXECUTE revoked from frontend roles. |
 
 ---
 
@@ -500,9 +500,8 @@ The main webhook processor. 908 lines. Runs as a Supabase Edge Function (Deno).
 1. Normalize the sender handle (strip WhatsApp suffixes, lowercase, etc.)
 2. Look up identity by `(channel, handle)` scoped to user
 3. If not found: try variant handles (with/without `+`, WhatsApp phone normalization)
-4. If not found: try display name match on same channel for same user
-5. If not found: create new person + identity
-6. Return `{person_id, identity_id}`
+4. If not found: create new person + identity
+5. Return `{person_id, identity_id}`
 
 **Outbound Deduplication:**
 When a `message_received` event arrives, the webhook checks if it's actually an outbound message (sent by the user via Convolios) by looking for a message with the same `body_text`, `channel`, `user_id`, and `sent_at` within 90 seconds. If found, it updates the existing record with the Unipile `external_id` instead of creating a duplicate.
@@ -625,14 +624,14 @@ Supabase Realtime ──► React Frontend
 The realtime system has three layers of resilience:
 
 1. **Primary:** Supabase Realtime WebSocket subscription on `messages` table, filtered by `user_id`
-2. **Heartbeat:** Every 30 seconds, checks if silence exceeds 90s — if so, forces a query invalidation
-3. **Fallback polling:** If WebSocket disconnects and all retries fail, polls every 8 seconds
+2. **Heartbeat:** Supabase's built-in `heartbeatCallback` monitors connection health every 15s, auto-reconnects on `'disconnected'`. Web Worker (`worker: true`) prevents background tab throttling.
+3. **Fallback polling:** If WebSocket disconnects, polls every 8 seconds. After 2 minutes of continuous disconnection, shows "Live updates paused" banner with manual retry.
 
-**Retry logic:**
-- On error/timeout: delays `3s * 2^attempt` (capped at `3s * 32 = 96s`), max 8 retries
-- If all 8 retries fail: switches to permanent polling mode
+**Reconnection:**
+- Supabase Realtime has built-in auto-reconnect with exponential backoff (1s, 2s, 5s, 10s)
+- The `heartbeatCallback` in `src/lib/supabase.ts` explicitly calls `supabase.realtime.connect()` on disconnect as a fallback
 - On window focus: invalidates all queries
-- On network online: resets retry counter to 0
+- On network online: reconnects if not already connected
 
 **Cache invalidation:**
 - On `INSERT`: invalidates `['conversations', userId]` and `['thread', personId, userId]`
@@ -662,6 +661,12 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 | 014 | `014_merge_duplicate_persons.sql` | One-time fix: merge duplicate persons with same (user_id, display_name). |
 | 015 | `015_merge_fuzzy_duplicate_persons.sql` | One-time fix: merge fuzzy duplicates (e.g., "Sandro" vs "Sandro Kratz") with prefix matching on same channel. |
 | 016 | `016_restore_unread_count.sql` | Restore real `read_at`-based unread count in `get_conversations` RPC (was stubbed to 0 in migration 010). |
+| 017 | `017_avatar_storage_and_staleness.sql` | Add `avatar_stale`, `avatar_refreshed_at` columns to persons. Create `avatars` storage bucket with RLS. |
+| 018 | `018_cascade_delete_messages.sql` | Add `ON DELETE CASCADE` to messages `person_id` FK. |
+| 019 | `019_deletion_audit_log.sql` | Create `deletion_log` table for person deletion tracking. |
+| 020 | `020_rpc_include_avatar_url.sql` | Re-include `avatar_url` in `get_conversations` RPC (now short Storage URLs, not base64). Remove `SECURITY DEFINER`. |
+| 021 | `021_remove_name_based_matching.sql` | Remove dangerous display_name fallback from `backfill_find_or_create_person`. Handle-only matching. |
+| 022 | `022_harden_security_definer.sql` | Revoke EXECUTE on backfill RPC from frontend roles. Add `auth.uid()` validation to `mark_conversation_read`. |
 
 ---
 
@@ -671,7 +676,7 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 
 1. **Embedding dimension mismatch** — DB has `vector(2000)`, Gemini Embedding 2 outputs 3072-dim. Not relevant until the embedding pipeline is built. When it is: either use Gemini's `output_dimensionality` parameter to truncate, or alter the column.
 
-2. **Base64 avatars stored in `persons.avatar_url`** — Group chat avatars are fetched as binary, base64-encoded, and stored directly in the DB. This bloats row size. Consider Supabase Storage if it becomes slow.
+2. **Avatars stored in Supabase Storage** — Avatars are now stored in the `avatars` bucket in Supabase Storage as short URLs. `persons.avatar_url` contains the public URL (~100 chars). Staleness tracked via `avatar_stale` and `avatar_refreshed_at` columns.
 
 3. **No `ChannelProvider` abstraction** — PLAN.md called for abstracting Unipile behind a generic interface. Not implemented. Unipile is hardcoded in the Rust backend. Only matters if switching providers.
 

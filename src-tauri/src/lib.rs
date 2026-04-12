@@ -630,6 +630,26 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
 
   for acc in &active_accounts {
     let channel = channel_from_type(&acc.account_type);
+
+    let last_sync_resp = client
+      .get(format!(
+        "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&unipile_account_id=eq.{}&select=sent_at&order=sent_at.desc&limit=1",
+        acc.id
+      ))
+      .header("apikey", &service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .send().await;
+
+    let msg_cutoff = match last_sync_resp {
+      Ok(r) if r.status().is_success() => {
+        let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+        rows.first()
+          .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
+          .map(String::from)
+      }
+      _ => None,
+    };
+
     let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
     let chats = match fetch_paginated(client, &chats_url, &api_key, 5).await {
       Ok(c) => c,
@@ -753,7 +773,10 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
         std::collections::HashMap::new()
       };
 
-      let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=20");
+      let msgs_url = match &msg_cutoff {
+        Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=20&after={ts}"),
+        None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=20"),
+      };
       let messages = match fetch_paginated(client, &msgs_url, &api_key, 1).await {
         Ok(m) => m,
         Err(_) => continue,
@@ -1840,6 +1863,11 @@ async fn reconcile_chats(
     let remote_chat_ids: std::collections::HashSet<String> = remote_chats.iter()
       .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
       .collect();
+
+    if remote_chat_ids.is_empty() {
+      eprintln!("[reconcile] Skipping account {account_id}: Unipile returned 0 chats (API issue or empty account)");
+      continue;
+    }
 
     // Collect all distinct local chat_provider_ids for this account (paginated)
     let mut local_chat_ids = std::collections::HashSet::new();

@@ -4,10 +4,8 @@ import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
 import type { Message } from '../types'
 
-const HEARTBEAT_INTERVAL = 30_000
-const RECONNECT_DELAY = 3_000
-const MAX_RETRIES = 8
 const FALLBACK_POLL_INTERVAL = 8_000
+const DEAD_THRESHOLD = 120_000
 
 interface RealtimeState {
   connected: boolean
@@ -16,20 +14,20 @@ interface RealtimeState {
 }
 
 export function useRealtimeMessages(userId: string | undefined): RealtimeState {
-  const lastEventRef = useRef(Date.now())
-  const [attempt, setAttempt] = useState(0)
   const [connected, setConnected] = useState(false)
-  const dead = !_.isString(userId) ? false : attempt >= MAX_RETRIES
+  const [dead, setDead] = useState(false)
+  const disconnectedSince = useRef<number | null>(null)
 
-  const reconnect = useCallback(() => setAttempt(0), [])
+  const reconnect = useCallback(() => {
+    setDead(false)
+    disconnectedSince.current = null
+    supabase.realtime.connect()
+  }, [])
 
   useEffect(() => {
     if (!userId) return
 
-    let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let fallbackPoll: ReturnType<typeof setInterval> | null = null
-    let cleaned = false
 
     const invalidateAll = () => {
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
@@ -44,28 +42,20 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
 
     const startFallbackPolling = () => {
       if (fallbackPoll) return
-      fallbackPoll = setInterval(invalidateAll, FALLBACK_POLL_INTERVAL)
+      fallbackPoll = setInterval(() => {
+        invalidateAll()
+        if (disconnectedSince.current && Date.now() - disconnectedSince.current > DEAD_THRESHOLD) {
+          setDead(true)
+        }
+      }, FALLBACK_POLL_INTERVAL)
     }
 
     const stopFallbackPolling = () => {
       if (fallbackPoll) { clearInterval(fallbackPoll); fallbackPoll = null }
     }
 
-    if (attempt >= MAX_RETRIES) {
-      setConnected(false)
-      startFallbackPolling()
-      const onFocus = () => invalidateAll()
-      window.addEventListener('focus', onFocus)
-      return () => {
-        stopFallbackPolling()
-        window.removeEventListener('focus', onFocus)
-      }
-    }
-
-    const channelName = attempt === 0 ? 'messages-realtime' : `messages-realtime-${attempt}`
-
     const channel = supabase
-      .channel(channelName)
+      .channel('messages-realtime')
       .on<Message>(
         'postgres_changes',
         {
@@ -75,7 +65,6 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           filter: `user_id=eq.${userId}`,
         },
         (payload) => {
-          lastEventRef.current = Date.now()
           const msg = payload.new as Message
           if (import.meta.env.DEV) console.debug('[realtime] INSERT', msg.direction, msg.body_text?.slice(0, 30), msg.person_id)
           if (_.isString(msg.person_id)) {
@@ -93,7 +82,6 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           filter: `user_id=eq.${userId}`,
         },
         (payload) => {
-          lastEventRef.current = Date.now()
           const msg = payload.new as Message
           if (import.meta.env.DEV) console.debug('[realtime] UPDATE', msg.direction, msg.body_text?.slice(0, 30), msg.person_id)
           if (_.isString(msg.person_id)) {
@@ -103,55 +91,40 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
         }
       )
       .subscribe((status) => {
-        if (import.meta.env.DEV) console.debug('[realtime]', channelName, status)
+        if (import.meta.env.DEV) console.debug('[realtime] status', status)
 
         if (status === 'SUBSCRIBED') {
-          setAttempt(0)
           setConnected(true)
+          setDead(false)
+          disconnectedSince.current = null
           stopFallbackPolling()
-          heartbeatTimer = setInterval(() => {
-            const silent = Date.now() - lastEventRef.current
-            if (silent > HEARTBEAT_INTERVAL * 3) {
-              invalidateAll()
-              lastEventRef.current = Date.now()
-            }
-          }, HEARTBEAT_INTERVAL)
         }
 
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
           setConnected(false)
+          if (!disconnectedSince.current) disconnectedSince.current = Date.now()
           startFallbackPolling()
-          if (import.meta.env.DEV) console.warn('[realtime] channel error/timeout, reconnecting...', { attempt })
-          if (reconnectTimer) clearTimeout(reconnectTimer)
-          const delay = RECONNECT_DELAY * Math.min(2 ** attempt, 32)
-          reconnectTimer = setTimeout(() => {
-            if (cleaned) return
-            supabase.removeChannel(channel)
-            invalidateAll()
-            setAttempt((a) => a + 1)
-          }, delay)
         }
       })
 
     const onFocus = () => invalidateAll()
     const onOnline = () => {
       invalidateAll()
-      if (attempt > 0) setAttempt(0)
+      if (!supabase.realtime.isConnected()) {
+        supabase.realtime.connect()
+      }
     }
     window.addEventListener('focus', onFocus)
     window.addEventListener('online', onOnline)
 
     return () => {
-      cleaned = true
       debouncedInvalidateConvos.cancel()
       stopFallbackPolling()
-      if (heartbeatTimer) clearInterval(heartbeatTimer)
-      if (reconnectTimer) clearTimeout(reconnectTimer)
       supabase.removeChannel(channel)
       window.removeEventListener('focus', onFocus)
       window.removeEventListener('online', onOnline)
     }
-  }, [userId, attempt])
+  }, [userId])
 
   return { connected, dead, reconnect }
 }

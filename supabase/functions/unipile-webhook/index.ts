@@ -803,38 +803,6 @@ async function findOrCreatePerson(
     };
   }
 
-  // Fallback: match existing person by display name + channel to avoid name dupes
-  const { data: nameMatch } = await supabase
-    .from("identities")
-    .select("id, person_id")
-    .eq("channel", channel)
-    .eq("user_id", userId)
-    .eq("display_name", displayName)
-    .limit(1)
-    .single();
-
-  if (nameMatch) {
-    // Person exists but with a different handle — add this handle as a new identity
-    const { data: newIdent, error: newIdentErr } = await supabase
-      .from("identities")
-      .insert({
-        person_id: nameMatch.person_id,
-        channel,
-        handle: normalizedHandle,
-        display_name: displayName,
-        unipile_account_id: unipileAccountId,
-        user_id: userId,
-      })
-      .select("id")
-      .single();
-
-    if (newIdentErr || !newIdent) {
-      return { personId: nameMatch.person_id, identityId: nameMatch.id };
-    }
-
-    return { personId: nameMatch.person_id, identityId: newIdent.id };
-  }
-
   const { data: person, error: personError } = await supabase
     .from("persons")
     .insert({

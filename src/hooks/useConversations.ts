@@ -9,7 +9,7 @@ function rowToPreview(row: Record<string, unknown>, userId: string): Conversatio
     id: row.person_id as string,
     user_id: userId,
     display_name: (row.display_name as string) ?? '',
-    avatar_url: null,
+    avatar_url: (row.avatar_url as string | null) ?? null,
     notes: (row.notes as string | null) ?? null,
     ai_summary: (row.ai_summary as string | null) ?? null,
     ai_summary_updated_at: null,
@@ -92,28 +92,6 @@ async function fetchConversations(userId: string): Promise<ConversationPreview[]
   if (!rows?.length) return []
 
   let previews = (rows as Record<string, unknown>[]).map((r) => rowToPreview(r, userId))
-
-  const personIds = previews.map((c) => c.person.id)
-
-  if (personIds.length > 0) {
-    const { data: persons } = await supabase
-      .from('persons')
-      .select('id,avatar_url')
-      .in('id', personIds)
-
-    if (persons) {
-      const avatarMap: Record<string, string> = {}
-      for (const p of persons) {
-        if (_.isString(p.avatar_url) && p.avatar_url.length > 10) {
-          avatarMap[p.id] = p.avatar_url
-        }
-      }
-      previews = previews.map((c) => {
-        const av = avatarMap[c.person.id]
-        return av ? { ...c, person: { ...c.person, avatar_url: av } } : c
-      })
-    }
-  }
 
   const outboundPersonIds = previews
     .filter((c) => c.lastMessage.direction === 'outbound')

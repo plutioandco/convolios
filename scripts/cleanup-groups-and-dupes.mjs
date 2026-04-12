@@ -180,6 +180,9 @@ async function run() {
         .eq('person_id', dupe.id)
 
       if (leftoverMsgs === 0) {
+        for (const ext of ['jpg', 'png', 'webp']) {
+          await SB.storage.from('avatars').remove([`${dupe.id}.${ext}`])
+        }
         const { error: dErr } = await SB
           .from('persons')
           .delete()
@@ -263,6 +266,9 @@ async function run() {
           .delete()
           .eq('person_id', p.id)
         if (!dErr) {
+          for (const ext of ['jpg', 'png', 'webp']) {
+            await SB.storage.from('avatars').remove([`${p.id}.${ext}`])
+          }
           const { error: pErr2 } = await SB
             .from('persons')
             .delete()

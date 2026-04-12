@@ -1041,9 +1041,12 @@ export function ThreadView() {
 
               const isMe = isMine(msg, mySenderNames)
               const prevIsMe = prev ? isMine(prev, mySenderNames) : false
+              const msgIsGroup = msg.message_type === 'group'
+              const prevIsGroup = prev?.message_type === 'group'
               const sameGroup = !showDivider && prev && !isSystemEvent(prev) &&
                 isMe === prevIsMe &&
-                (isGroup
+                msgIsGroup === prevIsGroup &&
+                (msgIsGroup
                   ? (_.isString(prev.sender_name) && prev.sender_name === msg.sender_name)
                   : prev.person_id === msg.person_id) &&
                 (new Date(msg.sent_at).getTime() - new Date(prev.sent_at).getTime() <= 420_000)
@@ -1057,7 +1060,7 @@ export function ThreadView() {
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
                       : sameGroup
                         ? <MsgCompact msg={msg} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />
-                        : <MsgFull msg={msg} person={person} isGroup={isGroup} memberAvatars={memberAvatars} isMe={isMe} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />}
+                        : <MsgFull msg={msg} person={person} memberAvatars={memberAvatars} isMe={isMe} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />}
                 </div>
               )
             })}
@@ -1161,10 +1164,9 @@ function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: 
   )
 }
 
-function MsgFull({ msg, person, isGroup, memberAvatars, isMe, onReply, onEdit }: {
+function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
   msg: Message
   person?: { id: string; display_name: string; avatar_url?: string | null } | null
-  isGroup: boolean
   memberAvatars?: Record<string, string>
   isMe?: boolean
   onReply: (msg: Message) => void
@@ -1172,9 +1174,10 @@ function MsgFull({ msg, person, isGroup, memberAvatars, isMe, onReply, onEdit }:
 }) {
   const out = isMe ?? msg.direction === 'outbound'
   const hasSender = _.isString(msg.sender_name) && msg.sender_name.trim() !== ''
+  const msgIsGroup = msg.message_type === 'group'
   const rawName = out
     ? 'You'
-    : isGroup
+    : msgIsGroup
       ? (hasSender ? cleanSenderName(msg.sender_name!) : 'Member')
       : (person?.display_name ?? 'Unknown')
   const name = rawName
@@ -1183,7 +1186,7 @@ function MsgFull({ msg, person, isGroup, memberAvatars, isMe, onReply, onEdit }:
 
   const senderPic = out
     ? null
-    : isGroup && _.isString(msg.sender_name)
+    : msgIsGroup && _.isString(msg.sender_name)
       ? (memberAvatars?.[msg.sender_name] ?? memberAvatars?.[cleanSenderName(msg.sender_name)] ?? null)
       : person?.avatar_url ?? null
 

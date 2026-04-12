@@ -165,9 +165,6 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   console.log("webhook_payload", JSON.stringify({
     event: payload.event,
     account_type: payload.account_type,
-    account_info: payload.account_info,
-    sender: payload.sender,
-    attendees: payload.attendees,
     chat_id: payload.chat_id,
     message_id: payload.message_id,
   }));
@@ -195,7 +192,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   }
 
   const userId = account.user_id;
-  const isGroup = chatInfo.isGroup || (payload.attendees?.length ?? 0) >= 2;
+  const isGroup = chatInfo.isGroup || (payload.attendees?.length ?? 0) >= 3;
 
   const threadLookup = await resolvePersonFromThread(userId, payload.chat_id);
 
@@ -205,9 +202,19 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   let messageType: string;
 
   if (threadLookup) {
-    personId = threadLookup.person_id;
-    identityId = threadLookup.identity_id;
-    messageType = threadLookup.message_type;
+    if (isGroup) {
+      const groupHandle = chatInfo.provider_id ?? payload.chat_id;
+      const groupName = chatInfo.name ?? "Group Chat";
+      const result = await findOrCreatePerson(
+        userId, channel, groupHandle, groupName, payload.account_id
+      );
+      personId = result.personId;
+      identityId = result.identityId;
+    } else {
+      personId = threadLookup.person_id;
+      identityId = threadLookup.identity_id;
+    }
+    messageType = isGroup ? "group" : threadLookup.message_type;
 
     direction = resolveSenderDirection(fullMsg, payload);
   } else {
@@ -245,6 +252,28 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     );
     personId = result.personId;
     identityId = result.identityId;
+
+    // Mark avatar as stale if it hasn't been refreshed in 3+ days
+    const { data: personRow } = await supabase
+      .from("persons")
+      .select("avatar_refreshed_at")
+      .eq("id", personId)
+      .maybeSingle();
+
+    if (personRow) {
+      const refreshedAt = personRow.avatar_refreshed_at
+        ? new Date(personRow.avatar_refreshed_at).getTime()
+        : 0;
+      const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+      if (Date.now() - refreshedAt > threeDaysMs) {
+        // Fire-and-forget — marking stale is advisory, don't block webhook response
+        supabase
+          .from("persons")
+          .update({ avatar_stale: true })
+          .eq("id", personId)
+          .then(() => {});
+      }
+    }
   }
 
   // Content-based dedup for outbound messages.
@@ -551,11 +580,11 @@ async function handleMessageDeleted(payload: Record<string, unknown>): Promise<R
 
   const { error } = await supabase
     .from("messages")
-    .update({ deleted: true })
+    .delete()
     .eq("external_id", messageId);
 
   if (error) {
-    console.error("Delete update error:", error);
+    console.error("Message hard-delete error:", error);
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
@@ -686,7 +715,7 @@ async function fetchChatInfo(
     return {
       provider_id: data.provider_id ?? undefined,
       name: data.name ?? undefined,
-      isGroup: data.type === 1 || data.type === "group",
+      isGroup: (data.type ?? 0) >= 1,
       folder: data.folder ?? undefined,
       attendee_provider_id: data.attendee_provider_id ?? undefined,
     };

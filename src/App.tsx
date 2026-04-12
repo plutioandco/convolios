@@ -4,6 +4,7 @@ import { Routes, Route } from 'react-router-dom'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
 import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { Sidebar } from './components/sidebar/Sidebar'
 import { InboxList } from './components/inbox/InboxList'
 import { ThreadView } from './components/thread/ThreadView'
@@ -21,7 +22,7 @@ import _ from 'lodash'
 
 const persister = createSyncStoragePersister({
   storage: window.localStorage,
-  key: 'convolios-query-cache-v4',
+  key: 'convolios-query-cache-v6',
 })
 
 const RealtimeContext = createContext(true)
@@ -256,7 +257,18 @@ function Authenticated({ userId }: { userId: string }) {
     invoke('startup_sync', { userId }).catch((e: unknown) => {
       if (import.meta.env.DEV) console.warn('[startup_sync]', e)
     })
-    return () => unsubscribe()
+
+    const unlisten = listen('account-disconnected', () => {
+      queryClient.clear()
+      window.localStorage.removeItem('convolios-query-cache-v6')
+      useInboxStore.getState().selectPerson(null)
+      fetchAccounts(userId)
+    })
+
+    return () => {
+      unsubscribe()
+      unlisten.then((fn) => fn())
+    }
   }, [userId, fetchAccounts, subscribe, unsubscribe])
 
   return (

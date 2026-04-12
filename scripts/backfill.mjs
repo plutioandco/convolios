@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 const API = process.env.UNIPILE_API_URL || 'https://api4.unipile.com:13443'
 const KEY = process.env.UNIPILE_API_KEY
 const SB = createClient(process.env.VITE_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
-const USER_ID = 'user_3ByUlnK4ZqUy6gb7URDDRW30OBn'
+const USER_ID = '0ca4c58c-98b0-49a4-a7e2-876650228b85'
 
 const hdr = { 'X-API-KEY': KEY }
 
@@ -52,13 +52,24 @@ async function findOrCreatePerson(channel, handle, displayName, accountId) {
   return data
 }
 
-async function fetchAvatar(attId) {
+async function fetchAvatar(attId, personId) {
   try {
     const r = await fetch(`${API}/api/v1/chat_attendees/${attId}/picture`, { headers: hdr })
     if (!r.ok) return null
     const buf = Buffer.from(await r.arrayBuffer())
     if (!buf.length) return null
-    return `data:${r.headers.get('content-type') || 'image/jpeg'};base64,${buf.toString('base64')}`
+    const ct = r.headers.get('content-type') || 'image/jpeg'
+    const ext = ct.includes('png') ? 'png' : ct.includes('webp') ? 'webp' : 'jpg'
+    const objectPath = `${personId}.${ext}`
+
+    const { error } = await SB.storage.from('avatars').upload(objectPath, buf, {
+      contentType: ct,
+      upsert: true,
+    })
+    if (error) { console.error('  avatar upload error:', error.message); return null }
+
+    const { data: urlData } = SB.storage.from('avatars').getPublicUrl(objectPath)
+    return urlData?.publicUrl ?? null
   } catch { return null }
 }
 
@@ -83,7 +94,7 @@ async function run() {
     for (const chat of chats) {
       const chatId = chat.id
       if (!chatId) continue
-      const isGroup = chat.type === 1
+      const isGroup = (chat.type ?? 0) >= 1
       const chatName = chat.name || ''
 
       let displayName, handle, otherAttendeeId = null
@@ -126,9 +137,13 @@ async function run() {
       totalPersons++
 
       if (!isGroup) {
-        const avatar = await fetchAvatar(otherAttendeeId)
+        const avatar = await fetchAvatar(otherAttendeeId, person_id)
         if (avatar) {
-          await SB.from('persons').update({ avatar_url: avatar }).eq('id', person_id)
+          await SB.from('persons').update({
+            avatar_url: avatar,
+            avatar_stale: false,
+            avatar_refreshed_at: new Date().toISOString(),
+          }).eq('id', person_id)
         }
       }
 
@@ -139,7 +154,8 @@ async function run() {
         const gAttResp = await fetch(`${API}/api/v1/chat_attendees?chat_id=${chatId}`, { headers: hdr })
         const gAttData = await gAttResp.json()
         for (const a of (gAttData.items || [])) {
-          if (a.id && a.name) attendeeMap[a.id] = a.name
+          const name = a.name || a.public_identifier || a.provider_id
+          if (a.id && name) attendeeMap[a.id] = name
         }
       }
 

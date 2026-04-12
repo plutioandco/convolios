@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::time::Duration;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
   http: reqwest::Client,
@@ -47,7 +47,8 @@ pub fn run() {
       add_reaction,
       edit_message,
       fetch_attachment,
-      fetch_chat_avatars
+      fetch_chat_avatars,
+      reconcile_chats
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -441,10 +442,45 @@ async fn sync_unipile_accounts(user_id: String, state: State<'_, AppState>) -> R
   Ok(msg)
 }
 
+/// Delete a person and all associated data: Storage avatar, person row
+/// (CASCADE deletes messages + identities), and log the deletion.
+async fn purge_person(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  person_id: &str,
+  user_id: &str,
+) {
+  delete_avatar(client, supabase_url, service_key, person_id).await;
+
+  let _ = client
+    .delete(format!(
+      "{supabase_url}/rest/v1/persons?id=eq.{person_id}"
+    ))
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .send()
+    .await;
+
+  let _ = client
+    .post(format!("{supabase_url}/rest/v1/deletion_log"))
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({
+      "user_id": user_id,
+      "action": "person_deleted",
+      "target_id": person_id
+    }))
+    .send()
+    .await;
+}
+
 #[tauri::command]
 async fn disconnect_account(
   account_id: String,
   user_id: String,
+  app_handle: tauri::AppHandle,
   state: State<'_, AppState>,
 ) -> Result<String, String> {
   let (api_key, base) = unipile_config()?;
@@ -454,30 +490,87 @@ async fn disconnect_account(
     .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
   let client = &state.http;
 
-  let resp = client
-    .delete(format!("{base}/api/v1/accounts/{account_id}"))
-    .header("X-API-KEY", &api_key)
+  // 1. Find all identities linked to this Unipile account
+  let idents_resp = client
+    .get(format!(
+      "{supabase_url}/rest/v1/identities?unipile_account_id=eq.{account_id}&user_id=eq.{user_id}&select=id,person_id"
+    ))
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
     .send()
     .await
-    .map_err(|e| format!("Unipile delete failed: {e}"))?;
+    .map_err(|e| format!("identity lookup failed: {e}"))?;
 
-  if !resp.status().is_success() {
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    return Err(format!("Unipile delete returned {status}: {body}"));
+  let idents: Vec<serde_json::Value> = if idents_resp.status().is_success() {
+    idents_resp.json().await.unwrap_or_default()
+  } else {
+    vec![]
+  };
+
+  // 2. For each identity, decide whether to purge the whole person or just the identity
+  let mut purged_persons = std::collections::HashSet::new();
+  for ident in &idents {
+    let pid = ident.get("person_id").and_then(|v| v.as_str()).unwrap_or("");
+    let iid = ident.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if pid.is_empty() || iid.is_empty() { continue; }
+    if purged_persons.contains(pid) { continue; }
+
+    let count_resp = client
+      .get(format!(
+        "{supabase_url}/rest/v1/identities?person_id=eq.{pid}&user_id=eq.{user_id}&select=id"
+      ))
+      .header("apikey", &service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .header("Prefer", "count=exact")
+      .header("Range", "0-0")
+      .send()
+      .await;
+
+    let total_identities = count_resp.ok()
+      .and_then(|r| r.headers().get("content-range")?.to_str().ok()
+        .and_then(|s| s.split('/').last()?.parse::<usize>().ok()))
+      .unwrap_or(1);
+
+    if total_identities <= 1 {
+      purge_person(client, &supabase_url, &service_key, pid, &user_id).await;
+      purged_persons.insert(pid.to_string());
+    } else {
+      let _ = client
+        .delete(format!("{supabase_url}/rest/v1/identities?id=eq.{iid}"))
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .send()
+        .await;
+    }
   }
 
-  client
+  // 3. Delete connected_accounts row
+  let _ = client
     .delete(format!(
       "{supabase_url}/rest/v1/connected_accounts?account_id=eq.{account_id}&user_id=eq.{user_id}"
     ))
     .header("apikey", &service_key)
     .header("Authorization", format!("Bearer {service_key}"))
     .send()
-    .await
-    .map_err(|e| format!("Supabase delete failed: {e}"))?;
+    .await;
 
-  Ok("Account disconnected".to_string())
+  // 4. Delete Unipile account (last — so earlier queries still work)
+  let resp = client
+    .delete(format!("{base}/api/v1/accounts/{account_id}"))
+    .header("X-API-KEY", &api_key)
+    .send()
+    .await;
+
+  if let Ok(r) = resp {
+    if !r.status().is_success() && r.status().as_u16() != 404 {
+      eprintln!("[disconnect] Unipile delete returned {}", r.status().as_u16());
+    }
+  }
+
+  // 5. Emit event for frontend cache cleanup
+  let _ = app_handle.emit("account-disconnected", &account_id);
+
+  Ok(format!("Disconnected: purged {} persons", purged_persons.len()))
 }
 
 #[tauri::command]
@@ -547,22 +640,31 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
       let chat_id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if chat_id.is_empty() { continue; }
 
-      let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) == 1;
+      let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
       let msg_type = if is_group { "group" } else { "dm" };
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
-      let sender_handle_raw = chat.get("attendee_public_identifier")
-        .or(chat.get("attendee_provider_id"))
-        .or(chat.get("provider_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(chat_id);
-      let sender_handle = normalize_handle(sender_handle_raw, channel);
-      let display_name = if !chat_name.is_empty() {
-        chat_name.to_string()
-      } else if is_group {
-        "Group Chat".to_string()
+
+      let sender_handle;
+      let display_name;
+      if is_group {
+        display_name = if chat_name.is_empty() { "Group Chat".to_string() } else { chat_name.to_string() };
+        sender_handle = normalize_handle(
+          chat.get("provider_id").and_then(|v| v.as_str()).unwrap_or(chat_id),
+          channel
+        );
       } else {
-        sender_handle.clone()
-      };
+        let sender_handle_raw = chat.get("attendee_public_identifier")
+          .or(chat.get("attendee_provider_id"))
+          .or(chat.get("provider_id"))
+          .and_then(|v| v.as_str())
+          .unwrap_or(chat_id);
+        sender_handle = normalize_handle(sender_handle_raw, channel);
+        display_name = if !chat_name.is_empty() {
+          chat_name.to_string()
+        } else {
+          sender_handle.clone()
+        };
+      }
 
       let person_resp = client
         .post(format!("{supabase_url}/rest/v1/rpc/backfill_find_or_create_person"))
@@ -587,6 +689,49 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
         _ => continue,
       };
 
+      // For DMs, upload avatar if person has no avatar or avatar is stale
+      if !is_group {
+        let check_url = format!(
+          "{supabase_url}/rest/v1/persons?id=eq.{person_id}&select=avatar_url,avatar_stale"
+        );
+        let needs_avatar = match client.get(&check_url)
+          .header("apikey", &service_key)
+          .header("Authorization", format!("Bearer {service_key}"))
+          .header("Accept", "application/vnd.pgrst.object+json")
+          .send().await
+        {
+          Ok(r) if r.status().is_success() => {
+            let p: serde_json::Value = r.json().await.unwrap_or_default();
+            let has_url = p.get("avatar_url").and_then(|v| v.as_str()).unwrap_or("").len() > 10;
+            let stale = p.get("avatar_stale").and_then(|v| v.as_bool()).unwrap_or(true);
+            !has_url || stale
+          }
+          _ => false,
+        };
+
+        if needs_avatar {
+          let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+          if let Ok(att_resp) = client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+            if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
+              if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
+                for att in items {
+                  let is_self = att.get("is_self").and_then(|v| v.as_bool()).unwrap_or(false);
+                  if is_self { continue; }
+                  let att_id = att.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                  if att_id.is_empty() { continue; }
+                  let pic_url = att.get("picture_url").and_then(|v| v.as_str());
+                  upload_avatar(
+                    client, &api_key, &base, &supabase_url, &service_key,
+                    &person_id, att_id, pic_url,
+                  ).await;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+
       let attendee_map: std::collections::HashMap<String, String> = if is_group {
         let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
         match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
@@ -595,8 +740,9 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
             body.get("items").and_then(|v| v.as_array()).map(|arr| {
               arr.iter().filter_map(|a| {
                 let id = a.get("id").and_then(|v| v.as_str())?;
-                let name = a.get("name").and_then(|v| v.as_str())?;
-                if name.is_empty() { return None; }
+                let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+                  .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+                  .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
                 Some((id.to_string(), name.to_string()))
               }).collect()
             }).unwrap_or_default()
@@ -647,6 +793,7 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
                 .map(|s| s.replace("@s.whatsapp.net", "").replace("@lid", ""))
                 .map(|s| if s.chars().all(|c| c.is_ascii_digit()) { format!("+{s}") } else { s })
             })
+            .or(Some("Unknown".to_string()))
         } else {
           None
         };
@@ -777,7 +924,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let chat_id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if chat_id.is_empty() { continue; }
 
-      let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) == 1;
+      let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
       let msg_type = if is_group { "group" } else { "dm" };
 
@@ -788,10 +935,12 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
 
       if is_group {
         display_name = if chat_name.is_empty() { "Group Chat".to_string() } else { chat_name.to_string() };
-        sender_handle = chat.get("provider_id")
-          .and_then(|v| v.as_str())
-          .unwrap_or(chat_id)
-          .to_string();
+        sender_handle = normalize_handle(
+          chat.get("provider_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(chat_id),
+          channel
+        );
       } else {
         let attendees_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
         let all_attendees: Vec<serde_json::Value> = match client.get(&attendees_url).header("X-API-KEY", &api_key).send().await {
@@ -893,48 +1042,28 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
 
       if !is_group {
         if let Some(att_id) = &dm_attendee_id {
-          let mut avatar_data: Option<String> = None;
-
-          if let Some(ref pic_url) = dm_picture_url {
-            if let Ok(pic_resp) = client.get(pic_url).send().await {
-              if pic_resp.status().is_success() {
-                let ct = pic_resp.headers().get("content-type")
-                  .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
-                if let Ok(bytes) = pic_resp.bytes().await {
-                  if !bytes.is_empty() {
-                    let b64 = base64_encode(&bytes);
-                    avatar_data = Some(format!("data:{ct};base64,{b64}"));
-                  }
-                }
-              }
+          let check_url = format!(
+            "{supabase_url}/rest/v1/persons?id=eq.{person_id}&select=avatar_url,avatar_stale"
+          );
+          let needs_avatar = match client.get(&check_url)
+            .header("apikey", &service_key)
+            .header("Authorization", format!("Bearer {service_key}"))
+            .header("Accept", "application/vnd.pgrst.object+json")
+            .send().await
+          {
+            Ok(r) if r.status().is_success() => {
+              let p: serde_json::Value = r.json().await.unwrap_or_default();
+              let has_url = p.get("avatar_url").and_then(|v| v.as_str()).unwrap_or("").len() > 10;
+              let stale = p.get("avatar_stale").and_then(|v| v.as_bool()).unwrap_or(true);
+              !has_url || stale
             }
-          }
-
-          if avatar_data.is_none() {
-            let pic_url = format!("{base}/api/v1/chat_attendees/{att_id}/picture");
-            if let Ok(pic_resp) = client.get(&pic_url).header("X-API-KEY", &api_key).send().await {
-              if pic_resp.status().is_success() {
-                let ct = pic_resp.headers().get("content-type")
-                  .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
-                if let Ok(bytes) = pic_resp.bytes().await {
-                  if !bytes.is_empty() {
-                    let b64 = base64_encode(&bytes);
-                    avatar_data = Some(format!("data:{ct};base64,{b64}"));
-                  }
-                }
-              }
-            }
-          }
-
-          if let Some(data_uri) = avatar_data {
-            let _ = client
-              .patch(format!("{supabase_url}/rest/v1/persons?id=eq.{person_id}"))
-              .header("apikey", &service_key)
-              .header("Authorization", format!("Bearer {service_key}"))
-              .header("Content-Type", "application/json")
-              .json(&serde_json::json!({ "avatar_url": data_uri }))
-              .send()
-              .await;
+            _ => true,
+          };
+          if needs_avatar {
+            upload_avatar(
+              client, &api_key, &base, &supabase_url, &service_key,
+              &person_id, att_id, dm_picture_url.as_deref(),
+            ).await;
           }
         }
       }
@@ -951,8 +1080,9 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
             body.get("items").and_then(|v| v.as_array()).map(|arr| {
               arr.iter().filter_map(|a| {
                 let id = a.get("id").and_then(|v| v.as_str())?;
-                let name = a.get("name").and_then(|v| v.as_str())?;
-                if name.is_empty() { return None; }
+                let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+                  .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+                  .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
                 Some((id.to_string(), name.to_string()))
               }).collect()
             }).unwrap_or_default()
@@ -1003,6 +1133,9 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
               .and_then(|v| v.as_str())
               .map(|s| s.replace("@s.whatsapp.net", "").replace("@lid", ""))
               .map(|s| if s.chars().all(|c| c.is_ascii_digit()) { format!("+{s}") } else { s })
+          })
+          .or_else(|| {
+            if is_group { Some("Unknown".to_string()) } else { None }
           });
 
         let hidden = msg.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1118,7 +1251,7 @@ async fn send_message(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_message] chat {chat_id} returned 404, looking up current chat for person {person_id}");
+    eprintln!("[send_message] chat returned 404, resolving current chat");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let r2 = try_send(&new_cid, Some(&new_aid)).await
@@ -1211,7 +1344,7 @@ async fn resolve_chat(
           .and_then(|c| c.get("id"))
           .and_then(|v| v.as_str())
         {
-          eprintln!("[resolve_chat] found chat {chat_id} on account {aid} for handle {handle}");
+          eprintln!("[resolve_chat] found chat on matching account");
           patch_stale_thread_ids(client, &sb_url, &sb_key, person_id, channel, chat_id).await;
           return Ok((chat_id.to_string(), aid.to_string()));
         }
@@ -1288,7 +1421,7 @@ async fn send_attachment(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_attachment] chat {chat_id} returned 404, resolving...");
+    eprintln!("[send_attachment] chat returned 404, resolving...");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let retry_form = build_form(raw, Some(&new_aid))?;
@@ -1420,7 +1553,7 @@ async fn send_voice_message(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_voice] chat {chat_id} returned 404, resolving...");
+    eprintln!("[send_voice] chat returned 404, resolving...");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let retry_form = build_form(raw, Some(&new_aid))?;
@@ -1592,6 +1725,10 @@ async fn fetch_chat_avatars(
   state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
   let (api_key, base) = unipile_config()?;
+  let supabase_url =
+    std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
   let client = &state.http;
 
   let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
@@ -1617,38 +1754,289 @@ async fn fetch_chat_avatars(
       .unwrap_or(false);
     if is_self { continue; }
 
-    if let Some(pic_url) = att.get("picture_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-      if let Ok(pic_resp) = client.get(pic_url).send().await {
-        if pic_resp.status().is_success() {
-          let ct = pic_resp.headers().get("content-type")
-            .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
-          if let Ok(bytes) = pic_resp.bytes().await {
-            if !bytes.is_empty() {
-              let b64 = base64_encode(&bytes);
-              result.insert(att_name.clone(), format!("data:{ct};base64,{b64}"));
-              continue;
-            }
-          }
-        }
-      }
-    }
+    let person_url = format!(
+      "{supabase_url}/rest/v1/persons?display_name=eq.{}&select=id,avatar_url,avatar_stale",
+      urlencoding::encode(&att_name)
+    );
+    let person_row = client.get(&person_url)
+      .header("apikey", &service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .send().await.ok()
+      .and_then(|r| if r.status().is_success() { Some(r) } else { None });
 
-    let pic_url = format!("{base}/api/v1/chat_attendees/{att_id}/picture");
-    if let Ok(pic_resp) = client.get(&pic_url).header("X-API-KEY", &api_key).send().await {
-      if pic_resp.status().is_success() {
-        let ct = pic_resp.headers().get("content-type")
-          .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
-        if let Ok(bytes) = pic_resp.bytes().await {
-          if !bytes.is_empty() {
-            let b64 = base64_encode(&bytes);
-            result.insert(att_name, format!("data:{ct};base64,{b64}"));
-          }
+    let person_data: Option<serde_json::Value> = match person_row {
+      Some(r) => r.json::<serde_json::Value>().await.ok()
+        .and_then(|arr| arr.as_array().and_then(|a| a.first().cloned())),
+      None => None,
+    };
+
+    if let Some(person) = person_data {
+      let pid = person.get("id").and_then(|v| v.as_str()).unwrap_or("");
+      if pid.is_empty() { continue; }
+
+      let existing_url = person.get("avatar_url").and_then(|v| v.as_str()).unwrap_or("");
+      let stale = person.get("avatar_stale").and_then(|v| v.as_bool()).unwrap_or(true);
+
+      if !existing_url.is_empty() && !stale {
+        result.insert(att_name, existing_url.to_string());
+      } else {
+        let pic_url = att.get("picture_url").and_then(|v| v.as_str());
+        if let Some(url) = upload_avatar(
+          client, &api_key, &base, &supabase_url, &service_key,
+          pid, att_id, pic_url,
+        ).await {
+          result.insert(att_name, url);
         }
       }
     }
   }
 
   Ok(result)
+}
+
+/// Full reconciliation: fetch ALL chats from Unipile (no time filter),
+/// diff against local identities, purge persons whose chats no longer exist.
+/// Heavy operation — run in background, not during startup.
+#[tauri::command]
+async fn reconcile_chats(
+  user_id: String,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  let (api_key, base) = unipile_config()?;
+  let supabase_url =
+    std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+  let client = &state.http;
+
+  let accounts_resp = client
+    .get(format!(
+      "{supabase_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&select=account_id"
+    ))
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .send().await
+    .map_err(|e| format!("accounts fetch: {e}"))?;
+
+  let accounts: Vec<serde_json::Value> = if accounts_resp.status().is_success() {
+    accounts_resp.json().await.unwrap_or_default()
+  } else {
+    return Ok("No accounts".to_string());
+  };
+
+  let mut purged = 0u32;
+  let mut purged_persons = std::collections::HashSet::new();
+
+  for acc in &accounts {
+    let account_id = acc.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+    if account_id.is_empty() { continue; }
+
+    let chats_url = format!("{base}/api/v1/chats?account_id={account_id}&limit=50");
+    let remote_chats = match fetch_paginated(client, &chats_url, &api_key, 100).await {
+      Ok(c) => c,
+      Err(_) => continue,
+    };
+
+    let remote_chat_ids: std::collections::HashSet<String> = remote_chats.iter()
+      .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+      .collect();
+
+    // Collect all distinct local chat_provider_ids for this account (paginated)
+    let mut local_chat_ids = std::collections::HashSet::new();
+    let mut offset = 0usize;
+    loop {
+      let end = offset + 999;
+      let msgs_resp = client
+        .get(format!(
+          "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&unipile_account_id=eq.{account_id}&select=chat_provider_id"
+        ))
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .header("Range", format!("{offset}-{end}"))
+        .send().await;
+
+      let page: Vec<serde_json::Value> = match msgs_resp {
+        Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => {
+          r.json().await.unwrap_or_default()
+        }
+        _ => break,
+      };
+
+      let count = page.len();
+      for m in &page {
+        if let Some(cid) = m.get("chat_provider_id").and_then(|v| v.as_str()) {
+          local_chat_ids.insert(cid.to_string());
+        }
+      }
+
+      if count < 1000 { break; }
+      offset += 1000;
+    }
+
+    for chat_id in &local_chat_ids {
+      if remote_chat_ids.contains(chat_id) { continue; }
+
+      // Find the specific person(s) who have messages in this deleted chat
+      let person_resp = client
+        .get(format!(
+          "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&chat_provider_id=eq.{chat_id}&select=person_id&limit=1"
+        ))
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .send().await;
+
+      let affected_pid: Option<String> = match person_resp {
+        Ok(r) if r.status().is_success() => {
+          let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+          rows.first()
+            .and_then(|r| r.get("person_id").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+        }
+        _ => None,
+      };
+
+      let pid = match affected_pid {
+        Some(p) => p,
+        None => continue,
+      };
+
+      if purged_persons.contains(&pid) { continue; }
+
+      let count_resp = client
+        .get(format!(
+          "{supabase_url}/rest/v1/identities?person_id=eq.{pid}&user_id=eq.{user_id}&select=id"
+        ))
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .header("Prefer", "count=exact")
+        .header("Range", "0-0")
+        .send().await;
+
+      let total = count_resp.ok()
+        .and_then(|r| r.headers().get("content-range")?.to_str().ok()
+          .and_then(|s| s.split('/').last()?.parse::<usize>().ok()))
+        .unwrap_or(1);
+
+      if total <= 1 {
+        purge_person(client, &supabase_url, &service_key, &pid, &user_id).await;
+        purged_persons.insert(pid);
+        purged += 1;
+      }
+    }
+  }
+
+  Ok(format!("Reconciled: purged {purged} persons"))
+}
+
+/// Fetch avatar from Unipile (direct URL or proxy endpoint), upload to
+/// Supabase Storage, and update `persons.avatar_url` with the public URL.
+/// Returns the public Storage URL on success.
+async fn upload_avatar(
+  client: &reqwest::Client,
+  api_key: &str,
+  unipile_base: &str,
+  supabase_url: &str,
+  service_key: &str,
+  person_id: &str,
+  attendee_id: &str,
+  picture_url: Option<&str>,
+) -> Option<String> {
+  let mut image_bytes: Option<(Vec<u8>, String)> = None;
+
+  if let Some(url) = picture_url {
+    if let Ok(resp) = client.get(url).send().await {
+      if resp.status().is_success() {
+        let ct = resp.headers().get("content-type")
+          .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
+        if let Ok(bytes) = resp.bytes().await {
+          if !bytes.is_empty() {
+            image_bytes = Some((bytes.to_vec(), ct));
+          }
+        }
+      }
+    }
+  }
+
+  if image_bytes.is_none() {
+    let proxy_url = format!("{unipile_base}/api/v1/chat_attendees/{attendee_id}/picture");
+    if let Ok(resp) = client.get(&proxy_url).header("X-API-KEY", api_key).send().await {
+      if resp.status().is_success() {
+        let ct = resp.headers().get("content-type")
+          .and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
+        if let Ok(bytes) = resp.bytes().await {
+          if !bytes.is_empty() {
+            image_bytes = Some((bytes.to_vec(), ct));
+          }
+        }
+      }
+    }
+  }
+
+  let (bytes, content_type) = image_bytes?;
+
+  let ext = if content_type.contains("png") { "png" }
+    else if content_type.contains("webp") { "webp" }
+    else { "jpg" };
+  let object_path = format!("{person_id}.{ext}");
+
+  let upload_url = format!(
+    "{supabase_url}/storage/v1/object/avatars/{object_path}"
+  );
+  let upload_resp = client
+    .post(&upload_url)
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", &content_type)
+    .header("x-upsert", "true")
+    .body(bytes)
+    .send()
+    .await;
+
+  if let Ok(resp) = upload_resp {
+    if !resp.status().is_success() {
+      return None;
+    }
+  } else {
+    return None;
+  }
+
+  let public_url = format!(
+    "{supabase_url}/storage/v1/object/public/avatars/{object_path}"
+  );
+
+  let _ = client
+    .patch(format!("{supabase_url}/rest/v1/persons?id=eq.{person_id}"))
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({
+      "avatar_url": public_url,
+      "avatar_stale": false,
+      "avatar_refreshed_at": chrono::Utc::now().to_rfc3339()
+    }))
+    .send()
+    .await;
+
+  Some(public_url)
+}
+
+/// Delete avatar from Supabase Storage for a given person.
+async fn delete_avatar(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  person_id: &str,
+) {
+  for ext in &["jpg", "png", "webp"] {
+    let _ = client
+      .delete(format!(
+        "{supabase_url}/storage/v1/object/avatars/{person_id}.{ext}"
+      ))
+      .header("apikey", service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .send()
+      .await;
+  }
 }
 
 fn base64_encode(data: &[u8]) -> String {

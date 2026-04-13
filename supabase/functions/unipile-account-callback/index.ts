@@ -1,7 +1,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing required env: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 const UNIPILE_API_KEY = Deno.env.get("UNIPILE_API_KEY") ?? "";
 const UNIPILE_API_URL = Deno.env.get("UNIPILE_API_URL") ?? "";
 const CALLBACK_SECRET = Deno.env.get("UNIPILE_CALLBACK_SECRET") ?? "";
@@ -42,7 +45,6 @@ Deno.serve(async (req: Request) => {
     }
 
     const payload = await req.json();
-    console.log("Account callback received:", payload.status, payload.account_id);
 
     const status = payload.status;
     const accountId = payload.account_id;
@@ -127,7 +129,7 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ ok: true, account_id: accountId, channel });
   } catch (err) {
     console.error("Account callback error:", err);
-    return jsonResponse({ ok: false, error: String(err) }, 500);
+    return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 });
 

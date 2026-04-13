@@ -39,6 +39,9 @@
       "desktop": {
         "schemes": ["convolios"]
       }
+    },
+    "shell": {
+      "open": "^((mailto:\\w+)|(tel:\\w+)|(https?://\\w+)|(x-apple\\.systempreferences:)).+"
     }
   }
 }

@@ -1,10 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { Lock } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
 import { useAccountsStore } from '../../stores/accountsStore'
+import { useSyncStore } from '../../stores/inboxStore'
 import { queryClient } from '../../lib/queryClient'
 import { channelLabel, channelColor, relativeTime } from '../../utils'
+import { ChannelLogo } from '../icons/ChannelLogo'
 import type { ConnectedAccount } from '../../types'
 import _ from 'lodash'
 
@@ -16,6 +19,7 @@ const PROVIDERS = [
   { providers: ['TELEGRAM'],  label: 'Telegram',   desc: 'QR code',  channel: 'telegram' },
   { providers: ['MICROSOFT'], label: 'Outlook',    desc: 'OAuth',    channel: 'email' },
   { providers: ['X'],         label: 'X',          desc: 'OAuth',    channel: 'x' },
+  { providers: ['IMESSAGE'],  label: 'iMessage',   desc: 'Local',    channel: 'imessage' },
 ]
 
 export function Settings() {
@@ -24,6 +28,8 @@ export function Settings() {
   const loading = useAccountsStore((s) => s.loading)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const removeAccount = useAccountsStore((s) => s.removeAccount)
+  const syncPhase = useSyncStore((s) => s.phase)
+  const lastSyncedAt = useSyncStore((s) => s.lastSyncedAt)
   const [syncing, setSyncing] = useState(false)
   const [syncMsg, setSyncMsg] = useState('')
   const [pulling, setPulling] = useState(false)
@@ -46,7 +52,12 @@ export function Settings() {
   const sync = async () => {
     if (!user?.id) return
     setSyncing(true); setSyncMsg('')
-    try { setSyncMsg(await invoke<string>('sync_unipile_accounts', { userId: user.id })); refresh() }
+    try {
+      const result = await invoke<string>('startup_sync', { userId: user.id })
+      setSyncMsg(result)
+      refresh()
+      queryClient.invalidateQueries({ queryKey: ['conversations', user.id] })
+    }
     catch (e) { setSyncMsg(String(e)) }
     finally { setSyncing(false) }
   }
@@ -102,10 +113,18 @@ export function Settings() {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <h2 style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.02em', color: '#b5bac1' }}>
-            Connected Accounts
-          </h2>
-          <Btn small onClick={sync} busy={syncing}>{syncing ? 'Syncing...' : 'Sync'}</Btn>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <h2 style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.02em', color: '#b5bac1' }}>
+              Connected Accounts
+            </h2>
+            {syncPhase === 'syncing' && (
+              <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: '#5865f2' }} />
+            )}
+            {lastSyncedAt && syncPhase !== 'syncing' && (
+              <span style={{ fontSize: 11, color: '#6d6f78' }}>Last synced {relativeTime(lastSyncedAt)}</span>
+            )}
+          </div>
+          <Btn small onClick={sync} busy={syncing}>{syncing ? 'Syncing...' : 'Sync All'}</Btn>
         </div>
         {syncMsg && <Hint>{syncMsg}</Hint>}
         {disconnectErr && <Hint>{disconnectErr}</Hint>}
@@ -190,7 +209,8 @@ function Hint({ children }: { children: string }) {
 function ProviderCard({ providers, label, desc, channel, userId }: {
   providers: string[]; label: string; desc: string; channel: string; userId?: string
 }) {
-  const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err'>('idle')
+  const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err' | 'permission'>('idle')
+  const [errMsg, setErrMsg] = useState('')
   const accounts = useAccountsStore((s) => s.accounts)
   const countBefore = useRef(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -209,9 +229,12 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
       if (userId) {
         invoke<string>('backfill_messages', { userId }).then(() => {
           queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-        }).catch(() => {}).finally(() => {
           setSt('done')
           timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+        }).catch((e) => {
+          setErrMsg(String(e))
+          setSt('err')
+          timerRef.current = setTimeout(() => setSt('idle'), 6_000)
         })
       } else {
         setSt('done')
@@ -220,11 +243,51 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
     }
   }, [st, accounts, channel, userId])
 
+  useEffect(() => {
+    if (st !== 'permission') return
+    const onFocus = () => {
+      if (!userId) return
+      setSt('loading')
+      invoke<string>('connect_imessage', { userId })
+        .then(() => {
+          setSt('syncing')
+          return invoke<string>('backfill_messages', { userId })
+        })
+        .then(() => {
+          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+          setSt('done')
+          timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+        })
+        .catch((e) => {
+          const msg = String(e)
+          if (msg.includes('Full Disk Access') || msg.includes('Cannot access')) {
+            setSt('permission')
+          } else {
+            setErrMsg(msg)
+            setSt('err')
+            timerRef.current = setTimeout(() => setSt('idle'), 6_000)
+          }
+        })
+    }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [st, userId])
+
   const go = async () => {
     if (!userId) return
     setSt('loading')
+    setErrMsg('')
     countBefore.current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     try {
+      if (channel === 'imessage') {
+        await invoke<string>('connect_imessage', { userId })
+        setSt('syncing')
+        await invoke<string>('backfill_messages', { userId })
+        queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+        setSt('done')
+        timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+        return
+      }
       let link: string
       if (channel === 'x') {
         link = await invoke<string>('connect_x_account', { userId })
@@ -239,10 +302,60 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
       if (!link) throw new Error('No link')
       await open(link)
       setSt('waiting')
-    } catch {
+    } catch (e) {
+      const msg = String(e)
+      if (channel === 'imessage' && (msg.includes('Full Disk Access') || msg.includes('Cannot access'))) {
+        setSt('permission')
+        return
+      }
+      setErrMsg(msg)
       setSt('err')
-      timerRef.current = setTimeout(() => setSt('idle'), 4_000)
+      timerRef.current = setTimeout(() => setSt('idle'), 6_000)
     }
+  }
+
+  const openFdaSettings = async () => {
+    try {
+      await open('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles')
+    } catch {
+      await open('x-apple.systempreferences:com.apple.preference.security').catch(() => {})
+    }
+  }
+
+  if (st === 'permission') {
+    return (
+      <div style={{
+        width: 340, borderRadius: 8, background: '#1e1f22', border: '1px solid #f0b132',
+        padding: 16, display: 'flex', flexDirection: 'column', gap: 12,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ display: 'flex', alignItems: 'center' }}><Lock size={18} /></span>
+          <span style={{ fontSize: 14, fontWeight: 600, color: '#f2f3f5' }}>Full Disk Access Required</span>
+        </div>
+        <p style={{ fontSize: 13, color: '#b5bac1', lineHeight: 1.5 }}>
+          Convolios needs permission to read your Messages database. Open System Settings, find Convolios in the list and toggle it on.
+        </p>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={openFdaSettings} style={{
+            flex: 1, height: 32, borderRadius: 3, fontSize: 14, fontWeight: 500,
+            background: '#5865f2', color: '#fff', border: 'none', cursor: 'pointer',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = '#4752c4' }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = '#5865f2' }}>
+            Open Settings
+          </button>
+          <button onClick={() => setSt('idle')} style={{
+            height: 32, borderRadius: 3, fontSize: 14, fontWeight: 500, padding: '0 12px',
+            background: 'transparent', color: '#b5bac1', border: '1px solid #3f4147', cursor: 'pointer',
+          }}>
+            Cancel
+          </button>
+        </div>
+        <p style={{ fontSize: 11, color: '#6d6f78' }}>
+          When you come back, we'll retry automatically.
+        </p>
+      </div>
+    )
   }
 
   const stColor = st === 'done' ? '#23a559' : st === 'err' ? '#ed4245' : st === 'waiting' || st === 'syncing' ? '#f0b132' : '#949ba4'
@@ -250,23 +363,31 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
     : st === 'waiting' ? 'Waiting...'
     : st === 'syncing' ? 'Syncing messages...'
     : st === 'done' ? 'Connected!'
-    : st === 'err' ? 'Error' : desc
+    : st === 'err' ? (errMsg || 'Error') : desc
 
   return (
-    <button onClick={go} disabled={st === 'loading' || st === 'waiting'} style={{
-      width: 164, height: 48, borderRadius: 8, display: 'flex', alignItems: 'center',
-      gap: 8, padding: '0 12px', background: '#1e1f22',
-      border: st === 'waiting' ? '1px solid #f0b132' : st === 'done' ? '1px solid #23a559' : '1px solid #3f4147',
-      cursor: st === 'loading' || st === 'waiting' ? 'default' : 'pointer',
-    }}
-    onMouseEnter={(e) => { if (st === 'idle') e.currentTarget.style.background = '#313338' }}
-    onMouseLeave={(e) => { e.currentTarget.style.background = '#1e1f22' }}>
-      <span style={{ fontSize: 14, fontWeight: 500, flex: 1, textAlign: 'left', color: '#f2f3f5' }}>{label}</span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: stColor }}>
-        {st === 'waiting' && <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: stColor }} />}
-        {stText}
-      </span>
-    </button>
+    <div style={{ position: 'relative' }}>
+      <button onClick={go} disabled={st === 'loading' || st === 'waiting'} title={st === 'err' ? errMsg : undefined} style={{
+        width: 164, height: 48, borderRadius: 8, display: 'flex', alignItems: 'center',
+        gap: 8, padding: '0 12px', background: '#1e1f22',
+        border: st === 'waiting' ? '1px solid #f0b132' : st === 'done' ? '1px solid #23a559' : st === 'err' ? '1px solid #ed4245' : '1px solid #3f4147',
+        cursor: st === 'loading' || st === 'waiting' ? 'default' : 'pointer',
+      }}
+      onMouseEnter={(e) => { if (st === 'idle') e.currentTarget.style.background = '#313338' }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '#1e1f22' }}>
+        <ChannelLogo channel={channel} size={16} color="#f2f3f5" style={{ flexShrink: 0 }} />
+        <span style={{ fontSize: 14, fontWeight: 500, flex: 1, textAlign: 'left', color: '#f2f3f5' }}>{label}</span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: stColor, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 80 }}>
+          {st === 'waiting' && <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: stColor, flexShrink: 0 }} />}
+          {st === 'err' ? 'Failed' : stText}
+        </span>
+      </button>
+      {st === 'err' && errMsg && (
+        <div style={{ position: 'absolute', left: 0, right: 0, top: 52, zIndex: 10, padding: '6px 10px', borderRadius: 6, background: '#2b2d31', border: '1px solid #ed4245', fontSize: 12, color: '#ed4245', lineHeight: 1.4, maxWidth: 260, wordBreak: 'break-word' }}>
+          {errMsg}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -389,9 +510,7 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
           width: 40, height: 40, borderRadius: '50%', flexShrink: 0,
           background: color, display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
-          <span style={{ fontSize: 14, fontWeight: 700, color: '#fff' }}>
-            {channelLabel(a.channel).slice(0, 2).toUpperCase()}
-          </span>
+          <ChannelLogo channel={a.channel} size={20} color="#fff" />
         </div>
 
         <div style={{ flex: 1, minWidth: 0 }}>

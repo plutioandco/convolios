@@ -18,8 +18,11 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const sbUrl = Deno.env.get("SUPABASE_URL")!;
-    const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const sbUrl = Deno.env.get("SUPABASE_URL");
+    const sbKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!sbUrl || !sbKey) {
+      return errorPage("Server configuration error. Please contact support.");
+    }
     const clientId = Deno.env.get("X_API_CLIENT_ID");
     const clientSecret = Deno.env.get("X_API_CLIENT_SECRET");
 
@@ -48,11 +51,6 @@ Deno.serve(async (req: Request) => {
 
     const { code_verifier, user_id } = rows[0];
 
-    await fetch(`${sbUrl}/rest/v1/x_oauth_state?state=eq.${encodeURIComponent(state)}`, {
-      method: "DELETE",
-      headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
-    });
-
     const redirectUri = `${sbUrl}/functions/v1/x-account-callback`;
     const basicAuth = btoa(`${clientId}:${clientSecret}`);
 
@@ -76,6 +74,11 @@ Deno.serve(async (req: Request) => {
       console.error("[x-callback] token exchange failed:", tokenBody);
       return errorPage("Token exchange failed. Please try again.");
     }
+
+    await fetch(`${sbUrl}/rest/v1/x_oauth_state?state=eq.${encodeURIComponent(state)}`, {
+      method: "DELETE",
+      headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+    });
 
     const accessToken = tokenBody.access_token;
     const refreshToken = tokenBody.refresh_token ?? "";

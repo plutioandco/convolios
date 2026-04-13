@@ -63,3 +63,19 @@ export const useFilterStore = create<FilterState>((set) => ({
   setTriageFilter: (triageFilter) => set({ triageFilter }),
   setSearchQuery: (searchQuery) => set({ searchQuery }),
 }))
+
+interface SyncState {
+  phase: 'idle' | 'syncing' | 'done'
+  detail: string
+  lastSyncedAt: string | null
+  setSync: (phase: SyncState['phase'], detail: string) => void
+  markDone: (detail: string) => void
+}
+
+export const useSyncStore = create<SyncState>((set) => ({
+  phase: 'idle',
+  detail: '',
+  lastSyncedAt: null,
+  setSync: (phase, detail) => set({ phase, detail }),
+  markDone: (detail) => set({ phase: 'done', detail, lastSyncedAt: new Date().toISOString() }),
+}))

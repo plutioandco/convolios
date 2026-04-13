@@ -23,7 +23,7 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
 
       const { data, error } = await query
       if (error) throw error
-      return ((data as Message[]) ?? []).reverse()
+      return [...((data as Message[]) ?? [])].reverse()
     },
     enabled: _.isString(personId) && _.isString(userId),
     refetchInterval: interval,

@@ -14,7 +14,7 @@ This document describes the actual implementation as it exists today. For the vi
 - **One feature per file** — `Sidebar.tsx`, `InboxList.tsx`, `ThreadView.tsx`, `Settings.tsx`. No deep component tree.
 - **Helper components live in the same file** as their parent — `GifPlayer`, `AttachmentMedia`, `ComposeBox` all live inside `ThreadView.tsx`.
 - **Named exports** for components: `export function Sidebar()`, not default exports (except `App`).
-- **Inline styles** for layout, colors, and spacing. Use the Discord-like palette: `#1e1f22` (darkest), `#2b2d31` (dark), `#313338` (base), `#3f4147` (border), `#5865f2` (accent blue), `#949ba4` (muted text), `#dbdee1` (body text), `#f2f3f5` (bright text).
+- **Inline styles** for layout, colors, and spacing. Use CSS custom property tokens defined in `src/index.css` `@theme` block (e.g. `var(--color-surface)`, `var(--color-accent)`, `var(--radius-card)`). Never hardcode hex values.
 - **CSS classes** only for reusable behaviors: `thin-scroll`, `chat-scroll`, `guild-pill`, `guild-icon`, `av-1`–`av-8`, `msg-compact`, `pulse-dot`.
 - **Conditional rendering** uses `&&` (never `? : null`).
 - **Zustand selectors** pull one field per call: `useInboxStore((s) => s.activeChannel)`.
@@ -60,8 +60,10 @@ This document describes the actual implementation as it exists today. For the vi
 
 ### Styling Conventions
 
-- **Tailwind v4** is imported but not the primary layout system. Most layout is inline styles.
-- **Hex color palette** from Discord: use the constants above, do not introduce new colors.
+- **Design tokens** defined in `src/index.css` via Tailwind v4 `@theme` block. All colors, radii, spacing, and typography are CSS custom properties (`var(--color-surface)`, `var(--radius-card)`, `var(--font-sm)`, etc.). Never use raw hex values — always reference the tokens.
+- **Style primitives** in `src/components/thread/threadStyles.ts` — composable `CSSProperties` objects (`S.card`, `S.label`, `S.meta`, `S.media`, etc.) shared across all thread/media components. Spread with overrides: `{ ...S.card, display: 'flex' }`.
+- **Inline styles** for layout, colors, and spacing — referencing `var(--color-*)` tokens, not hardcoded hex.
+- **CSS classes** only for reusable behaviors: `thin-scroll`, `chat-scroll`, `guild-pill`, `guild-icon`, `av-1`–`av-8`, `msg-compact`, `pulse-dot`.
 - **Hover states** use `onMouseEnter`/`onMouseLeave` mutating `e.currentTarget.style`.
 - **Scrollbars**: use `chat-scroll` for main scroll areas, `thin-scroll` for narrow sidebars.
 
@@ -121,7 +123,7 @@ The `AppState` holds a shared `reqwest::Client` with 30s timeout and connection 
 
 Environment variables are loaded from `.env.local` and `.env` in the project root via `dotenvy`.
 
-### Tauri IPC Commands (16 total)
+### Tauri IPC Commands (19 total)
 
 | Command | Purpose |
 |---------|---------|
@@ -132,15 +134,18 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `create_connect_link` | Generate Unipile Hosted Auth URL (opens in browser) |
 | `sync_unipile_accounts` | Fetch Unipile accounts, deduplicate, upsert to `connected_accounts` |
 | `disconnect_account` | Delete account from Unipile + mark `disconnected` in Supabase |
-| `startup_sync` | On app launch: sync accounts + backfill last 24h of messages |
-| `backfill_messages` | Full historical backfill — paginated fetch of all messages per account |
-| `send_message` | Send text message via Unipile + persist outbound to Supabase |
+| `startup_sync` | On app launch: sync accounts + backfill last 24h of messages (Unipile + X + iMessage) |
+| `backfill_messages` | Full historical backfill — all accounts including X DMs and iMessage |
+| `send_message` | Send text message via Unipile, X API, or AppleScript (dispatched by channel) |
 | `send_attachment` | Send file attachment via Unipile multipart upload |
 | `send_voice_message` | Send voice note via Unipile |
 | `add_reaction` | Add emoji reaction to a message via Unipile |
 | `edit_message` | Edit a sent message (WhatsApp) via Unipile |
-| `fetch_attachment` | Download attachment binary from Unipile, return as base64 |
+| `fetch_attachment` | Download attachment binary from Unipile, return as base64 (with disk cache) |
 | `fetch_chat_avatars` | Fetch group chat avatars from Unipile, store in `persons.avatar_url` |
+| `reconcile_chats` | Reconcile stale chat/thread IDs after chat resolution |
+| `connect_x_account` | Initiate X OAuth 2.0 PKCE flow, store state, return auth URL |
+| `connect_imessage` | Verify chat.db access, create connected_account for macOS Messages |
 
 ### Key Helper Functions
 
@@ -149,7 +154,7 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `unipile_config()` | Read `UNIPILE_API_KEY` and `UNIPILE_API_URL` from env |
 | `fetch_paginated()` | Generic paginated GET with cursor-based pagination |
 | `dedupe_accounts()` | Deduplicate Unipile accounts (phone/email normalization) |
-| `channel_from_type()` | Map Unipile `account_type` (LINKEDIN, WHATSAPP, MAIL...) to our `Channel` |
+| `channel_from_type()` | Map account types (LINKEDIN, WHATSAPP, MAIL, MOBILE, X, IMESSAGE...) to our `Channel` |
 | `map_unipile_status()` | Map Unipile status strings to our status enum |
 | `normalize_handle()` | Strip WhatsApp suffixes, normalize LinkedIn URLs, lowercase |
 | `persist_outbound()` | Save a sent message to Supabase via REST API |
@@ -166,6 +171,8 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `VITE_SUPABASE_URL` | Yes | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes | Supabase service role key (bypasses RLS) |
 | `GEMINI_API_KEY` | Yes | Gemini API for health check |
+| `X_API_CLIENT_ID` | For X | X/Twitter OAuth 2.0 client ID |
+| `X_API_CLIENT_SECRET` | For X | X/Twitter OAuth 2.0 client secret |
 
 ---
 
@@ -257,7 +264,7 @@ App
 | `Message` | id, user_id, person_id, channel, direction, body_text, body_html, attachments, thread_id, sender_name, reactions, triage, seen, delivered, edited, deleted, hidden, is_event, event_type, quoted_text, quoted_sender, provider_id, chat_provider_id, in_reply_to_message_id, smtp_message_id, folder, read_at |
 | `ConnectedAccount` | id, user_id, provider, channel, account_id, status, display_name, email, phone, username, avatar_url, provider_type, connection_params, last_synced_at |
 | `ConversationPreview` | person, lastMessage, unreadCount, prevInboundBody, prevInboundSender |
-| `Channel` | Union: whatsapp, linkedin, instagram, telegram, email, x, slack, clickup, google_chat |
+| `Channel` | Union: whatsapp, linkedin, instagram, telegram, email, x, imessage, sms, slack, clickup, google_chat |
 | `TriageLevel` | Union: urgent, human, newsletter, notification, noise, unclassified |
 | `Direction` | Union: inbound, outbound |
 
@@ -485,10 +492,37 @@ Unipile `account_type` values map to our `Channel` type:
 | INSTAGRAM | instagram |
 | TELEGRAM | telegram |
 | MAIL, GMAIL, GOOGLE, GOOGLE_OAUTH, OUTLOOK, MICROSOFT, IMAP | email |
+| MOBILE, SMS, RCS | sms |
+| X, TWITTER | x |
+| IMESSAGE, APPLE | imessage |
 
 ---
 
-## Edge Functions
+## Direct Channel Integrations
+
+Some channels bypass Unipile and are integrated directly.
+
+### X / Twitter (Direct API)
+
+- **Auth**: OAuth 2.0 PKCE flow. Rust generates `code_verifier` + `code_challenge`, stores state in `x_oauth_state` table, opens X consent URL in browser. On callback, `x-account-callback` Edge Function exchanges the code for tokens server-side.
+- **Backfill**: `backfill_x_dms` fetches DMs via `GET https://api.x.com/2/dm_events` with user fields/expansions. Creates persons with avatars.
+- **Send**: `send_x_dm` via `POST https://api.x.com/2/dm_conversations/with/:participant_id/messages`.
+- **Env vars**: `X_API_CLIENT_ID`, `X_API_CLIENT_SECRET`.
+- **Edge Function**: `x-account-callback/index.ts` handles the OAuth redirect.
+
+### iMessage / SMS (macOS Local)
+
+- **Connect**: `connect_imessage` command checks `~/Library/Messages/chat.db` accessibility (requires Full Disk Access). Creates a `local-imessage` connected account in Supabase.
+- **Backfill**: `backfill_imessage` reads `chat.db` via `rusqlite`, groups by `chat_guid`, resolves persons, inserts messages with `imsg-` prefixed external IDs.
+- **Send**: `send_imessage_dm` uses AppleScript (`osascript`) to send via Messages.app. Parses `chat_id` to determine iMessage vs SMS service.
+- **Limitations**: macOS only. No real-time push (backfill on app launch). Requires Full Disk Access permission. SMS only available if iPhone SMS Forwarding is enabled.
+- **Dependencies**: `rusqlite` (bundled SQLite, in Cargo.toml).
+
+### SMS via Unipile (Android)
+
+- **Connect**: Standard Unipile Hosted Auth flow. Account type `MOBILE`.
+- **Backfill/Send/Webhook**: Uses the same Unipile infrastructure as WhatsApp, LinkedIn, etc. No special handling needed.
+- **Limitations**: Android only. iOS not supported by Unipile for SMS.
 
 ### `unipile-webhook/index.ts`
 
@@ -516,6 +550,21 @@ Handles the callback after Unipile Hosted Auth completes.
 1. Receive `account_id` from Unipile callback
 2. Fetch full account details from Unipile `GET /api/v1/accounts/{id}`
 3. Upsert to `connected_accounts` with all detail fields (display_name, email, phone, etc.)
+
+### `x-account-callback/index.ts`
+
+Handles the X/Twitter OAuth 2.0 PKCE callback.
+
+**Flow:**
+1. Receive `code` and `state` from X OAuth redirect
+2. Look up `code_verifier` from `x_oauth_state` table using `state`
+3. Exchange authorization code for access/refresh tokens via `POST https://api.x.com/2/oauth2/token`
+4. Fetch user profile from `GET https://api.x.com/2/users/me`
+5. Upsert `connected_account` with X credentials
+6. Clean up `x_oauth_state` row
+7. Show success page with `window.close()` to dismiss browser tab
+
+**Security:** `escapeHtml()` applied to all user-controlled text in HTML responses.
 
 ---
 

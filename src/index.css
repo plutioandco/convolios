@@ -1,11 +1,49 @@
 @import "tailwindcss";
 
+@theme {
+  --color-bg: #313338;
+  --color-surface: #2b2d31;
+  --color-surface-deep: #1e1f22;
+  --color-surface-input: #383a40;
+  --color-scrollbar: #1a1b1e;
+
+  --color-text-primary: #f2f3f5;
+  --color-text-body: #dbdee1;
+  --color-text-secondary: #b5bac1;
+  --color-text-muted: #949ba4;
+  --color-text-pending: #6d6f78;
+
+  --color-border: #3f4147;
+  --color-accent: #5865f2;
+  --color-link: #00aff4;
+  --color-success: #23a559;
+  --color-danger: #ed4245;
+  --color-white: #fff;
+
+  --radius-sm: 4px;
+  --radius-card: 8px;
+  --radius-lg: 16px;
+  --radius-pill: 20px;
+
+  --card-padding: 10px 14px;
+  --card-max-width: 320px;
+  --card-gap: 8px;
+
+  --font-2xs: 10px;
+  --font-xs: 11px;
+  --font-sm: 12px;
+  --font-md: 13px;
+  --font-base: 14px;
+  --font-lg: 15px;
+  --font-body: 16px;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body, #root {
   height: 100%;
-  background: #313338;
-  color: #dbdee1;
+  background: var(--color-bg);
+  color: var(--color-text-body);
   font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
   font-size: 1rem;
   line-height: 1.375rem;
@@ -21,20 +59,20 @@ button { border: none; background: none; cursor: pointer; }
 .thin-scroll:hover { scrollbar-width: thin; }
 .thin-scroll::-webkit-scrollbar { width: 0; }
 .thin-scroll:hover::-webkit-scrollbar { width: 4px; }
-.thin-scroll::-webkit-scrollbar-thumb { background: #1a1b1e; border-radius: 4px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: var(--color-scrollbar); border-radius: var(--radius-sm); }
 .thin-scroll::-webkit-scrollbar-track { background: transparent; }
 
 /* chat area scrollbar */
-.chat-scroll { overflow-y: scroll; scrollbar-color: #1a1b1e #2b2d31; }
+.chat-scroll { overflow-y: scroll; scrollbar-color: var(--color-scrollbar) var(--color-surface); }
 .chat-scroll::-webkit-scrollbar { width: 16px; }
-.chat-scroll::-webkit-scrollbar-track { background: #2b2d31; background-clip: padding-box; border: 4px solid transparent; border-radius: 8px; }
-.chat-scroll::-webkit-scrollbar-thumb { background: #1a1b1e; background-clip: padding-box; border: 4px solid transparent; border-radius: 8px; min-height: 40px; }
+.chat-scroll::-webkit-scrollbar-track { background: var(--color-surface); background-clip: padding-box; border: 4px solid transparent; border-radius: var(--radius-card); }
+.chat-scroll::-webkit-scrollbar-thumb { background: var(--color-scrollbar); background-clip: padding-box; border: 4px solid transparent; border-radius: var(--radius-card); min-height: 40px; }
 
 /* avatar palette */
 .av-1 { background: #5865f2; }
 .av-2 { background: #eb459e; }
 .av-3 { background: #57f287; }
-.av-4 { background: #fee75c; color: #1e1f22 !important; }
+.av-4 { background: #fee75c; color: var(--color-surface-deep) !important; }
 .av-5 { background: #ed4245; }
 .av-6 { background: #3ba55d; }
 .av-7 { background: #9b59b6; }
@@ -43,7 +81,7 @@ button { border: none; background: none; cursor: pointer; }
 /* server rail pill */
 .guild-pill {
   position: absolute; left: 0; width: 4px;
-  border-radius: 0 4px 4px 0; background: #fff;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--color-white);
   transition: height .2s ease-out, opacity .2s ease-out;
 }
 
@@ -53,7 +91,7 @@ button { border: none; background: none; cursor: pointer; }
   border-radius: 50%; transition: border-radius .2s ease-out, background .2s ease-out;
   overflow: hidden; cursor: pointer;
 }
-.guild-icon:hover, .guild-icon.active { border-radius: 16px; }
+.guild-icon:hover, .guild-icon.active { border-radius: var(--radius-lg); }
 
 /* hover timestamp for compact messages */
 .msg-compact:hover .msg-hover-ts { opacity: 1; }

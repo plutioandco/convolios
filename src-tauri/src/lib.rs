@@ -2,8 +2,15 @@ use std::path::Path;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 
+macro_rules! dev_log {
+  ($($arg:tt)*) => {
+    if cfg!(debug_assertions) { eprintln!($($arg)*); }
+  };
+}
+
 struct AppState {
   http: reqwest::Client,
+  syncing: std::sync::atomic::AtomicBool,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -22,6 +29,7 @@ pub fn run() {
         .expect("failed to build HTTP client");
       app.manage(AppState {
         http: client,
+        syncing: std::sync::atomic::AtomicBool::new(false),
       });
 
       if cfg!(debug_assertions) {
@@ -43,15 +51,18 @@ pub fn run() {
       disconnect_account,
       startup_sync,
       backfill_messages,
+      sync_chat,
       send_message,
       send_attachment,
       send_voice_message,
       add_reaction,
       edit_message,
       fetch_attachment,
+      open_attachment,
       fetch_chat_avatars,
       reconcile_chats,
-      connect_x_account
+      connect_x_account,
+      connect_imessage
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -574,7 +585,7 @@ async fn disconnect_account(
 
   if let Ok(r) = resp {
     if !r.status().is_success() && r.status().as_u16() != 404 {
-      eprintln!("[disconnect] Unipile delete returned {}", r.status().as_u16());
+      dev_log!("[disconnect] Unipile delete returned {}", r.status().as_u16());
     }
   }
 
@@ -585,7 +596,22 @@ async fn disconnect_account(
 }
 
 #[tauri::command]
-async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<String, String> {
+async fn startup_sync(user_id: String, state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<String, String> {
+  if state.syncing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    return Ok("Already syncing".to_string());
+  }
+  let result = startup_sync_inner(&user_id, state.inner(), &app_handle).await;
+  state.syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+  let _ = app_handle.emit("sync-status", serde_json::json!({ "phase": "idle" }));
+  result
+}
+
+async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
+  let emit = |phase: &str, detail: &str| {
+    let _ = app.emit("sync-status", serde_json::json!({ "phase": phase, "detail": detail }));
+  };
+  emit("syncing", "Fetching accounts...");
+
   let (api_key, base) = unipile_config()?;
   let supabase_url =
     std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
@@ -597,6 +623,8 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
     Ok(a) => a,
     Err(e) => { eprintln!("[startup_sync] account fetch failed: {e}"); return Ok(format!("Skipped: {e}")); }
   };
+
+  emit("syncing", &format!("Syncing {} accounts...", accounts.len()));
 
   let now = chrono::Utc::now().to_rfc3339();
   let mut synced = 0u32;
@@ -634,9 +662,17 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
-  match backfill_x_dms(client, &user_id, &supabase_url, &service_key).await {
-    Ok((m, c)) if m > 0 => eprintln!("[startup_sync] X: {m} msgs from {c} chats"),
+  emit("syncing", "Syncing X DMs...");
+  match backfill_x_dms(client, user_id, &supabase_url, &service_key).await {
+    Ok((m, c)) if m > 0 => dev_log!("[startup_sync] X: {m} msgs from {c} chats"),
     Err(e) => eprintln!("[startup_sync] X DM error: {e}"),
+    _ => {}
+  }
+
+  emit("syncing", "Syncing iMessage...");
+  match backfill_imessage(client, user_id, &supabase_url, &service_key).await {
+    Ok((m, c)) if m > 0 => dev_log!("[startup_sync] iMessage: {m} msgs from {c} chats"),
+    Err(e) => eprintln!("[startup_sync] iMessage error: {e}"),
     _ => {}
   }
 
@@ -645,29 +681,9 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
     .cloned()
     .collect();
 
-  for acc in &active_accounts {
+  for (acc_idx, acc) in active_accounts.iter().enumerate() {
     let channel = channel_from_type(&acc.account_type);
-
-    let last_sync_resp = client
-      .get(format!(
-        "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&unipile_account_id=eq.{}&select=sent_at&order=sent_at.desc&limit=1",
-        acc.id
-      ))
-      .header("apikey", &service_key)
-      .header("Authorization", format!("Bearer {service_key}"))
-      .send().await;
-
-    let msg_cutoff = match last_sync_resp {
-      Ok(r) if r.status().is_success() => {
-        let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-        rows.first()
-          .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
-          .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
-            .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
-          .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-      }
-      _ => None,
-    };
+    emit("syncing", &format!("Checking {} ({}/{})", acc.name, acc_idx + 1, active_accounts.len()));
 
     let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
     let chats = match fetch_paginated(client, &chats_url, &api_key, 5).await {
@@ -678,6 +694,26 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
     for chat in &chats {
       let chat_id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if chat_id.is_empty() { continue; }
+
+      let last_sync_resp = client
+        .get(format!(
+          "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&thread_id=eq.{chat_id}&select=sent_at&order=sent_at.desc&limit=1"
+        ))
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .send().await;
+
+      let msg_cutoff: Option<String> = match last_sync_resp {
+        Ok(r) if r.status().is_success() => {
+          let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+          rows.first()
+            .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
+            .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
+              .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
+            .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        }
+        _ => None,
+      };
 
       let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
       let msg_type = if is_group { "group" } else { "dm" };
@@ -697,12 +733,48 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
           .or(chat.get("provider_id"))
           .and_then(|v| v.as_str())
           .unwrap_or(chat_id);
-        sender_handle = normalize_handle(sender_handle_raw, channel);
-        display_name = if !chat_name.is_empty() {
-          chat_name.to_string()
-        } else {
-          sender_handle.clone()
-        };
+        let mut resolved = normalize_handle(sender_handle_raw, channel);
+        let mut resolved_name = if !chat_name.is_empty() { chat_name.to_string() } else { resolved.clone() };
+
+        if channel == "email" {
+          let own_email = acc.email.as_deref().unwrap_or("").to_lowercase();
+          if !own_email.is_empty() && resolved == own_email {
+            let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+            if let Ok(att_resp) = client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+              if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
+                if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
+                  let other = items.iter().find(|a| {
+                    let is_self = a.get("is_self")
+                      .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+                      .unwrap_or(false);
+                    !is_self
+                  });
+                  if let Some(other) = other {
+                    let other_id = other.get("identifier")
+                      .or_else(|| other.get("provider_id"))
+                      .and_then(|v| v.as_str())
+                      .unwrap_or("");
+                    if !other_id.is_empty() {
+                      resolved = normalize_handle(other_id, channel);
+                      let other_name = other.get("display_name")
+                        .or_else(|| other.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                      if !other_name.is_empty() {
+                        resolved_name = other_name.to_string();
+                      } else {
+                        resolved_name = resolved.clone();
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        sender_handle = resolved;
+        display_name = resolved_name;
       }
 
       let person_resp = client
@@ -794,13 +866,13 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
 
       let msgs_url = match &msg_cutoff {
         Some(ts) => {
-          eprintln!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
-          format!("{base}/api/v1/chats/{chat_id}/messages?limit=20&after={ts}")
+          dev_log!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
+          format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}")
         }
-        None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=20"),
+        None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
       };
-      let messages = match fetch_paginated(client, &msgs_url, &api_key, 1).await {
-        Ok(m) => { if !m.is_empty() { eprintln!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
+      let messages = match fetch_paginated(client, &msgs_url, &api_key, 3).await {
+        Ok(m) => { if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
         Err(e) => { eprintln!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
       };
 
@@ -815,6 +887,7 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
           .unwrap_or(false);
         let direction = if is_sender { "outbound" } else { "inbound" };
         let body_text = msg.get("text").and_then(|v| v.as_str());
+        let msg_subject = msg.get("subject").and_then(|v| v.as_str());
 
         let attachments = msg.get("attachments")
           .and_then(|v| v.as_array())
@@ -843,15 +916,46 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
           None
         };
 
+        let hidden = msg.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_event = msg.get("is_event").and_then(|v| v.as_bool()).unwrap_or(false);
+        let event_type_val = msg.get("event_type").and_then(|v| v.as_str());
+        let seen_val = msg.get("seen").and_then(|v| v.as_bool()).unwrap_or(false);
+        let seen_by = msg.get("seen_by").filter(|v| v.is_object()).cloned();
+        let delivered_val = msg.get("delivered").and_then(|v| v.as_bool()).unwrap_or(false);
+        let edited_val = msg.get("edited").and_then(|v| v.as_bool()).unwrap_or(false);
+        let deleted_val = msg.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+        let msg_provider_id = msg.get("provider_id").and_then(|v| v.as_str());
+        let msg_chat_provider_id = msg.get("chat_provider_id").and_then(|v| v.as_str());
+        let quoted_text = msg.get("quoted").and_then(|q| q.get("text")).and_then(|v| v.as_str());
+        let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
+        let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
+        let chat_folder = chat.get("folder").and_then(|v| v.as_str()).unwrap_or("");
+
         let row = serde_json::json!({
           "user_id": user_id, "person_id": person_id,
           "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
           "external_id": external_id, "channel": channel,
           "direction": direction, "message_type": msg_type,
           "body_text": body_text, "attachments": attachments,
+          "subject": msg_subject,
           "thread_id": chat_id, "sent_at": timestamp,
           "sender_name": sender_name,
+          "reactions": reactions,
           "triage": "unclassified", "unipile_account_id": acc.id,
+          "hidden": hidden,
+          "is_event": is_event,
+          "event_type": event_type_val,
+          "seen": seen_val,
+          "seen_by": seen_by,
+          "delivered": delivered_val,
+          "edited": edited_val,
+          "deleted": deleted_val,
+          "provider_id": msg_provider_id,
+          "chat_provider_id": msg_chat_provider_id,
+          "quoted_text": quoted_text,
+          "quoted_sender": quoted_sender,
+          "folder": if chat_folder.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(chat_folder.to_string()) },
+          "read_at": if !is_sender && seen_val { serde_json::Value::String(chrono::Utc::now().to_rfc3339()) } else { serde_json::Value::Null },
         });
 
         let insert = client
@@ -870,7 +974,8 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>) -> Result<Str
   if !to_remove.is_empty() { result.push_str(&format!(", cleaned {}", to_remove.len())); }
   if msgs_synced > 0 { result.push_str(&format!(", backfilled {msgs_synced} msgs (24h)")); }
 
-  eprintln!("[startup_sync] {result}");
+  emit("done", &result);
+  dev_log!("[startup_sync] {result}");
   Ok(result)
 }
 
@@ -910,6 +1015,8 @@ fn channel_from_type(t: &str) -> &'static str {
     "OUTLOOK" | "MICROSOFT" => "email",
     "IMAP" => "email",
     "X" | "TWITTER" => "x",
+    "IMESSAGE" | "APPLE" => "imessage",
+    "MOBILE" | "SMS" | "RCS" => "sms",
     _ => "unknown",
   }
 }
@@ -937,6 +1044,10 @@ fn normalize_handle(raw: &str, channel: &str) -> String {
     if let Some(stripped) = h.strip_prefix("https://www.linkedin.com/in/") {
       h = stripped.trim_end_matches('/').to_string();
     } else if let Some(stripped) = h.strip_prefix("https://linkedin.com/in/") {
+      h = stripped.trim_end_matches('/').to_string();
+    } else if let Some(stripped) = h.strip_prefix("http://www.linkedin.com/in/") {
+      h = stripped.trim_end_matches('/').to_string();
+    } else if let Some(stripped) = h.strip_prefix("http://linkedin.com/in/") {
       h = stripped.trim_end_matches('/').to_string();
     }
   }
@@ -975,7 +1086,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
       let msg_type = if is_group { "group" } else { "dm" };
 
-      let display_name: String;
+      let mut display_name: String;
       let mut sender_handle: String;
       let mut dm_attendee_id: Option<String> = None;
       let mut dm_picture_url: Option<String> = None;
@@ -1050,6 +1161,30 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           .unwrap_or(chat_id)
           .to_string();
         sender_handle = normalize_handle(&sender_handle, channel);
+
+        if channel == "email" {
+          let own_email = acc.email.as_deref().unwrap_or("").to_lowercase();
+          if !own_email.is_empty() && sender_handle == own_email {
+            if let Some(other) = other_attendee {
+              let other_id = other.get("identifier")
+                .or_else(|| other.get("provider_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+              if !other_id.is_empty() {
+                sender_handle = normalize_handle(other_id, channel);
+                let other_name = other.get("display_name")
+                  .or_else(|| other.get("name"))
+                  .and_then(|v| v.as_str())
+                  .unwrap_or("");
+                if !other_name.is_empty() {
+                  display_name = other_name.to_string();
+                } else {
+                  display_name = sender_handle.clone();
+                }
+              }
+            }
+          }
+        }
       }
 
       let person_resp = client
@@ -1153,6 +1288,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         if timestamp.is_empty() { continue; }
 
         let body_text = msg.get("text").and_then(|v| v.as_str());
+        let msg_subject = msg.get("subject").and_then(|v| v.as_str());
 
         let is_sender = msg.get("is_sender")
           .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
@@ -1208,6 +1344,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           "direction": direction,
           "message_type": msg_type,
           "body_text": body_text,
+          "subject": msg_subject,
           "attachments": attachments,
           "thread_id": chat_id,
           "sent_at": timestamp,
@@ -1266,12 +1403,198 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
     Err(e) => errors.push(format!("X DMs: {e}")),
   }
 
+  match backfill_imessage(client, &user_id, &supabase_url, &service_key).await {
+    Ok((msgs, chats)) => {
+      total_messages += msgs;
+      total_chats += chats;
+    }
+    Err(e) => errors.push(format!("iMessage: {e}")),
+  }
+
   let mut result = format!("Backfilled {} messages from {} chats", total_messages, total_chats);
   if !errors.is_empty() {
     let first_errors: Vec<&str> = errors.iter().take(3).map(|s| s.as_str()).collect();
     result.push_str(&format!(" (errors: {})", first_errors.join("; ")));
   }
   Ok(result)
+}
+
+#[tauri::command]
+async fn sync_chat(
+  chat_id: String,
+  user_id: String,
+  person_id: String,
+  channel: String,
+  message_type: String,
+  identity_id: Option<String>,
+  unipile_account_id: Option<String>,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  let account_id = match &unipile_account_id {
+    Some(a) if !a.is_empty() => a.clone(),
+    _ => return Ok("no_account".to_string()),
+  };
+
+  if channel == "x" || channel == "imessage" {
+    return Ok("skip_non_unipile".to_string());
+  }
+
+  let (api_key, base) = unipile_config()?;
+  let supabase_url =
+    std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+  let client = &state.http;
+
+  let last_resp = client
+    .get(format!(
+      "{supabase_url}/rest/v1/messages?thread_id=eq.{chat_id}&user_id=eq.{user_id}&select=sent_at&order=sent_at.desc&limit=1"
+    ))
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .send().await;
+
+  let after_ts = match last_resp {
+    Ok(r) if r.status().is_success() => {
+      let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+      rows.first()
+        .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
+        .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
+          .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
+        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+    }
+    _ => None,
+  };
+
+  let msgs_url = match &after_ts {
+    Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
+    None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
+  };
+  let messages = match fetch_paginated(client, &msgs_url, &api_key, 3).await {
+    Ok(m) => m,
+    Err(e) => return Err(format!("sync_chat fetch: {e}")),
+  };
+
+  if messages.is_empty() {
+    return Ok("0".to_string());
+  }
+
+  let is_group = message_type == "group";
+  let attendee_map: std::collections::HashMap<String, String> = if is_group {
+    let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+    match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+      Ok(r) if r.status().is_success() => {
+        let body: serde_json::Value = r.json().await.unwrap_or_default();
+        body.get("items").and_then(|v| v.as_array()).map(|arr| {
+          arr.iter().filter_map(|a| {
+            let id = a.get("id").and_then(|v| v.as_str())?;
+            let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+              .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+              .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
+            Some((id.to_string(), name.to_string()))
+          }).collect()
+        }).unwrap_or_default()
+      }
+      _ => std::collections::HashMap::new(),
+    }
+  } else {
+    std::collections::HashMap::new()
+  };
+
+  let mut synced = 0u32;
+
+  for msg in &messages {
+    let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if external_id.is_empty() { continue; }
+    let timestamp = msg.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+    if timestamp.is_empty() { continue; }
+
+    let is_sender = msg.get("is_sender")
+      .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+      .unwrap_or(false);
+    let direction = if is_sender { "outbound" } else { "inbound" };
+    let body_text = msg.get("text").and_then(|v| v.as_str());
+    let msg_subject = msg.get("subject").and_then(|v| v.as_str());
+    let attachments = msg.get("attachments")
+      .and_then(|v| v.as_array())
+      .map(|arr| serde_json::Value::Array(arr.clone()))
+      .unwrap_or_else(|| serde_json::json!([]));
+
+    let sender_name: Option<String> = if is_group {
+      msg.get("sender_attendee_id")
+        .and_then(|v| v.as_str())
+        .and_then(|id| attendee_map.get(id))
+        .cloned()
+        .or_else(|| {
+          msg.get("sender_public_identifier")
+            .and_then(|v| v.as_str())
+            .map(|s| s.replace("@s.whatsapp.net", "").replace("@lid", ""))
+            .map(|s| if s.chars().all(|c| c.is_ascii_digit()) { format!("+{s}") } else { s })
+        })
+        .or(Some("Unknown".to_string()))
+    } else {
+      None
+    };
+
+    let hidden = msg.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_event = msg.get("is_event").and_then(|v| v.as_bool()).unwrap_or(false);
+    let event_type_val = msg.get("event_type").and_then(|v| v.as_str());
+    let seen_val = msg.get("seen").and_then(|v| v.as_bool()).unwrap_or(false);
+    let seen_by = msg.get("seen_by").filter(|v| v.is_object()).cloned();
+    let delivered_val = msg.get("delivered").and_then(|v| v.as_bool()).unwrap_or(false);
+    let edited_val = msg.get("edited").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deleted_val = msg.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+    let msg_provider_id = msg.get("provider_id").and_then(|v| v.as_str());
+    let msg_chat_provider_id = msg.get("chat_provider_id").and_then(|v| v.as_str());
+    let quoted_text = msg.get("quoted").and_then(|q| q.get("text")).and_then(|v| v.as_str());
+    let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
+    let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
+
+    let row = serde_json::json!({
+      "user_id": user_id,
+      "person_id": person_id,
+      "identity_id": identity_id,
+      "external_id": external_id,
+      "channel": channel,
+      "direction": direction,
+      "message_type": message_type,
+      "body_text": body_text,
+      "subject": msg_subject,
+      "attachments": attachments,
+      "thread_id": chat_id,
+      "sent_at": timestamp,
+      "sender_name": sender_name,
+      "reactions": reactions,
+      "triage": "unclassified",
+      "unipile_account_id": account_id,
+      "hidden": hidden,
+      "is_event": is_event,
+      "event_type": event_type_val,
+      "seen": seen_val,
+      "seen_by": seen_by,
+      "delivered": delivered_val,
+      "edited": edited_val,
+      "deleted": deleted_val,
+      "provider_id": msg_provider_id,
+      "chat_provider_id": msg_chat_provider_id,
+      "quoted_text": quoted_text,
+      "quoted_sender": quoted_sender,
+      "read_at": if !is_sender && seen_val { serde_json::Value::String(chrono::Utc::now().to_rfc3339()) } else { serde_json::Value::Null },
+    });
+
+    let insert = client
+      .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
+      .header("apikey", &service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .header("Content-Type", "application/json")
+      .header("Prefer", "resolution=merge-duplicates")
+      .json(&row).send().await;
+    if let Ok(r) = insert {
+      if r.status().is_success() || r.status().as_u16() == 409 { synced += 1; }
+    }
+  }
+
+  Ok(format!("{synced}"))
 }
 
 #[tauri::command]
@@ -1294,6 +1617,12 @@ async fn send_message(
     ).await;
   }
 
+  if channel == "imessage" {
+    return send_imessage_dm(
+      &state.http, &chat_id, &text, &user_id, &person_id,
+    ).await;
+  }
+
   let (api_key, base) = unipile_config()?;
   let client = &state.http;
 
@@ -1313,7 +1642,7 @@ async fn send_message(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_message] chat returned 404, resolving current chat");
+    dev_log!("[send_message] chat returned 404, resolving current chat");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let r2 = try_send(&new_cid, Some(&new_aid)).await
@@ -1406,7 +1735,7 @@ async fn resolve_chat(
           .and_then(|c| c.get("id"))
           .and_then(|v| v.as_str())
         {
-          eprintln!("[resolve_chat] found chat on matching account");
+          dev_log!("[resolve_chat] found chat on matching account");
           patch_stale_thread_ids(client, &sb_url, &sb_key, person_id, channel, chat_id).await;
           return Ok((chat_id.to_string(), aid.to_string()));
         }
@@ -1483,7 +1812,7 @@ async fn send_attachment(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_attachment] chat returned 404, resolving...");
+    dev_log!("[send_attachment] chat returned 404, resolving...");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let retry_form = build_form(raw, Some(&new_aid))?;
@@ -1615,7 +1944,7 @@ async fn send_voice_message(
   let body = response.text().await.unwrap_or_default();
 
   let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    eprintln!("[send_voice] chat returned 404, resolving...");
+    dev_log!("[send_voice] chat returned 404, resolving...");
     match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
       Ok((new_cid, new_aid)) => {
         let retry_form = build_form(raw, Some(&new_aid))?;
@@ -1792,6 +2121,20 @@ async fn refresh_and_store_x_token(
   let token_body: serde_json::Value = token_resp.json().await.unwrap_or_default();
 
   if !status.is_success() {
+    let update_url = format!(
+      "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&account_id=eq.{account_id}"
+    );
+    let _ = client
+      .patch(&update_url)
+      .header("apikey", sb_key)
+      .header("Authorization", format!("Bearer {sb_key}"))
+      .header("Content-Type", "application/json")
+      .json(&serde_json::json!({
+        "status": "credentials",
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+      }))
+      .send()
+      .await;
     return Err(format!("X token refresh error {status}: {token_body}"));
   }
 
@@ -2103,6 +2446,325 @@ async fn backfill_x_dms(
   Ok((total_msgs, convo_count))
 }
 
+// ─── iMESSAGE / SMS INTEGRATION ──────────────────────────────────────────────
+
+fn imessage_db_path() -> Result<String, String> {
+  let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+  let path = format!("{home}/Library/Messages/chat.db");
+  if !std::path::Path::new(&path).exists() {
+    return Err("Messages database not found. Make sure you're on macOS with Messages configured.".to_string());
+  }
+  Ok(path)
+}
+
+fn open_imessage_db(db_path: &str) -> Result<rusqlite::Connection, String> {
+  rusqlite::Connection::open_with_flags(
+    db_path,
+    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+  ).map_err(|e| {
+    let msg = e.to_string();
+    if msg.contains("unable to open") || msg.contains("authorization") || msg.contains("permission") {
+      "Cannot access Messages database. Grant Full Disk Access to Convolios in System Settings > Privacy & Security > Full Disk Access.".to_string()
+    } else {
+      format!("Messages database error: {e}")
+    }
+  })
+}
+
+fn apple_date_to_rfc3339(date: i64) -> String {
+  let unix_secs = if date > 1_000_000_000_000_000 {
+    (date / 1_000_000_000) + 978307200
+  } else if date > 1_000_000_000 {
+    date + 978307200
+  } else {
+    return String::new();
+  };
+  chrono::DateTime::from_timestamp(unix_secs, 0)
+    .map(|dt| dt.to_rfc3339())
+    .unwrap_or_default()
+}
+
+#[derive(Debug)]
+struct IMsg {
+  guid: String,
+  text: String,
+  date: i64,
+  is_from_me: bool,
+  _service: String,
+  sender_handle: String,
+  chat_guid: String,
+  group_name: Option<String>,
+  chat_identifier: String,
+}
+
+fn read_imessage_db(db_path: &str, limit: u32) -> Result<Vec<IMsg>, String> {
+  let conn = open_imessage_db(db_path)?;
+
+  let mut stmt = conn.prepare(
+    "SELECT m.guid, m.text, m.date, m.is_from_me, m.service,
+            COALESCE(h.id, '') as sender_handle,
+            c.guid as chat_guid, c.display_name, c.chat_identifier
+     FROM message m
+     JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+     JOIN chat c ON c.ROWID = cmj.chat_id
+     LEFT JOIN handle h ON h.ROWID = m.handle_id
+     WHERE m.text IS NOT NULL AND m.text != ''
+       AND m.associated_message_type = 0
+     ORDER BY m.date DESC
+     LIMIT ?1"
+  ).map_err(|e| format!("SQL prepare: {e}"))?;
+
+  let rows = stmt.query_map([limit], |row| {
+    Ok(IMsg {
+      guid: row.get(0)?,
+      text: row.get(1)?,
+      date: row.get(2)?,
+      is_from_me: row.get::<_, i32>(3)? != 0,
+      _service: row.get::<_, String>(4).unwrap_or_default(),
+      sender_handle: row.get::<_, String>(5).unwrap_or_default(),
+      chat_guid: row.get::<_, String>(6).unwrap_or_default(),
+      group_name: row.get::<_, Option<String>>(7).unwrap_or(None),
+      chat_identifier: row.get::<_, String>(8).unwrap_or_default(),
+    })
+  }).map_err(|e| format!("SQL query: {e}"))?;
+
+  let mut messages = Vec::new();
+  for row in rows {
+    if let Ok(msg) = row { messages.push(msg); }
+  }
+  Ok(messages)
+}
+
+#[tauri::command]
+async fn connect_imessage(
+  user_id: String,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  let db_path = imessage_db_path()?;
+
+  let (handle_count, msg_count) = {
+    let conn = open_imessage_db(&db_path)?;
+    let handles: i64 = conn.query_row("SELECT COUNT(*) FROM handle", [], |r| r.get(0)).unwrap_or(0);
+    let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM message WHERE text IS NOT NULL AND text != ''", [], |r| r.get(0)).unwrap_or(0);
+    (handles, msgs)
+  };
+
+  let sb_url = std::env::var("VITE_SUPABASE_URL")
+    .map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let sb_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+
+  let now = chrono::Utc::now().to_rfc3339();
+  let account_row = serde_json::json!({
+    "user_id": user_id,
+    "provider": "imessage",
+    "channel": "imessage",
+    "account_id": "local-imessage",
+    "status": "active",
+    "display_name": "Messages",
+    "provider_type": "iMessage",
+    "connection_params": {
+      "db_path": "~/Library/Messages/chat.db",
+      "handle_count": handle_count,
+      "message_count": msg_count,
+    },
+    "last_synced_at": now,
+    "updated_at": now,
+  });
+
+  let store_resp = state.http
+    .post(format!("{sb_url}/rest/v1/connected_accounts?on_conflict=user_id,provider,account_id"))
+    .header("apikey", &sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .header("Content-Type", "application/json")
+    .header("Prefer", "resolution=merge-duplicates")
+    .json(&account_row)
+    .send().await
+    .map_err(|e| format!("Failed to store account: {e}"))?;
+
+  if !store_resp.status().is_success() && store_resp.status().as_u16() != 409 {
+    let b = store_resp.text().await.unwrap_or_default();
+    return Err(format!("Failed to save account: {b}"));
+  }
+
+  Ok(format!("Connected! Found {handle_count} contacts and {msg_count} messages."))
+}
+
+async fn backfill_imessage(
+  client: &reqwest::Client,
+  user_id: &str,
+  sb_url: &str,
+  sb_key: &str,
+) -> Result<(u32, u32), String> {
+  let acct_url = format!(
+    "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.imessage&status=eq.active&select=account_id&limit=1"
+  );
+  let acct_resp = client.get(&acct_url)
+    .header("apikey", sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .send().await.map_err(|e| format!("iMessage account lookup: {e}"))?;
+  let rows: Vec<serde_json::Value> = acct_resp.json().await.unwrap_or_default();
+  if rows.is_empty() { return Ok((0, 0)); }
+
+  let db_path = imessage_db_path()?;
+  let messages = read_imessage_db(&db_path, 2000)
+    .map_err(|e| format!("iMessage read: {e}"))?;
+
+  if messages.is_empty() { return Ok((0, 0)); }
+
+  let mut convos: std::collections::HashMap<String, Vec<&IMsg>> =
+    std::collections::HashMap::new();
+  for msg in &messages {
+    if !msg.chat_guid.is_empty() {
+      convos.entry(msg.chat_guid.clone()).or_default().push(msg);
+    }
+  }
+
+  let mut total_msgs = 0u32;
+  let convo_count = convos.len() as u32;
+
+  for (chat_guid, msgs) in &convos {
+    let first = msgs.first().unwrap();
+    let is_group = first.group_name.is_some()
+      || chat_guid.contains(";+;");
+
+    let handle = if is_group {
+      chat_guid.clone()
+    } else {
+      if !first.chat_identifier.is_empty() {
+        first.chat_identifier.clone()
+      } else {
+        msgs.iter()
+          .find(|m| !m.is_from_me && !m.sender_handle.is_empty())
+          .map(|m| m.sender_handle.clone())
+          .unwrap_or_else(|| chat_guid.clone())
+      }
+    };
+
+    let display_name = if is_group {
+      first.group_name.clone()
+        .unwrap_or_else(|| format!("Group ({})", handle))
+    } else {
+      handle.clone()
+    };
+
+    let message_type = if is_group { "group" } else { "dm" };
+
+    let person_url = format!("{sb_url}/rest/v1/rpc/backfill_find_or_create_person");
+    let person_resp = client
+      .post(&person_url)
+      .header("apikey", sb_key)
+      .header("Authorization", format!("Bearer {sb_key}"))
+      .header("Content-Type", "application/json")
+      .header("Accept", "application/vnd.pgrst.object+json")
+      .json(&serde_json::json!({
+        "p_user_id": user_id,
+        "p_channel": "imessage",
+        "p_handle": handle,
+        "p_display_name": display_name,
+        "p_unipile_account_id": "local-imessage",
+      }))
+      .send().await;
+
+    let person_id = match person_resp {
+      Ok(r) if r.status().is_success() => {
+        let b: serde_json::Value = r.json().await.unwrap_or_default();
+        let pid = b.get("person_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if pid.is_empty() { continue; }
+        pid
+      }
+      _ => continue,
+    };
+
+    for msg in msgs {
+      if msg.guid.is_empty() { continue; }
+      let sent_at = apple_date_to_rfc3339(msg.date);
+      if sent_at.is_empty() { continue; }
+
+      let direction = if msg.is_from_me { "outbound" } else { "inbound" };
+      let sender_name = if msg.is_from_me { None } else {
+        Some(if !msg.sender_handle.is_empty() {
+          msg.sender_handle.as_str()
+        } else { "" })
+      };
+
+      let row = serde_json::json!({
+        "user_id": user_id,
+        "person_id": person_id,
+        "external_id": format!("imsg-{}", msg.guid),
+        "channel": "imessage",
+        "direction": direction,
+        "message_type": message_type,
+        "body_text": msg.text,
+        "attachments": [],
+        "thread_id": chat_guid,
+        "sender_name": sender_name,
+        "sent_at": sent_at,
+        "triage": "unclassified",
+      });
+
+      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
+      let msg_resp = client
+        .post(&msg_url)
+        .header("apikey", sb_key)
+        .header("Authorization", format!("Bearer {sb_key}"))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "resolution=merge-duplicates,return=minimal")
+        .json(&row)
+        .send().await;
+
+      if let Ok(r) = msg_resp {
+        if r.status().is_success() || r.status().as_u16() == 409 {
+          total_msgs += 1;
+        }
+      }
+    }
+  }
+
+  Ok((total_msgs, convo_count))
+}
+
+async fn send_imessage_dm(
+  client: &reqwest::Client,
+  chat_id: &str,
+  text: &str,
+  user_id: &str,
+  person_id: &str,
+) -> Result<String, String> {
+  let parts: Vec<&str> = chat_id.splitn(3, ';').collect();
+  let service = parts.first().copied().unwrap_or("iMessage");
+  let handle = parts.get(2).copied().unwrap_or(chat_id);
+
+  if handle.is_empty() {
+    return Err("Cannot determine recipient handle".to_string());
+  }
+
+  let script = format!(
+    "on run argv\n\
+       tell application \"Messages\" to send (item 1 of argv) to buddy (item 2 of argv) \
+       of (1st account whose service type = {service})\n\
+     end run"
+  );
+
+  let output = std::process::Command::new("osascript")
+    .args(["-e", &script, text, handle])
+    .output()
+    .map_err(|e| format!("AppleScript failed: {e}"))?;
+
+  if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    return Err(format!("Messages send failed: {stderr}"));
+  }
+
+  let event_id = format!("imsg-sent-{}", chrono::Utc::now().timestamp_millis());
+  persist_outbound(
+    client, user_id, person_id, "imessage", "dm", text,
+    chat_id, &event_id, &serde_json::json!([]), None,
+  ).await.unwrap_or_else(|e| eprintln!("[send_imessage] persist: {e}"));
+
+  Ok(r#"{"status":"sent"}"#.to_string())
+}
+
 async fn persist_outbound(
   client: &reqwest::Client,
   user_id: &str,
@@ -2123,7 +2785,8 @@ async fn persist_outbound(
   let now = chrono::Utc::now();
   let now_str = now.to_rfc3339();
 
-  let window_start = (now - chrono::Duration::seconds(30)).to_rfc3339();
+  let window_start = (now - chrono::Duration::seconds(10)).to_rfc3339();
+  let window_end = (now + chrono::Duration::seconds(10)).to_rfc3339();
   let body_filter = if body_text.is_empty() {
     "is.null".to_string()
   } else {
@@ -2140,6 +2803,7 @@ async fn persist_outbound(
       ("direction", "eq.outbound"),
       ("body_text", body_filter.as_str()),
       ("sent_at", &format!("gte.{window_start}") as &str),
+      ("sent_at", &format!("lte.{window_end}") as &str),
       ("limit", "1"),
     ])
     .header("apikey", &service_key)
@@ -2205,7 +2869,7 @@ async fn persist_outbound(
 }
 
 #[tauri::command]
-async fn fetch_attachment(message_id: String, attachment_id: String, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+async fn fetch_attachment(message_id: String, attachment_id: String, channel: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
   let cache_dir = app.path().app_cache_dir().map_err(|e| format!("Cache dir error: {e}"))?
     .join("attachments");
   let cache_key = format!("{message_id}_{attachment_id}");
@@ -2220,7 +2884,12 @@ async fn fetch_attachment(message_id: String, attachment_id: String, app: tauri:
   }
 
   let (api_key, base) = unipile_config()?;
-  let url = format!("{base}/api/v1/messages/{message_id}/attachments/{attachment_id}");
+  let is_email = channel.as_deref().map(|c| c == "email").unwrap_or(false);
+  let url = if is_email {
+    format!("{base}/api/v1/emails/{message_id}/attachments/{attachment_id}")
+  } else {
+    format!("{base}/api/v1/messages/{message_id}/attachments/{attachment_id}")
+  };
 
   let response = state.http
     .get(&url)
@@ -2255,6 +2924,65 @@ async fn fetch_attachment(message_id: String, attachment_id: String, app: tauri:
 
   let b64 = base64_encode(&bytes);
   Ok(format!("data:{content_type};base64,{b64}"))
+}
+
+#[tauri::command]
+async fn open_attachment(message_id: String, attachment_id: String, channel: Option<String>, filename: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+  let cache_dir = app.path().app_cache_dir().map_err(|e| format!("Cache dir error: {e}"))?
+    .join("attachments");
+  let cache_key = format!("{message_id}_{attachment_id}");
+  let cache_file = cache_dir.join(&cache_key);
+  let meta_file = cache_dir.join(format!("{cache_key}.meta"));
+
+  let bytes = if cache_file.exists() && meta_file.exists() {
+    std::fs::read(&cache_file).map_err(|e| format!("Read cache: {e}"))?
+  } else {
+    let (api_key, base) = unipile_config()?;
+    let is_email = channel.as_deref().map(|c| c == "email").unwrap_or(false);
+    let url = if is_email {
+      format!("{base}/api/v1/emails/{message_id}/attachments/{attachment_id}")
+    } else {
+      format!("{base}/api/v1/messages/{message_id}/attachments/{attachment_id}")
+    };
+
+    let response = state.http
+      .get(&url)
+      .header("X-API-KEY", &api_key)
+      .send()
+      .await
+      .map_err(|e| format!("Attachment fetch failed: {e}"))?;
+
+    if !response.status().is_success() {
+      return Err("Attachment not found".to_string());
+    }
+
+    let content_type = response.headers().get("content-type")
+      .and_then(|v| v.to_str().ok())
+      .unwrap_or("application/octet-stream")
+      .to_string();
+
+    let data = response.bytes().await.map_err(|e| format!("Read error: {e}"))?.to_vec();
+    if data.is_empty() {
+      return Err("Empty attachment".to_string());
+    }
+
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_file, &data);
+    let _ = std::fs::write(&meta_file, &content_type);
+    data
+  };
+
+  let tmp_dir = std::env::temp_dir().join("convolios-attachments");
+  std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Temp dir: {e}"))?;
+  let raw_name = filename.unwrap_or_else(|| format!("{attachment_id}"));
+  let file_name = Path::new(&raw_name).file_name()
+    .map(|n| n.to_string_lossy().to_string())
+    .unwrap_or_else(|| format!("{attachment_id}"));
+  let tmp_path = tmp_dir.join(&file_name);
+  std::fs::write(&tmp_path, &bytes).map_err(|e| format!("Write temp: {e}"))?;
+
+  open::that(&tmp_path).map_err(|e| format!("Open failed: {e}"))?;
+  Ok(())
 }
 
 #[tauri::command]
@@ -2380,7 +3108,7 @@ async fn reconcile_chats(
       .collect();
 
     if remote_chat_ids.is_empty() {
-      eprintln!("[reconcile] Skipping account {account_id}: Unipile returned 0 chats (API issue or empty account)");
+      dev_log!("[reconcile] Skipping account {account_id}: Unipile returned 0 chats (API issue or empty account)");
       continue;
     }
 

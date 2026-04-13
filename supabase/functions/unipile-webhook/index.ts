@@ -1,7 +1,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing required env: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 const WEBHOOK_SECRET = Deno.env.get("UNIPILE_WEBHOOK_SECRET") ?? "";
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") ?? "";
 const UNIPILE_API_KEY = Deno.env.get("UNIPILE_API_KEY") ?? "";
@@ -21,6 +24,9 @@ const CHANNEL_MAP: Record<string, string> = {
   OUTLOOK: "email",
   MICROSOFT: "email",
   IMAP: "email",
+  MOBILE: "sms",
+  SMS: "sms",
+  RCS: "sms",
 };
 
 interface UnipileWebhook {
@@ -138,7 +144,7 @@ Deno.serve(async (req: Request) => {
     }
   } catch (err) {
     console.error("Webhook handler error:", err);
-    return jsonResponse({ ok: false, error: String(err) }, 500);
+    return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 });
 
@@ -161,13 +167,6 @@ function resolveSenderDirection(
 
 async function handleMessageReceived(payload: UnipileWebhook): Promise<Response> {
   const channel = CHANNEL_MAP[payload.account_type] ?? payload.account_type.toLowerCase();
-
-  console.log("webhook_payload", JSON.stringify({
-    event: payload.event,
-    account_type: payload.account_type,
-    chat_id: payload.chat_id,
-    message_id: payload.message_id,
-  }));
 
   const { data: existing } = await supabase
     .from("messages")
@@ -283,8 +282,8 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   // then adopt the webhook's external_id so future events resolve correctly.
   if (direction === "outbound") {
     const ts = new Date(payload.timestamp).getTime();
-    const windowStart = new Date(ts - 30000).toISOString();
-    const windowEnd = new Date(ts + 30000).toISOString();
+    const windowStart = new Date(ts - 10000).toISOString();
+    const windowEnd = new Date(ts + 10000).toISOString();
 
     const { data: contentDup } = await supabase
       .from("messages")
@@ -295,6 +294,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       .eq("body_text", payload.message ?? "")
       .gte("sent_at", windowStart)
       .lte("sent_at", windowEnd)
+      .order("sent_at", { ascending: false })
       .limit(1)
       .maybeSingle();
 
@@ -406,7 +406,8 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
     const fromAddr = (em.from_attendee?.identifier ?? "").toLowerCase();
     const fromName = em.from_attendee?.display_name ?? fromAddr;
 
-    const direction = em.origin === "internal" ? "outbound" : "inbound";
+    const isSentEvent = (payload.event as string) === "mail_sent";
+    const direction = (isSentEvent || em.origin === "internal") ? "outbound" : "inbound";
     const otherAddr = direction === "inbound"
       ? fromAddr
       : (em.to_attendees?.[0]?.identifier?.toLowerCase() ?? "");
@@ -464,7 +465,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
     return jsonResponse({ ok: true, direction, channel: "email", person_id: personId });
   } catch (err) {
     console.error("Email handler error:", err);
-    return jsonResponse({ ok: false, error: String(err) }, 500);
+    return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 }
 
@@ -735,8 +736,9 @@ async function resolvePersonFromThread(
     .eq("user_id", userId)
     .eq("thread_id", threadId)
     .not("person_id", "is", null)
+    .order("sent_at", { ascending: false })
     .limit(1)
-    .single();
+    .maybeSingle();
   return data;
 }
 

@@ -1,16 +1,18 @@
 import _ from 'lodash'
 import type { Channel, ConnectedAccount } from '../types'
 
-export const CHANNEL_META: Record<Channel, { label: string; abbr: string; color: string }> = {
-  whatsapp:    { label: 'WhatsApp',    abbr: 'WA', color: '#25D366' },
-  linkedin:    { label: 'LinkedIn',    abbr: 'LI', color: '#0A66C2' },
-  instagram:   { label: 'Instagram',   abbr: 'IG', color: '#E4405F' },
-  telegram:    { label: 'Telegram',    abbr: 'TG', color: '#26A5E4' },
-  email:       { label: 'Email',       abbr: 'EM', color: '#b5bac1' },
-  x:           { label: 'X',           abbr: 'X',  color: '#f2f3f5' },
-  slack:       { label: 'Slack',       abbr: 'SL', color: '#E01E5A' },
-  clickup:     { label: 'ClickUp',     abbr: 'CU', color: '#7B68EE' },
-  google_chat: { label: 'Google Chat', abbr: 'GC', color: '#34A853' },
+export const CHANNEL_META: Record<Channel, { label: string; color: string }> = {
+  whatsapp:    { label: 'WhatsApp',    color: '#25D366' },
+  linkedin:    { label: 'LinkedIn',    color: '#0A66C2' },
+  instagram:   { label: 'Instagram',   color: '#E4405F' },
+  telegram:    { label: 'Telegram',    color: '#26A5E4' },
+  email:       { label: 'Email',       color: '#EA4335' },
+  x:           { label: 'X',           color: '#f2f3f5' },
+  imessage:    { label: 'iMessage',    color: '#34C759' },
+  sms:         { label: 'SMS',         color: '#A8B8D8' },
+  slack:       { label: 'Slack',       color: '#E01E5A' },
+  clickup:     { label: 'ClickUp',     color: '#7B68EE' },
+  google_chat: { label: 'Google Chat', color: '#34A853' },
 }
 
 const CHANNEL_ALIAS: Record<string, string> = {
@@ -21,6 +23,8 @@ const CHANNEL_ALIAS: Record<string, string> = {
   microsoft: 'email',
   imap: 'email',
   mail: 'email',
+  mobile: 'sms',
+  rcs: 'sms',
 }
 
 function resolveChannel(ch: string): string {
@@ -29,10 +33,6 @@ function resolveChannel(ch: string): string {
 
 export function channelLabel(ch: string): string {
   return CHANNEL_META[resolveChannel(ch) as Channel]?.label ?? ch
-}
-
-export function channelAbbr(ch: string): string {
-  return CHANNEL_META[resolveChannel(ch) as Channel]?.abbr ?? ch.slice(0, 2).toUpperCase()
 }
 
 export function channelColor(ch: string): string {
@@ -89,16 +89,6 @@ export function initials(name: string): string {
 export function avatarCls(id: string): string {
   const n = id.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
   return `av-${(n % 8) + 1}`
-}
-
-export function channelIcon(ch: string): string {
-  const resolved = resolveChannel(ch)
-  const map: Record<string, string> = {
-    whatsapp: 'WA', linkedin: 'LI', instagram: 'IG',
-    telegram: 'TG', email: 'EM', slack: 'SL',
-    x: 'X', clickup: 'CU', google_chat: 'GC',
-  }
-  return map[resolved] ?? ch.slice(0, 2).toUpperCase()
 }
 
 const ZERO_WIDTH_RE = /[\u00AD\u200B\u200C\u200D\u200E\u200F\uFEFF\u2060\u034F]/g

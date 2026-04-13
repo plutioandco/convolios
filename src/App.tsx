@@ -10,7 +10,7 @@ import { Sidebar } from './components/sidebar/Sidebar'
 import { InboxList } from './components/inbox/InboxList'
 import { ThreadView } from './components/thread/ThreadView'
 import { Settings } from './components/settings/Settings'
-import { useInboxStore } from './stores/inboxStore'
+import { useInboxStore, useSyncStore } from './stores/inboxStore'
 import { useRealtimeMessages } from './hooks/useRealtimeMessages'
 import { useConversations } from './hooks/useConversations'
 import { useAuth, signOut } from './lib/auth'
@@ -18,6 +18,7 @@ import { supabase } from './lib/supabase'
 import { queryClient } from './lib/queryClient'
 import { useAccountsStore } from './stores/accountsStore'
 import { channelLabel, channelColor, accountDisplayLabel } from './utils'
+import { ChannelLogo } from './components/icons/ChannelLogo'
 import type { ConnectedAccount } from './types'
 import _ from 'lodash'
 
@@ -269,24 +270,48 @@ function Authenticated({ userId }: { userId: string }) {
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const subscribe = useAccountsStore((s) => s.subscribe)
   const unsubscribe = useAccountsStore((s) => s.unsubscribe)
+  const syncPhase = useSyncStore((s) => s.phase)
+  const syncDetail = useSyncStore((s) => s.detail)
 
   useEffect(() => {
     fetchAccounts(userId)
     subscribe(userId)
-    invoke('startup_sync', { userId }).catch((e: unknown) => {
+    invoke('startup_sync', { userId }).then(() => {
+      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+    }).catch((e: unknown) => {
       if (import.meta.env.DEV) console.warn('[startup_sync]', e)
     })
 
-    const unlisten = listen('account-disconnected', () => {
+    const syncInterval = setInterval(() => {
+      invoke('startup_sync', { userId }).then(() => {
+        queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+      }).catch((e: unknown) => {
+        if (import.meta.env.DEV) console.warn('[periodic_sync]', e)
+      })
+    }, 300_000)
+
+    const unlistenDisconnect = listen('account-disconnected', () => {
       queryClient.clear()
       del('convolios-query-cache-v7').catch(() => {})
       useInboxStore.getState().selectPerson(null)
       fetchAccounts(userId)
     })
 
+    const { setSync, markDone } = useSyncStore.getState()
+    const unlistenSync = listen<{ phase: string; detail?: string }>('sync-status', (event) => {
+      const { phase, detail } = event.payload
+      if (phase === 'done' || phase === 'idle') {
+        markDone(detail ?? '')
+      } else {
+        setSync('syncing', detail ?? '')
+      }
+    })
+
     return () => {
+      clearInterval(syncInterval)
       unsubscribe()
-      unlisten.then((fn) => fn())
+      unlistenDisconnect.then((fn) => fn())
+      unlistenSync.then((fn) => fn())
     }
   }, [userId, fetchAccounts, subscribe, unsubscribe])
 
@@ -312,6 +337,15 @@ function Authenticated({ userId }: { userId: string }) {
         }}>
           <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: '#000' }} />
           <span style={{ fontSize: 12, color: '#000' }}>Connecting to live updates...</span>
+        </div>
+      )}
+      {syncPhase === 'syncing' && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          padding: '3px 16px', background: '#1e1f22', borderBottom: '1px solid #3f4147', flexShrink: 0,
+        }}>
+          <span className="pulse-dot" style={{ width: 5, height: 5, borderRadius: '50%', background: '#5865f2', flexShrink: 0 }} />
+          <span style={{ fontSize: 11, color: '#949ba4' }}>{syncDetail || 'Syncing...'}</span>
         </div>
       )}
       <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
@@ -413,6 +447,7 @@ function ConnectionPill({ account }: { account: ConnectedAccount }) {
       background: 'rgba(79,84,92,.4)', borderRadius: 10,
     }}>
       <span style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
+      <ChannelLogo channel={account.channel} size={12} color={color} />
       {text}
     </span>
   )

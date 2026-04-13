@@ -28,6 +28,8 @@ export type Channel =
   | 'telegram'
   | 'email'
   | 'x'
+  | 'imessage'
+  | 'sms'
   | 'slack'
   | 'clickup'
   | 'google_chat'

@@ -1,6 +1,12 @@
 import { useRef, useEffect, useState, createElement, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import _ from 'lodash'
+import {
+  Link as LinkIcon, Music, FileText, Film, Paperclip, MapPin,
+  Phone, Video, MessageSquare, Users, CornerDownLeft, Smile,
+  Pencil, X as XIcon, Play, Pause, Mic, Check, CheckCheck, Clock,
+  Download,
+} from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
@@ -8,7 +14,9 @@ import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
 import { useThread, useAddOptimisticMessage } from '../../hooks/useThread'
 import { supabase } from '../../lib/supabase'
-import { channelAbbr, channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
+import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
+import { ChannelLogo } from '../icons/ChannelLogo'
+import * as S from './threadStyles'
 import type { Message } from '../../types'
 
 const URL_SPLIT_RE = /(https?:\/\/[^\s<>]+)/g
@@ -27,11 +35,7 @@ function RichText({ text }: { text: string }) {
               href: part,
               target: '_blank',
               rel: 'noopener noreferrer',
-              style: {
-                color: '#00aff4',
-                textDecoration: 'none',
-                wordBreak: 'break-all' as const,
-              },
+              style: S.inlineLink,
               onMouseEnter: (e: React.MouseEvent<HTMLAnchorElement>) => { e.currentTarget.style.textDecoration = 'underline' },
               onMouseLeave: (e: React.MouseEvent<HTMLAnchorElement>) => { e.currentTarget.style.textDecoration = 'none' },
             }, part)
@@ -56,16 +60,22 @@ interface Attachment {
   post?: { url?: string; author?: string; description?: string }
 }
 
+const DOC_EXTENSIONS = /\.(ics|pdf|zip|rar|7z|gz|tar|csv|xls|xlsx|doc|docx|ppt|pptx|txt|rtf|odt|ods|json|xml|yaml|yml|eml|vcf|svg|key|pages|numbers)$/i
+const DOC_MIMES = /^(application\/|text\/)/
+
 function attType(att: Attachment): string {
   if (att.gif || isGif(att)) return 'gif'
   const t = (att.type ?? '').toLowerCase()
   const mime = att.mimetype ?? att.mime_type ?? ''
+  const name = att.name ?? ''
   if (t === 'media_share') return 'media_share'
   if (t === 'video' || t === 'vid' || mime.startsWith('video/')) return 'video'
   if (att.voice_note || t === 'ptt') return 'voicenote'
   if (t === 'audio' || mime.startsWith('audio/')) return 'audio'
-  if (t === 'document' || t === 'file' || mime === 'application/pdf') return 'document'
   if (att.sticker) return 'sticker'
+  if (t === 'document' || t === 'file' || mime === 'application/pdf') return 'document'
+  if (DOC_EXTENSIONS.test(name)) return 'document'
+  if (mime && DOC_MIMES.test(mime) && !mime.startsWith('text/html')) return 'document'
   return 'image'
 }
 
@@ -106,12 +116,12 @@ function GifPlayer({ src }: { src: string }) {
       onMouseLeave={onLeave}
     >
       <video ref={vidRef} src={src} loop muted playsInline style={{
-        maxWidth: '100%', maxHeight: 300, borderRadius: 8, marginTop: 4, display: 'block',
+        ...S.media, maxHeight: 300,
       }} />
       {frozen && <span style={{
         position: 'absolute', bottom: 10, left: 10, padding: '2px 8px',
-        borderRadius: 4, background: 'rgba(0,0,0,.7)', color: '#fff',
-        fontSize: 11, fontWeight: 600, letterSpacing: '.5px',
+        borderRadius: 'var(--radius-sm)', background: 'rgba(0,0,0,.7)', color: 'var(--color-white)',
+        fontSize: 'var(--font-xs)', fontWeight: 600, letterSpacing: '.5px',
       }}>GIF</span>}
     </span>
   )
@@ -131,22 +141,21 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
       alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out',
     }}>
       <img src={src} alt="" onClick={(e) => e.stopPropagation()} style={{
-        maxWidth: '90vw', maxHeight: '90vh', borderRadius: 8,
+        maxWidth: '90vw', maxHeight: '90vh', borderRadius: 'var(--radius-card)',
         objectFit: 'contain', cursor: 'default',
       }} />
     </div>
   )
 }
 
-function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachment }) {
+function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: Attachment; channel?: string }) {
   const [lightbox, setLightbox] = useState(false)
   const kind = attType(att)
-  const gif = isGif(att)
 
   const { data: src, isLoading, isError } = useQuery({
     queryKey: ['attachment', messageId, att.id],
     queryFn: async () => {
-      const data = await invoke<string>('fetch_attachment', { messageId, attachmentId: att.id })
+      const data = await invoke<string>('fetch_attachment', { messageId, attachmentId: att.id, channel: channel ?? null })
       if (!data) throw new Error('empty')
       return data
     },
@@ -167,21 +176,20 @@ function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachmen
         target="_blank"
         rel="noopener noreferrer"
         style={{
-          display: 'flex', flexDirection: 'column', gap: 4,
-          padding: '10px 14px', borderRadius: 8, background: '#2b2d31',
-          marginTop: 4, maxWidth: 320, textDecoration: 'none',
-          border: '1px solid #3f4147', transition: 'border-color .15s',
+          ...S.cardBordered, display: 'flex', flexDirection: 'column', gap: 4,
+          textDecoration: 'none',
         }}
-        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#5865f2' }}
-        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = '#3f4147' }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-accent)' }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-border)' }}
       >
-        <span style={{ fontSize: 12, color: '#949ba4' }}>
-          {'\uD83D\uDD17'} {author ? `@${author}` : 'Shared post'}
+        <span style={S.meta}>
+          <LinkIcon size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+          {author ? `@${author}` : 'Shared post'}
         </span>
-        {desc && <span style={{ fontSize: 13, color: '#dbdee1', lineHeight: 1.4 }}>
+        {desc && <span style={S.bodyText}>
           {desc.length > 120 ? `${desc.slice(0, 120)}...` : desc}
         </span>}
-        <span style={{ fontSize: 11, color: '#5865f2', wordBreak: 'break-all' }}>
+        <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-accent)', wordBreak: 'break-all' }}>
           {att.post.url}
         </span>
       </a>
@@ -192,32 +200,49 @@ function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachmen
 
   if (unavailable || isError) {
     const label = att.name ?? `${kind} attachment`
-    const icon = kind === 'audio' ? '\uD83C\uDFB5' : kind === 'document' ? '\uD83D\uDCC4' : kind === 'video' ? '\uD83C\uDFAC' : '\uD83D\uDCCE'
+    const iconMap: Record<string, React.ReactNode> = {
+      audio: <Music size={18} />, document: <FileText size={18} />,
+      video: <Film size={18} />,
+    }
+    const icon = iconMap[kind] ?? <Paperclip size={18} />
+    const canOpen = !!att.id && !!messageId && (kind === 'document' || kind === 'audio')
+    const handleClick = canOpen ? () => {
+      invoke('open_attachment', {
+        messageId, attachmentId: att.id, channel: channel ?? null, filename: att.name ?? null,
+      }).catch(() => {})
+    } : undefined
     return (
-      <div style={{
-        display: 'inline-flex', alignItems: 'center', gap: 8,
-        padding: '8px 12px', borderRadius: 8, background: '#2b2d31', marginTop: 4,
-      }}>
-        <span style={{ fontSize: 18 }}>{icon}</span>
-        <span style={{ fontSize: 14, color: '#949ba4' }}>{label}</span>
-      </div>
+      <button onClick={handleClick} disabled={!canOpen} style={{
+        ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8, border: 'none',
+        cursor: canOpen ? 'pointer' : 'default',
+      }}
+      onMouseEnter={(e) => { if (canOpen) e.currentTarget.style.background = 'var(--color-surface-deep)' }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
+        <span style={{ color: 'var(--color-text-muted)' }}>{icon}</span>
+        <span style={{ ...S.label, fontWeight: 400, color: canOpen ? 'var(--color-link)' : 'var(--color-text-muted)' }}>{label}</span>
+        {canOpen && <Download size={14} style={{ flexShrink: 0, opacity: 0.6 }} />}
+      </button>
     )
   }
 
   if (isLoading) {
+    if (kind === 'document' || kind === 'audio') {
+      return (
+        <div style={{ ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8, opacity: 0.6 }}>
+          <span style={{ color: 'var(--color-text-muted)' }}><FileText size={18} /></span>
+          <span style={{ ...S.label, fontWeight: 400, color: 'var(--color-text-muted)' }}>{att.name ?? 'Loading...'}</span>
+        </div>
+      )
+    }
     return (
-      <div style={{
-        width: 200, height: 100, borderRadius: 8, background: '#1e1f22',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        color: '#949ba4', fontSize: 12, marginTop: 4,
-      }}>
+      <div style={S.loadingPlaceholder}>
         loading...
       </div>
     )
   }
 
   if (kind === 'video') {
-    return <video src={src} controls style={{ maxWidth: '100%', maxHeight: 300, borderRadius: 8, marginTop: 4, display: 'block' }} />
+    return <video src={src} controls style={{ ...S.media, maxHeight: 300 }} />
   }
   if (kind === 'voicenote') {
     return <VoiceNotePlayer src={src} duration={att.duration} />
@@ -226,14 +251,24 @@ function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachmen
     return <audio src={src} controls style={{ marginTop: 4, display: 'block', maxWidth: 300 }} />
   }
   if (kind === 'document') {
+    const openDoc = () => {
+      invoke('open_attachment', {
+        messageId, attachmentId: att.id, channel: channel ?? null, filename: att.name ?? null,
+      }).catch(() => {})
+    }
     return (
-      <a href={src} download={att.name} style={{
-        display: 'inline-flex', alignItems: 'center', gap: 8,
-        padding: '8px 12px', borderRadius: 8, background: '#2b2d31', marginTop: 4,
-        color: '#00aff4', textDecoration: 'none', fontSize: 14,
-      }}>
-        {'\uD83D\uDCC4'} {att.name ?? 'Document'}
-      </a>
+      <button onClick={openDoc} style={{
+        ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8,
+        color: 'var(--color-link)', textDecoration: 'none', cursor: 'pointer', border: 'none',
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-surface-deep)' }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
+        <FileText size={16} style={{ flexShrink: 0 }} />
+        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {att.name ?? 'Document'}
+        </span>
+        <Download size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+      </button>
     )
   }
   if (kind === 'gif') {
@@ -247,23 +282,43 @@ function AttachmentMedia({ messageId, att }: { messageId: string; att: Attachmen
       <img
         src={src} alt=""
         onClick={() => setLightbox(true)}
-        style={{ maxWidth: '100%', maxHeight: 350, borderRadius: 8, marginTop: 4, display: 'block', cursor: 'zoom-in' }}
+        style={{ ...S.media, maxHeight: 350, cursor: 'zoom-in' }}
       />
       {lightbox && <Lightbox src={src} onClose={() => setLightbox(false)} />}
     </>
   )
 }
 
-function parseAttachments(raw: unknown): Attachment[] {
-  if (_.isArray(raw)) return raw as Attachment[]
-  if (_.isString(raw)) {
-    try { const parsed = JSON.parse(raw); if (_.isArray(parsed)) return parsed as Attachment[] } catch { /* ignore */ }
+function normalizeAttachment(raw: Record<string, unknown>, idx: number): Attachment {
+  const att = { ...raw } as unknown as Attachment
+  if (!att.id) {
+    att.id = (_.isString(raw.content_id) ? raw.content_id : null)
+      ?? (_.isString(raw.contentId) ? raw.contentId : null)
+      ?? `att-${idx}`
   }
-  return []
+  if (!att.name) {
+    att.name = (_.isString(raw.filename) ? raw.filename : null)
+      ?? (_.isString(raw.file_name) ? raw.file_name : null)
+      ?? undefined
+  }
+  if (!att.mimetype && !att.mime_type) {
+    att.mimetype = (_.isString(raw.content_type) ? raw.content_type : null)
+      ?? (_.isString(raw.contentType) ? raw.contentType : null)
+      ?? undefined
+  }
+  return att
+}
+
+function parseAttachments(raw: unknown): Attachment[] {
+  let items: Record<string, unknown>[] = []
+  if (_.isArray(raw)) items = raw as Record<string, unknown>[]
+  else if (_.isString(raw)) {
+    try { const parsed = JSON.parse(raw); if (_.isArray(parsed)) items = parsed as Record<string, unknown>[] } catch { /* ignore */ }
+  }
+  return items.map((item, i) => normalizeAttachment(item, i))
 }
 
 const REACTION_RE = /^\{\{[^}]+\}\}\s*reacted\s+(.+)$/
-const REACTED_CLEAN_RE = /^\{\{[^}]+\}\}\s*reacted\s+/
 const LID_RE = /\{\{[^}]+@lid\}\}/g
 
 function cleanSenderName(raw: string): string {
@@ -282,43 +337,22 @@ function isReactionMsg(msg: Message): boolean {
   return _.isString(msg.body_text) && REACTION_RE.test(msg.body_text.trim())
 }
 
-function ReactionEvent({ msg }: { msg: Message }) {
-  const emoji = msg.body_text?.trim().replace(REACTED_CLEAN_RE, '') ?? ''
-  const name = msg.sender_name ?? 'Someone'
-  return (
-    <div style={{
-      textAlign: 'center', padding: '2px 16px', fontSize: 13, color: '#949ba4',
-    }}>
-      <span style={{ fontSize: 18, verticalAlign: 'middle' }}>{emoji}</span>
-      {' '}
-      <span>{name} reacted</span>
-    </div>
-  )
-}
-
 function SystemEvent({ msg }: { msg: Message }) {
   const label = msg.body_text ?? msg.event_type ?? 'System event'
-  const icon = CALL_ICON_MAP[label.toLowerCase()] ?? '💬'
+  const lower = label.toLowerCase()
+  const isVideo = lower.includes('video')
+  const isVoice = lower.includes('voice') || lower.includes('call')
+  const icon = isVideo ? <Video size={16} /> : isVoice ? <Phone size={16} /> : <MessageSquare size={16} />
   return (
     <div style={{
-      textAlign: 'center', padding: '6px 16px', fontSize: 13, color: '#949ba4',
+      textAlign: 'center', padding: '6px 16px', fontSize: 'var(--font-md)', color: 'var(--color-text-muted)',
       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
     }}>
       <span>{icon}</span>
       <span style={{ fontStyle: 'italic' }}>{label}</span>
-      <span style={{ fontSize: 11 }}>{shortTime(msg.sent_at)}</span>
+      <span style={{ fontSize: 'var(--font-xs)' }}>{shortTime(msg.sent_at)}</span>
     </div>
   )
-}
-
-const CALL_ICON_MAP: Record<string, string> = {
-  'incoming video call': '📹',
-  'video call ended': '📹',
-  'voice call ended': '📞',
-  'incoming voice call': '📞',
-  'missed voice call': '📞',
-  'missed video call': '📹',
-  'group call': '📞',
 }
 
 const SYSTEM_EVENT_PATTERNS = [
@@ -369,13 +403,13 @@ function LocationCard({ loc }: { loc: ParsedLocation }) {
   const embedUrl = `https://maps.google.com/maps?q=${loc.lat},${loc.lng}&z=15&output=embed`
 
   return (
-    <div style={{ marginTop: 4, borderRadius: 8, overflow: 'hidden', maxWidth: 320, background: '#2b2d31' }}>
+    <div style={{ ...S.card, padding: 0, overflow: 'hidden' }}>
       {expanded ? (
         <iframe
           src={embedUrl}
           width="320"
           height="200"
-          style={{ border: 0, display: 'block', borderRadius: '8px 8px 0 0' }}
+          style={{ border: 0, display: 'block', borderRadius: 'var(--radius-card) var(--radius-card) 0 0' }}
           allowFullScreen
           loading="lazy"
           referrerPolicy="no-referrer-when-downgrade"
@@ -385,25 +419,25 @@ function LocationCard({ loc }: { loc: ParsedLocation }) {
           onClick={() => setExpanded(true)}
           style={{
             width: '100%', height: 120, border: 'none', cursor: 'pointer',
-            background: '#1e1f22', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'var(--color-surface-deep)', display: 'flex', alignItems: 'center', justifyContent: 'center',
             flexDirection: 'column', gap: 4,
           }}
         >
-          <span style={{ fontSize: 32 }}>📍</span>
-          <span style={{ fontSize: 12, color: '#949ba4' }}>Tap to load map</span>
+          <span><MapPin size={32} /></span>
+          <span style={S.meta}>Tap to load map</span>
         </button>
       )}
-      <div style={{ padding: '8px 12px' }}>
-        <div style={{ fontWeight: 600, fontSize: 13, color: '#f2f3f5' }}>{loc.label}</div>
+      <div style={{ padding: 'var(--card-padding)' }}>
+        <div style={{ ...S.label, fontSize: 'var(--font-md)' }}>{loc.label}</div>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
-          <span style={{ fontSize: 11, color: '#949ba4' }}>
+          <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)' }}>
             {loc.lat.toFixed(6)}, {loc.lng.toFixed(6)}
           </span>
           <a
             href={gmapsUrl}
             target="_blank"
             rel="noopener noreferrer"
-            style={{ fontSize: 12, color: '#00aff4', textDecoration: 'none' }}
+            style={S.linkText}
           >
             Open in Maps
           </a>
@@ -428,26 +462,23 @@ function parseVCard(text: string): { name: string; phone: string | null; email: 
 
 function ContactCard({ name, phone, email }: { name: string; phone: string | null; email: string | null }) {
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 12,
-      padding: '12px 16px', borderRadius: 8, background: '#2b2d31', maxWidth: 320, marginTop: 4,
-    }}>
+    <div style={{ ...S.card, display: 'flex', alignItems: 'center', gap: 12 }}>
       <div style={{
-        width: 40, height: 40, borderRadius: '50%', background: '#5865f2',
+        width: 40, height: 40, borderRadius: '50%', background: 'var(--color-accent)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontSize: 18, fontWeight: 600, color: '#fff', flexShrink: 0,
+        fontSize: 18, fontWeight: 600, color: 'var(--color-white)', flexShrink: 0,
       }}>
         {initials(name)}
       </div>
       <div style={{ minWidth: 0 }}>
-        <div style={{ fontWeight: 600, fontSize: 14, color: '#f2f3f5' }}>{name}</div>
+        <div style={S.label}>{name}</div>
         {_.isString(phone) && (
-          <div style={{ fontSize: 12, color: '#00aff4', marginTop: 2 }}>
+          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--color-link)', marginTop: 2 }}>
             <a href={`tel:${phone}`} style={{ color: 'inherit', textDecoration: 'none' }}>{phone}</a>
           </div>
         )}
         {_.isString(email) && (
-          <div style={{ fontSize: 12, color: '#949ba4', marginTop: 1 }}>{email}</div>
+          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--color-text-muted)', marginTop: 1 }}>{email}</div>
         )}
       </div>
     </div>
@@ -492,30 +523,24 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
 
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 8,
-      padding: '8px 12px', borderRadius: 20, background: '#2b2d31', maxWidth: 280, marginTop: 4,
+      ...S.card, display: 'flex', alignItems: 'center', gap: 8,
+      borderRadius: 'var(--radius-pill)', maxWidth: 280,
     }}>
       <audio ref={audioRef} src={src} preload="metadata" />
       <button
         onClick={toggle}
-        style={{
-          width: 32, height: 32, borderRadius: '50%', border: 'none',
-          background: '#5865f2', color: '#fff', cursor: 'pointer',
-          fontSize: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-        }}
+        style={S.accentButton}
       >
-        {playing ? '\u275A\u275A' : '\u25B6'}
+        {playing ? <Pause size={16} /> : <Play size={16} />}
       </button>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{
-          height: 4, borderRadius: 2, background: '#3f4147', overflow: 'hidden',
-        }}>
+        <div style={S.progressTrack}>
           <div style={{
-            height: '100%', borderRadius: 2, background: '#5865f2',
+            ...S.progressFill,
             width: `${progress * 100}%`, transition: 'width 0.1s linear',
           }} />
         </div>
-        <div style={{ fontSize: 11, color: '#949ba4', marginTop: 3 }}>
+        <div style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', marginTop: 3 }}>
           {playing || currentTime > 0 ? formatDuration(currentTime) : dur > 0 ? formatDuration(dur) : ''}
         </div>
       </div>
@@ -587,14 +612,14 @@ function extractEmailPreview(msg: Message): string {
   return ''
 }
 
-const LIGHT_BG_RE = /background(-color)?\s*:\s*(#f[0-9a-f]{5}|#fff[0-9a-f]{0,3}|white|rgb\(\s*2[2-5]\d\s*,\s*2[2-5]\d\s*,\s*2[2-5]\d\s*\))/gi
-const DARK_TEXT_RE = /(?<![a-z-])color\s*:\s*(#[0-4][0-9a-f]{5}|#[0-4][0-9a-f]{2}|black|#000[0-9a-f]{0,3}|rgb\(\s*[0-6]\d?\s*,\s*[0-6]\d?\s*,\s*[0-6]\d?\s*\))/gi
+const LIGHT_BG_RE = /background(-color)?\s*:\s*(#[c-fC-F][0-9a-fA-F]{5}|#[c-fC-F][0-9a-fA-F]{2}|#fff[0-9a-fA-F]{0,3}|white|rgb\(\s*1[7-9]\d\s*,\s*1[7-9]\d\s*,\s*1[7-9]\d\s*\)|rgb\(\s*2[0-5]\d\s*,\s*2[0-5]\d\s*,\s*2[0-5]\d\s*\))/gi
+const DARK_TEXT_RE = /(?<![a-z-])color\s*:\s*(#[0-6][0-9a-fA-F]{5}|#[0-6][0-9a-fA-F]{2}|black|#000[0-9a-fA-F]{0,3}|rgb\(\s*[0-9]\d?\s*,\s*[0-9]\d?\s*,\s*[0-9]\d?\s*\))/gi
 
 function sanitizeEmailHtml(html: string): string {
   const doc = new DOMParser().parseFromString(html, 'text/html')
 
   doc.querySelectorAll(
-    'script, meta[http-equiv], base, object, embed, applet, form, link[rel="stylesheet"]'
+    'script, style, meta[http-equiv], base, object, embed, applet, form, link[rel="stylesheet"]'
   ).forEach((el) => el.remove())
 
   const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT)
@@ -637,6 +662,9 @@ function sanitizeEmailHtml(html: string): string {
       el.setAttribute('rel', 'noopener noreferrer')
     }
 
+    el.removeAttribute('bgcolor')
+    el.removeAttribute('background')
+
     const style = el.getAttribute('style')
     if (_.isString(style)) {
       const patched = style
@@ -652,46 +680,48 @@ function sanitizeEmailHtml(html: string): string {
 const EMAIL_SHADOW_STYLES = `
   :host { display: block; overflow: hidden; }
   .email-root {
-    color: #dbdee1 !important;
+    color: var(--color-text-body) !important;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    font-size: 14px; line-height: 1.6;
+    font-size: var(--font-base); line-height: 1.6;
     word-break: break-word; overflow-wrap: anywhere;
     background: transparent !important;
+    color-scheme: dark;
   }
-  .email-root a { color: #00aff4 !important; }
-  .email-root img { max-width: 100% !important; height: auto !important; border-radius: 4px; }
-  .email-root table { max-width: 100% !important; border-collapse: collapse; table-layout: fixed; }
-  .email-root td, .email-root th { max-width: 100% !important; overflow-wrap: anywhere; }
-  .email-root * { box-sizing: border-box !important; max-width: 100% !important; }
+  .email-root * {
+    box-sizing: border-box !important;
+    max-width: 100% !important;
+    background-color: transparent !important;
+    background-image: none !important;
+    color: inherit !important;
+  }
+  .email-root a { color: var(--color-link) !important; }
+  .email-root img { max-width: 100% !important; height: auto !important; border-radius: var(--radius-sm); }
+  .email-root table { border-collapse: collapse; table-layout: fixed; }
+  .email-root td, .email-root th { overflow-wrap: anywhere; }
   .email-root blockquote {
-    border-left: 3px solid #3f4147;
+    border-left: 3px solid var(--color-border);
     margin: 8px 0; padding: 4px 12px;
-    color: #949ba4;
+    color: var(--color-text-muted) !important;
   }
-  .email-root h1, .email-root h2, .email-root h3 { color: #f2f3f5; }
-  .email-root hr { border: none; border-top: 1px solid #3f4147; margin: 16px 0; }
+  .email-root h1, .email-root h2, .email-root h3, .email-root h4, .email-root h5, .email-root h6 {
+    color: var(--color-text-primary) !important;
+  }
+  .email-root hr { border: none; border-top: 1px solid var(--color-border); margin: 16px 0; }
   .email-root pre, .email-root code {
-    background: #1e1f22; border-radius: 4px; padding: 2px 6px;
-    font-size: 13px; color: #dbdee1;
+    background: var(--color-surface-deep) !important;
+    border-radius: var(--radius-sm); padding: 2px 6px;
+    font-size: var(--font-md); color: var(--color-text-body) !important;
   }
   .email-root pre { padding: 12px; overflow-x: auto; }
   .email-root p { margin: 4px 0; }
-  .email-root [style*="background-color: #ffffff"],
-  .email-root [style*="background-color:#ffffff"],
-  .email-root [style*="background: #ffffff"],
-  .email-root [style*="background:#ffffff"],
-  .email-root [style*="background-color: white"],
-  .email-root [style*="background-color:white"],
-  .email-root [style*="background: white"],
-  .email-root [style*="background:white"] {
-    background-color: transparent !important;
-    background: transparent !important;
+  .email-root [style*="border"][style*="solid"] {
+    border-color: var(--color-border) !important;
   }
-  .email-root [style*="color: #000"],
-  .email-root [style*="color:#000"],
-  .email-root [style*="color: black"],
-  .email-root [style*="color:black"] {
-    color: #dbdee1 !important;
+  .email-root button, .email-root [role="button"], .email-root a[style*="background"] {
+    background: var(--color-surface) !important;
+    color: var(--color-link) !important;
+    border: 1px solid var(--color-border) !important;
+    border-radius: var(--radius-sm);
   }
 `
 
@@ -710,7 +740,7 @@ function EmailRenderer({ html }: { html: string }) {
     shadow.innerHTML = `<style>${EMAIL_SHADOW_STYLES}</style><div class="email-root">${sanitized}</div>`
   }, [html])
 
-  return <div ref={hostRef} style={{ marginTop: 8, borderRadius: 6 }} />
+  return <div ref={hostRef} style={{ marginTop: 8, borderRadius: 'var(--radius-sm)' }} />
 }
 
 function EmailBody({ msg }: { msg: Message }) {
@@ -722,7 +752,7 @@ function EmailBody({ msg }: { msg: Message }) {
   return (
     <div>
       {_.isString(msg.subject) && msg.subject.trim() !== '' && (
-        <div style={{ fontWeight: 600, fontSize: 15, color: '#f2f3f5', marginBottom: 4 }}>
+        <div style={{ fontWeight: 600, fontSize: 'var(--font-lg)', color: 'var(--color-text-primary)', marginBottom: 4 }}>
           {msg.subject}
         </div>
       )}
@@ -730,7 +760,7 @@ function EmailBody({ msg }: { msg: Message }) {
       {expanded && hasHtml
         ? <EmailRenderer html={msg.body_html!} />
         : preview && (
-            <span style={{ color: '#b5bac1', whiteSpace: 'pre-wrap' }}>
+            <span style={{ color: 'var(--color-text-secondary)', whiteSpace: 'pre-wrap' }}>
               {isLong && !expanded ? preview.slice(0, 300) + '...' : preview}
             </span>
           )}
@@ -738,10 +768,7 @@ function EmailBody({ msg }: { msg: Message }) {
       {(hasHtml || isLong) && (
         <button
           onClick={() => setExpanded((v) => !v)}
-          style={{
-            background: 'none', border: 'none', cursor: 'pointer',
-            color: '#00aff4', fontSize: 13, padding: '4px 0 0', display: 'block',
-          }}
+          style={S.textButton}
         >
           {expanded ? 'Collapse' : hasHtml ? 'View full email' : 'Show more'}
         </button>
@@ -763,7 +790,7 @@ function MessageBody({ msg }: { msg: Message }) {
 
   if (msg.deleted) {
     return (
-      <em style={{ color: '#949ba4', fontStyle: 'italic' }}>This message was deleted</em>
+      <em style={S.mutedItalic}>This message was deleted</em>
     )
   }
 
@@ -772,7 +799,7 @@ function MessageBody({ msg }: { msg: Message }) {
       <>
         <EmailBody msg={msg} />
         {hasAttachments && attachments.map((att) => (
-          <AttachmentMedia key={att.id} messageId={msg.external_id ?? msg.id} att={att} />
+          <AttachmentMedia key={att.id} messageId={msg.external_id ?? msg.id} att={att} channel={msg.channel} />
         ))}
       </>
     )
@@ -788,16 +815,13 @@ function MessageBody({ msg }: { msg: Message }) {
   return (
     <>
       {msg.quoted_text && (
-        <div style={{
-          borderLeft: '3px solid #5865f2', padding: '4px 12px', margin: '2px 0 6px',
-          background: 'rgba(88, 101, 242, .08)', borderRadius: '0 4px 4px 0',
-        }}>
+        <div style={S.quotedBlock}>
           {_.isString(msg.quoted_sender) && (
-            <div style={{ fontSize: 12, fontWeight: 600, color: '#5865f2', marginBottom: 2 }}>
+            <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, color: 'var(--color-accent)', marginBottom: 2 }}>
               {msg.quoted_sender}
             </div>
           )}
-          <div style={{ fontSize: 13, color: '#949ba4', lineHeight: '18px' }}>
+          <div style={{ fontSize: 'var(--font-md)', color: 'var(--color-text-muted)', lineHeight: '18px' }}>
             {msg.quoted_text.length > 200 ? msg.quoted_text.slice(0, 200) + '...' : msg.quoted_text}
           </div>
         </div>
@@ -807,16 +831,16 @@ function MessageBody({ msg }: { msg: Message }) {
         <>
           <RichText text={displayText} />
           {msg.edited && (
-            <span style={{ fontSize: 11, color: '#949ba4', marginLeft: 4 }}>(edited)</span>
+            <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', marginLeft: 4 }}>(edited)</span>
           )}
         </>
       )}
       {location && <LocationCard loc={location} />}
       {hasAttachments && attachments.map((att) => (
-        <AttachmentMedia key={att.id} messageId={msg.external_id ?? msg.id} att={att} />
+        <AttachmentMedia key={att.id} messageId={msg.external_id ?? msg.id} att={att} channel={msg.channel} />
       ))}
       {(isEmpty && !hasAttachments && !location && !vcard) || (isUndisplayable && !hasAttachments)
-        ? <em style={{ color: '#949ba4' }}>unsupported message type</em>
+        ? <em style={S.mutedItalic}>unsupported message type</em>
         : null}
     </>
   )
@@ -835,13 +859,13 @@ function Reactions({ reactions }: { reactions: { value?: string; emoji?: string;
       {entries.map(([emoji, reactors]) => (
         <span key={emoji} title={reactors.map((r) => r.sender_id ?? (r.is_sender ? 'You' : 'Someone')).join(', ')} style={{
           display: 'inline-flex', alignItems: 'center', gap: 4,
-          padding: '1px 6px', borderRadius: 8, fontSize: 14, lineHeight: '20px',
-          background: reactors.some((r) => r.is_sender) ? 'rgba(88, 101, 242, .15)' : '#2b2d31',
-          border: reactors.some((r) => r.is_sender) ? '1px solid rgba(88, 101, 242, .4)' : '1px solid #3f4147',
+          padding: '1px 6px', borderRadius: 'var(--radius-card)', fontSize: 'var(--font-base)', lineHeight: '20px',
+          background: reactors.some((r) => r.is_sender) ? 'color-mix(in srgb, var(--color-accent) 15%, transparent)' : 'var(--color-surface)',
+          border: reactors.some((r) => r.is_sender) ? '1px solid color-mix(in srgb, var(--color-accent) 40%, transparent)' : '1px solid var(--color-border)',
           cursor: 'default',
         }}>
           {emoji}
-          {reactors.length > 1 && <span style={{ fontSize: 12, color: '#dbdee1' }}>{reactors.length}</span>}
+          {reactors.length > 1 && <span style={{ fontSize: 'var(--font-sm)', color: 'var(--color-text-body)' }}>{reactors.length}</span>}
         </span>
       ))}
     </div>
@@ -856,6 +880,18 @@ function MessageActions({ msg, onReply, onEdit }: {
   onEdit?: (msg: Message) => void
 }) {
   const [showPicker, setShowPicker] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!showPicker) return
+    const onDown = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setShowPicker(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [showPicker])
 
   const handleReaction = async (emoji: string) => {
     setShowPicker(false)
@@ -871,34 +907,34 @@ function MessageActions({ msg, onReply, onEdit }: {
   return (
     <div className="msg-actions" style={{
       position: 'absolute', top: -16, right: 16,
-      display: 'flex', gap: 2, background: '#2b2d31',
-      borderRadius: 4, border: '1px solid #3f4147',
+      display: 'flex', gap: 2, background: 'var(--color-surface)',
+      borderRadius: 'var(--radius-sm)', border: '1px solid var(--color-border)',
       padding: 2, zIndex: 10,
     }}>
-      <button onClick={() => onReply(msg)} title="Reply" style={actionBtnStyle}>↩</button>
+      <button onClick={() => onReply(msg)} title="Reply" style={actionBtnStyle}><CornerDownLeft size={16} /></button>
       <button onClick={() => setShowPicker((v) => !v)} title="React" style={actionBtnStyle}>
-        😀
-        {showPicker && (
-          <div onClick={(e) => e.stopPropagation()} style={{
-            position: 'absolute', bottom: '100%', right: 0, marginBottom: 4,
-            display: 'flex', gap: 2, padding: 4, borderRadius: 8,
-            background: '#1e1f22', border: '1px solid #3f4147',
-          }}>
-            {QUICK_EMOJIS.map((e) => (
-              <button key={e} onClick={() => handleReaction(e)} style={{
-                background: 'none', border: 'none', cursor: 'pointer',
-                fontSize: 20, padding: '2px 4px', borderRadius: 4,
-              }}
-              onMouseEnter={(ev) => { ev.currentTarget.style.background = '#3f4147' }}
-              onMouseLeave={(ev) => { ev.currentTarget.style.background = '' }}>
-                {e}
-              </button>
-            ))}
-          </div>
-        )}
+        <Smile size={16} />
       </button>
       {onEdit && (
-        <button onClick={() => onEdit(msg)} title="Edit" style={actionBtnStyle}>✏️</button>
+        <button onClick={() => onEdit(msg)} title="Edit" style={actionBtnStyle}><Pencil size={16} /></button>
+      )}
+      {showPicker && (
+        <div ref={pickerRef} onClick={(e) => e.stopPropagation()} style={{
+          position: 'absolute', bottom: '100%', right: 0, marginBottom: 4,
+          display: 'flex', gap: 2, padding: 4, borderRadius: 'var(--radius-card)',
+          background: 'var(--color-surface-deep)', border: '1px solid var(--color-border)',
+        }}>
+          {QUICK_EMOJIS.map((e) => (
+            <button key={e} onClick={() => handleReaction(e)} style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              fontSize: 20, padding: '2px 4px', borderRadius: 'var(--radius-sm)',
+            }}
+            onMouseEnter={(ev) => { ev.currentTarget.style.background = 'var(--color-border)' }}
+            onMouseLeave={(ev) => { ev.currentTarget.style.background = '' }}>
+              {e}
+            </button>
+          ))}
+        </div>
       )}
     </div>
   )
@@ -906,8 +942,8 @@ function MessageActions({ msg, onReply, onEdit }: {
 
 const actionBtnStyle: React.CSSProperties = {
   background: 'none', border: 'none', cursor: 'pointer',
-  padding: '2px 6px', fontSize: 16, borderRadius: 4,
-  color: '#b5bac1', lineHeight: 1,
+  padding: '2px 6px', fontSize: 16, borderRadius: 'var(--radius-sm)',
+  color: 'var(--color-text-secondary)', lineHeight: 1,
 }
 
 export function ThreadView() {
@@ -941,6 +977,37 @@ export function ThreadView() {
     if (!pid || !user?.id) return
     markRead(user.id, pid)
   }, [pid, markRead, user?.id])
+
+  useEffect(() => {
+    if (!pid || !user?.id || !chatId) return
+    const last = _.last(thread)
+    const args = {
+      chatId,
+      userId: user.id,
+      personId: pid,
+      channel: last?.channel ?? convo?.lastMessage?.channel ?? '',
+      messageType: last?.message_type ?? convo?.lastMessage?.message_type ?? 'dm',
+      identityId: last?.identity_id ?? null,
+      unipileAccountId: last?.unipile_account_id ?? convo?.lastMessage?.unipile_account_id ?? null,
+    }
+    if (!args.channel) return
+
+    const doSync = () => {
+      invoke<string>('sync_chat', args)
+        .then((n) => {
+          const count = parseInt(n as string, 10)
+          if (count > 0) {
+            qc.invalidateQueries({ queryKey: ['thread', pid] })
+            qc.invalidateQueries({ queryKey: ['conversations', user!.id] })
+          }
+        })
+        .catch(() => {})
+    }
+
+    doSync()
+    const interval = setInterval(doSync, 30_000)
+    return () => clearInterval(interval)
+  }, [pid, user?.id, chatId])
 
   useEffect(() => {
     if (!isGroup) { setMemberAvatars({}); return }
@@ -1019,7 +1086,7 @@ export function ThreadView() {
   if (!pid) return <EmptyState />
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: '#313338' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--color-bg)' }}>
       <div ref={scrollContainerRef} className="chat-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column-reverse' }}>
         <div>
           {person && (
@@ -1028,11 +1095,11 @@ export function ThreadView() {
                 {isGroup
                   ? <div className={avatarCls(person.id)}
                       style={{
-                        width: 80, height: 80, borderRadius: 16,
+                        width: 80, height: 80, borderRadius: 'var(--radius-lg)',
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        fontSize: 32, fontWeight: 700, color: '#fff',
+                        color: 'var(--color-white)',
                       }}>
-                      {'\uD83D\uDC65'}
+                      <Users size={36} />
                     </div>
                   : person.avatar_url
                     ? <img src={person.avatar_url} alt="" style={{
@@ -1042,12 +1109,12 @@ export function ThreadView() {
                         style={{
                           width: 80, height: 80, borderRadius: '50%',
                           display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          fontSize: 32, fontWeight: 700, color: '#fff',
+                          fontSize: 32, fontWeight: 700, color: 'var(--color-white)',
                         }}>
                         {initials(person.display_name)}
                       </div>}
-                <h3 style={{ fontSize: 24, fontWeight: 700, color: '#f2f3f5', marginTop: 8 }}>{person.display_name}</h3>
-                <p style={{ fontSize: 14, color: '#b5bac1', marginTop: 4 }}>
+                <h3 style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text-primary)', marginTop: 8 }}>{person.display_name}</h3>
+                <p style={{ fontSize: 'var(--font-base)', color: 'var(--color-text-secondary)', marginTop: 4 }}>
                   {isGroup
                     ? <>This is the beginning of <strong>{person.display_name}</strong>.</>
                     : <>This is the beginning of your conversation with <strong>{person.display_name}</strong>.</>}
@@ -1058,7 +1125,7 @@ export function ThreadView() {
 
           {thread.length === 0 && !person && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <p style={{ color: '#b5bac1', fontSize: 16 }}>No messages yet</p>
+              <p style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--font-body)' }}>No messages yet</p>
             </div>
           )}
 
@@ -1082,6 +1149,8 @@ export function ThreadView() {
                 )
               }
 
+              if (isReactionMsg(msg)) return null
+
               const isMe = isMine(msg, mySenderNames)
               const prevIsMe = prev ? isMine(prev, mySenderNames) : false
               const msgIsGroup = msg.message_type === 'group'
@@ -1097,9 +1166,7 @@ export function ThreadView() {
               return (
                 <div key={msg.id}>
                   {showDivider && <DayDivider iso={msg.sent_at} />}
-                  {isReactionMsg(msg)
-                    ? <ReactionEvent msg={msg} />
-                    : editingMsg?.id === msg.id
+                  {editingMsg?.id === msg.id
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
                       : sameGroup
                         ? <MsgCompact msg={msg} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />
@@ -1118,18 +1185,18 @@ export function ThreadView() {
 
 function EmptyState() {
   return (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#313338', userSelect: 'none' }}>
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-bg)', userSelect: 'none' }}>
       <div style={{ textAlign: 'center' }}>
         <div className="av-1"
           style={{
             width: 80, height: 80, borderRadius: '50%',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 32, fontWeight: 700, color: '#fff', margin: '0 auto 16px',
+            fontSize: 32, fontWeight: 700, color: 'var(--color-white)', margin: '0 auto 16px',
           }}>
           C
         </div>
-        <h2 style={{ fontSize: 24, fontWeight: 700, color: '#f2f3f5' }}>Welcome back!</h2>
-        <p style={{ fontSize: 16, marginTop: 4, color: '#b5bac1' }}>Select a conversation to start</p>
+        <h2 style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text-primary)' }}>Welcome back!</h2>
+        <p style={{ fontSize: 'var(--font-body)', marginTop: 4, color: 'var(--color-text-secondary)' }}>Select a conversation to start</p>
       </div>
     </div>
   )
@@ -1138,30 +1205,31 @@ function EmptyState() {
 function DayDivider({ iso }: { iso: string }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', margin: '24px 16px 8px', position: 'relative' }}>
-      <div style={{ flex: 1, height: 1, background: '#3f4147' }} />
+      <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
       <span style={{
-        padding: '0 8px', fontSize: 12, fontWeight: 600, lineHeight: '13px',
-        color: '#949ba4', background: '#313338',
+        padding: '0 8px', fontSize: 'var(--font-sm)', fontWeight: 600, lineHeight: '13px',
+        color: 'var(--color-text-muted)', background: 'var(--color-bg)',
       }}>
         {dateDivider(iso)}
       </span>
-      <div style={{ flex: 1, height: 1, background: '#3f4147' }} />
+      <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
     </div>
   )
 }
 
 function DeliveryStatus({ msg }: { msg: Message }) {
   const isOptimistic = msg.id.startsWith('opt-')
+  const iconStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', marginLeft: 6, verticalAlign: 'middle' }
   if (isOptimistic) {
-    return <span style={{ fontSize: 11, color: '#6d6f78', marginLeft: 6, verticalAlign: 'middle' }}>{'\u23F3'}</span>
+    return <span style={{ ...iconStyle, color: 'var(--color-text-pending)' }}><Clock size={12} /></span>
   }
   if (msg.seen) {
-    return <span style={{ fontSize: 11, color: '#00aff4', marginLeft: 6, verticalAlign: 'middle' }}>{'\u2713\u2713'}</span>
+    return <span style={{ ...iconStyle, color: 'var(--color-link)' }}><CheckCheck size={12} /></span>
   }
   if (msg.delivered) {
-    return <span style={{ fontSize: 11, color: '#949ba4', marginLeft: 6, verticalAlign: 'middle' }}>{'\u2713\u2713'}</span>
+    return <span style={{ ...iconStyle, color: 'var(--color-text-muted)' }}><CheckCheck size={12} /></span>
   }
-  return <span style={{ fontSize: 11, color: '#949ba4', marginLeft: 6, verticalAlign: 'middle' }}>{'\u2713'}</span>
+  return <span style={{ ...iconStyle, color: 'var(--color-text-muted)' }}><Check size={12} /></span>
 }
 
 function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: string, text: string) => void; onCancel: () => void }) {
@@ -1179,8 +1247,8 @@ function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: 
   return (
     <div style={{ padding: '4px 48px 4px 72px' }}>
       <div style={{
-        borderRadius: 8, background: '#383a40', padding: 8,
-        border: '1px solid #5865f2',
+        borderRadius: 'var(--radius-card)', background: 'var(--color-surface-input)', padding: 8,
+        border: '1px solid var(--color-accent)',
       }}>
         <textarea ref={ref} rows={1} value={text} onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -1189,20 +1257,20 @@ function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: 
           }}
           style={{
             width: '100%', background: 'transparent', border: 'none', outline: 'none',
-            resize: 'none', color: '#dbdee1', fontSize: 15, lineHeight: '20px',
+            resize: 'none', color: 'var(--color-text-body)', fontSize: 'var(--font-lg)', lineHeight: '20px',
           }} />
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
           <button onClick={onCancel} style={{
             background: 'none', border: 'none', cursor: 'pointer',
-            color: '#949ba4', fontSize: 12, fontWeight: 600,
+            color: 'var(--color-text-muted)', fontSize: 'var(--font-sm)', fontWeight: 600,
           }}>Cancel</button>
           <button onClick={() => onSubmit(msg.id, text.trim())} style={{
-            background: '#5865f2', border: 'none', cursor: 'pointer',
-            color: '#fff', fontSize: 12, fontWeight: 600, padding: '4px 12px', borderRadius: 4,
+            background: 'var(--color-accent)', border: 'none', cursor: 'pointer',
+            color: 'var(--color-white)', fontSize: 'var(--font-sm)', fontWeight: 600, padding: '4px 12px', borderRadius: 'var(--radius-sm)',
           }}>Save</button>
         </div>
       </div>
-      <span style={{ fontSize: 11, color: '#949ba4' }}>Escape to cancel · Enter to save</span>
+      <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)' }}>Escape to cancel · Enter to save</span>
     </div>
   )
 }
@@ -1224,7 +1292,7 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
       ? (hasSender ? cleanSenderName(msg.sender_name!) : 'Member')
       : (person?.display_name ?? 'Unknown')
   const name = rawName
-  const nameClr = out ? '#23a559' : channelColor(msg.channel)
+  const nameClr = out ? 'var(--color-success)' : 'var(--color-text-primary)'
   const av = out ? 'av-6' : avatarCls(msg.sender_name ?? person?.id ?? msg.id)
 
   const senderPic = out
@@ -1250,30 +1318,23 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
         : <div className={av} style={{
             position: 'absolute', left: 16, top: 2, width: 40, height: 40, borderRadius: '50%',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 15, fontWeight: 600, color: '#fff', cursor: 'pointer',
+            fontSize: 'var(--font-lg)', fontWeight: 600, color: 'var(--color-white)', cursor: 'pointer',
           }}>
             {out ? 'Y' : initials(name)}
           </div>}
 
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, flexWrap: 'wrap', minWidth: 0 }}>
-        <span style={{ fontSize: 16, fontWeight: 500, lineHeight: '22px', color: nameClr, cursor: 'pointer' }}>
+        <span style={{ fontSize: 'var(--font-body)', fontWeight: 500, lineHeight: '22px', color: nameClr, cursor: 'pointer' }}>
           {name}
         </span>
-        <span style={{
-          fontSize: 10, fontWeight: 600, lineHeight: '15px', padding: '0 4px',
-          borderRadius: 3, background: `color-mix(in srgb, ${channelColor(msg.channel)} 25%, transparent)`,
-          color: channelColor(msg.channel),
-        }}>
-          {channelAbbr(msg.channel)}
-        </span>
-        <span style={{ fontSize: 12, lineHeight: '22px', color: '#949ba4', marginLeft: 4 }}>
+        <ChannelLogo channel={msg.channel} size={14} color={channelColor(msg.channel)} style={{ flexShrink: 0, verticalAlign: 'middle' }} />
+        <span style={{ fontSize: 'var(--font-sm)', lineHeight: '22px', color: 'var(--color-text-muted)', marginLeft: 4 }}>
           {formatTimestamp(msg.sent_at)}
         </span>
       </div>
 
-      <div style={{ fontSize: 16, lineHeight: '22px', color: '#dbdee1', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-        <MessageBody msg={msg} />
-        {out && <DeliveryStatus msg={msg} />}
+      <div style={S.msgBody}>
+        <span><MessageBody msg={msg} />{out && <DeliveryStatus msg={msg} />}</span>
       </div>
 
       <Reactions reactions={msg.reactions} />
@@ -1293,15 +1354,14 @@ function MsgCompact({ msg, onReply, onEdit }: { msg: Message; onReply: (msg: Mes
       {hovered && <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />}
       <span className="msg-hover-ts" style={{
         position: 'absolute', left: 0, width: 56, textAlign: 'right', paddingRight: 4,
-        fontSize: 11, lineHeight: '22px', color: '#949ba4', opacity: 0,
+        fontSize: 'var(--font-xs)', lineHeight: '22px', color: 'var(--color-text-muted)', opacity: 0,
         transition: 'opacity .1s',
       }}>
         {shortTime(msg.sent_at)}
       </span>
 
-      <div style={{ fontSize: 16, lineHeight: '22px', color: '#dbdee1', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-        <MessageBody msg={msg} />
-        {out && <DeliveryStatus msg={msg} />}
+      <div style={S.msgBody}>
+        <span><MessageBody msg={msg} />{out && <DeliveryStatus msg={msg} />}</span>
       </div>
 
       <Reactions reactions={msg.reactions} />
@@ -1648,7 +1708,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
   if (!resolvedChatId) {
     return (
       <div style={{ padding: '0 16px 24px' }}>
-        <div style={{ borderRadius: 8, padding: '11px 16px', background: '#383a40', color: '#949ba4', fontSize: 16 }}>
+        <div style={{ borderRadius: 'var(--radius-card)', padding: '11px 16px', background: 'var(--color-surface-input)', color: 'var(--color-text-muted)', fontSize: 'var(--font-body)' }}>
           No chat context
         </div>
       </div>
@@ -1668,7 +1728,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
               display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px',
               borderRadius: 4, background: 'rgba(237, 66, 69, .1)', marginBottom: 2,
             }}>
-              <span style={{ fontSize: 12, color: '#ed4245', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--color-danger)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 Failed to send: {cleanPreviewText(m.body_text ?? '').slice(0, 40)}
               </span>
               <button onClick={() => {
@@ -1681,7 +1741,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
                 sendText(bodyText)
               }} style={{
                 background: 'none', border: 'none', cursor: 'pointer',
-                color: '#ed4245', fontSize: 12, fontWeight: 600, flexShrink: 0,
+                color: 'var(--color-danger)', fontSize: 'var(--font-sm)', fontWeight: 600, flexShrink: 0,
               }}>Retry</button>
             </div>
           ))}
@@ -1691,48 +1751,48 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
       {replyTo && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-          background: '#2b2d31', borderRadius: '8px 8px 0 0', borderBottom: '2px solid #5865f2',
+          background: 'var(--color-surface)', borderRadius: 'var(--radius-card) var(--radius-card) 0 0', borderBottom: '2px solid var(--color-accent)',
         }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: '#5865f2' }}>
+            <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, color: 'var(--color-accent)' }}>
               Replying to {replyTo.direction === 'outbound' ? 'yourself' : (replyTo.sender_name ?? personName ?? 'message')}
             </div>
-            <div style={{ fontSize: 13, color: '#949ba4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ fontSize: 'var(--font-md)', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {cleanPreviewText(replyTo.body_text ?? '').slice(0, 80)}
             </div>
           </div>
           <button onClick={onClearReply} style={{
             background: 'none', border: 'none', cursor: 'pointer',
-            color: '#949ba4', fontSize: 16, padding: 4, flexShrink: 0,
-          }}>{'\u2715'}</button>
+            color: 'var(--color-text-muted)', padding: 4, flexShrink: 0,
+          }}><XIcon size={16} /></button>
         </div>
       )}
 
       <div style={{
-        borderRadius: replyTo ? '0 0 8px 8px' : 8, background: '#383a40',
-        border: dragOver ? '2px solid #5865f2' : '2px solid transparent',
+        borderRadius: replyTo ? '0 0 var(--radius-card) var(--radius-card)' : 'var(--radius-card)', background: 'var(--color-surface-input)',
+        border: dragOver ? '2px solid var(--color-accent)' : '2px solid transparent',
         transition: 'border-color .15s',
       }}>
         {files.length > 0 && (
           <div style={{ display: 'flex', gap: 8, padding: '8px 12px 0', flexWrap: 'wrap' }}>
             {files.map((f, i) => (
               <div key={i} style={{
-                position: 'relative', borderRadius: 8, background: '#2b2d31',
+                position: 'relative', borderRadius: 'var(--radius-card)', background: 'var(--color-surface)',
                 overflow: 'hidden', width: 80, height: 80,
               }}>
                 {f.preview
                   ? <img src={f.preview} alt="" style={{ width: 80, height: 80, objectFit: 'cover' }} />
                   : <div style={{
                       width: 80, height: 80, display: 'flex', alignItems: 'center',
-                      justifyContent: 'center', fontSize: 11, color: '#949ba4', padding: 4,
+                      justifyContent: 'center', fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', padding: 4,
                       textAlign: 'center', wordBreak: 'break-all',
                     }}>{f.name}</div>}
                 <button onClick={() => removeFile(i)} style={{
                   position: 'absolute', top: 2, right: 2, width: 20, height: 20,
-                  borderRadius: '50%', background: 'rgba(0,0,0,.7)', color: '#fff',
-                  border: 'none', cursor: 'pointer', fontSize: 12, lineHeight: '20px',
+                  borderRadius: '50%', background: 'rgba(0,0,0,.7)', color: 'var(--color-white)',
+                  border: 'none', cursor: 'pointer', lineHeight: '20px',
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}>{'\u2715'}</button>
+                }}><XIcon size={12} /></button>
               </div>
             ))}
           </div>
@@ -1741,25 +1801,25 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
         <div style={{ display: 'flex', alignItems: 'flex-end' }}>
           <button onClick={() => fileRef.current?.click()} style={{
             background: 'none', border: 'none', cursor: 'pointer', padding: '10px 4px 10px 12px',
-            color: '#b5bac1', fontSize: 22, lineHeight: 1, flexShrink: 0,
-          }} title="Attach file">{'\u{1F4CE}'}</button>
+            color: 'var(--color-text-secondary)', lineHeight: 1, flexShrink: 0,
+          }} title="Attach file"><Paperclip size={20} /></button>
           <input ref={fileRef} type="file" multiple hidden
             onChange={(e) => { addFiles(e.target.files); e.target.value = '' }} />
 
           {recording ? (
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, padding: '11px 10px' }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#ed4245', animation: 'pulse 1s infinite' }} />
-              <span style={{ fontSize: 14, color: '#ed4245', fontWeight: 600 }}>
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--color-danger)', animation: 'pulse 1s infinite' }} />
+              <span style={{ fontSize: 'var(--font-base)', color: 'var(--color-danger)', fontWeight: 600 }}>
                 Recording {formatDuration(recordDuration)}
               </span>
               <div style={{ flex: 1 }} />
               <button onClick={cancelRecording} style={{
                 background: 'none', border: 'none', cursor: 'pointer',
-                color: '#949ba4', fontSize: 14, padding: '2px 8px',
+                color: 'var(--color-text-muted)', fontSize: 'var(--font-base)', padding: '2px 8px',
               }}>Cancel</button>
               <button onClick={sendVoice} style={{
-                background: '#5865f2', border: 'none', cursor: 'pointer',
-                color: '#fff', fontSize: 13, fontWeight: 600, padding: '4px 12px', borderRadius: 4,
+                background: 'var(--color-accent)', border: 'none', cursor: 'pointer',
+                color: 'var(--color-white)', fontSize: 'var(--font-md)', fontWeight: 600, padding: '4px 12px', borderRadius: 'var(--radius-sm)',
               }}>Send</button>
             </div>
           ) : (
@@ -1774,16 +1834,16 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
                 placeholder={`Message @${personName ?? 'this chat'}`}
                 style={{
                   flex: 1, background: 'transparent', outline: 'none', resize: 'none',
-                  padding: '11px 10px 11px 4px', fontSize: 16, lineHeight: '22px',
-                  color: '#dbdee1', maxHeight: 200, border: 'none',
+                  padding: '11px 10px 11px 4px', fontSize: 'var(--font-body)', lineHeight: '22px',
+                  color: 'var(--color-text-body)', maxHeight: 200, border: 'none',
                 }}
               />
               {!text.trim() && files.length === 0 && (
                 <button onClick={startRecording} title="Voice message" style={{
                   background: 'none', border: 'none', cursor: 'pointer',
-                  padding: '10px 12px 10px 4px', color: '#b5bac1', fontSize: 20,
+                  padding: '10px 12px 10px 4px', color: 'var(--color-text-secondary)',
                   lineHeight: 1, flexShrink: 0,
-                }}>🎙</button>
+                }}><Mic size={20} /></button>
               )}
             </>
           )}
@@ -1792,13 +1852,13 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
 
       {dragOver && (
         <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(88, 101, 242, .12)',
+          position: 'fixed', inset: 0, background: 'color-mix(in srgb, var(--color-accent) 12%, transparent)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           pointerEvents: 'none', zIndex: 999,
         }}>
           <div style={{
-            padding: '32px 48px', borderRadius: 16, background: '#5865f2',
-            color: '#fff', fontSize: 20, fontWeight: 600,
+            padding: '32px 48px', borderRadius: 'var(--radius-lg)', background: 'var(--color-accent)',
+            color: 'var(--color-white)', fontSize: 20, fontWeight: 600,
           }}>
             Drop files to upload
           </div>

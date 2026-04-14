@@ -19,8 +19,18 @@ let _channel: RealtimeChannel | null = null
 let _pollTimer: ReturnType<typeof setInterval> | null = null
 let _debouncedRefetch: ReturnType<typeof _.debounce> | null = null
 
+const ACCOUNTS_CACHE_KEY = 'convolios-accounts-v1'
+
+function loadCachedAccounts(): ConnectedAccount[] {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNTS_CACHE_KEY)
+    if (raw) return JSON.parse(raw) as ConnectedAccount[]
+  } catch { /* ignore corrupt cache */ }
+  return []
+}
+
 export const useAccountsStore = create<AccountsState>((set, get) => ({
-  accounts: [],
+  accounts: loadCachedAccounts(),
   loading: false,
   error: null,
 
@@ -34,7 +44,9 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         .order('created_at', { ascending: false })
 
       if (error) throw error
-      set({ accounts: (data as ConnectedAccount[]) ?? [], loading: false })
+      const fresh = (data as ConnectedAccount[]) ?? []
+      try { window.localStorage.setItem(ACCOUNTS_CACHE_KEY, JSON.stringify(fresh)) } catch { /* best-effort cache */ }
+      set({ accounts: fresh, loading: false })
     } catch (err) {
       set({ error: String(err), loading: false })
     }

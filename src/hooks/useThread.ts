@@ -23,10 +23,33 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
 
       const { data, error } = await query
       if (error) throw error
-      return [...((data as Message[]) ?? [])].reverse()
+
+      const raw = [...((data as Message[]) ?? [])].reverse()
+
+      // Pass 1: deduplicate by external_id (Unipile can return same message with
+      // two different IDs in send-response vs. chat-history, causing two DB rows).
+      const seenExtIds = new Set<string>()
+      const pass1 = raw.filter((m) => {
+        if (!_.isString(m.external_id)) return true
+        if (seenExtIds.has(m.external_id)) return false
+        seenExtIds.add(m.external_id)
+        return true
+      })
+
+      // Pass 2: content-based dedup for messages with NULL external_id
+      // (same sent_at + direction + body_text = same message, different DB rows).
+      const seenContent = new Set<string>()
+      return pass1.filter((m) => {
+        if (_.isString(m.external_id)) return true
+        const key = `${m.direction}:${m.sent_at}:${m.body_text ?? ''}`
+        if (seenContent.has(key)) return false
+        seenContent.add(key)
+        return true
+      })
     },
     enabled: _.isString(personId) && _.isString(userId),
     refetchInterval: interval,
+    staleTime: 30_000,
   })
 }
 

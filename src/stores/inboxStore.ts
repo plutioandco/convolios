@@ -8,8 +8,14 @@ import type { Channel, TriageLevel } from '../types'
 interface InboxState {
   selectedPersonId: string | null
   activeChannel: Channel | 'all'
+  activeView: 'inbox' | 'screener' | 'blocked'
+  activeCircleId: string | null
+  readFilter: 'all' | 'unread'
 
   setActiveChannel: (channel: Channel | 'all') => void
+  setActiveView: (view: InboxState['activeView']) => void
+  setActiveCircleId: (circleId: string | null) => void
+  setReadFilter: (filter: InboxState['readFilter']) => void
   selectPerson: (personId: string | null) => void
   markConversationRead: (userId: string, personId: string) => Promise<void>
 }
@@ -17,14 +23,21 @@ interface InboxState {
 export const useInboxStore = create<InboxState>((set) => ({
   selectedPersonId: null,
   activeChannel: 'all',
+  activeView: 'inbox',
+  activeCircleId: null,
+  readFilter: 'all',
 
-  setActiveChannel: (channel) => set({ activeChannel: channel }),
+  setActiveChannel: (channel) => set({ activeChannel: channel, activeView: 'inbox', activeCircleId: null }),
+  setActiveView: (activeView) => set({ activeView, activeCircleId: null, activeChannel: 'all', readFilter: 'all' }),
+  setActiveCircleId: (activeCircleId) => set({ activeCircleId, activeView: 'inbox', activeChannel: 'all' }),
+  setReadFilter: (readFilter) => set({ readFilter }),
 
   selectPerson: (personId) => set({ selectedPersonId: personId }),
 
   markConversationRead: async (userId: string, personId: string) => {
-    queryClient.setQueryData<ConversationPreview[]>(
-      ['conversations', userId],
+    // setQueriesData does partial-key matching — hits all 4-part conversation keys for this user
+    queryClient.setQueriesData<ConversationPreview[]>(
+      { queryKey: ['conversations', userId] },
       (old) => {
         if (!old) return old
         return old.map((c) =>
@@ -41,10 +54,12 @@ export const useInboxStore = create<InboxState>((set) => ({
     if (error) {
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
     }
+    queryClient.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
   },
 }))
 
-export const inboxTauriStore = createTauriStore('inbox', useInboxStore)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export const inboxTauriStore = createTauriStore('inbox', useInboxStore as any)
 
 inboxTauriStore.start().catch(() => {
   if (import.meta.env.DEV) console.warn('Tauri store not available (non-Tauri env)')
@@ -65,17 +80,11 @@ export const useFilterStore = create<FilterState>((set) => ({
 }))
 
 interface SyncState {
-  phase: 'idle' | 'syncing' | 'done'
-  detail: string
   lastSyncedAt: string | null
-  setSync: (phase: SyncState['phase'], detail: string) => void
   markDone: (detail: string) => void
 }
 
 export const useSyncStore = create<SyncState>((set) => ({
-  phase: 'idle',
-  detail: '',
   lastSyncedAt: null,
-  setSync: (phase, detail) => set({ phase, detail }),
-  markDone: (detail) => set({ phase: 'done', detail, lastSyncedAt: new Date().toISOString() }),
+  markDone: () => set({ lastSyncedAt: new Date().toISOString() }),
 }))

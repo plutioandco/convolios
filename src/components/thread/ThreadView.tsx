@@ -1,11 +1,12 @@
-import { useRef, useEffect, useState, createElement, useCallback } from 'react'
+import { useRef, useEffect, useState, createElement, useCallback, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import _ from 'lodash'
 import {
-  Link as LinkIcon, Music, FileText, Film, Paperclip, MapPin,
+  Link as LinkIcon, Music, FileText, Paperclip, MapPin,
   Phone, Video, MessageSquare, Users, CornerDownLeft, Smile,
   Pencil, X as XIcon, Play, Pause, Mic, Check, CheckCheck, Clock,
-  Download,
+  Download, ChevronDown, Link2, Upload,
 } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -13,11 +14,12 @@ import { useInboxStore } from '../../stores/inboxStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
 import { useThread, useAddOptimisticMessage } from '../../hooks/useThread'
+import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { supabase } from '../../lib/supabase'
 import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
-import { ChannelLogo } from '../icons/ChannelLogo'
+import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
 import * as S from './threadStyles'
-import type { Message } from '../../types'
+import type { Message, Channel, Identity } from '../../types'
 
 const URL_SPLIT_RE = /(https?:\/\/[^\s<>]+)/g
 const URL_TEST_RE = /^https?:\/\//
@@ -111,18 +113,12 @@ function GifPlayer({ src }: { src: string }) {
 
   return (
     <span
-      style={{ position: 'relative', display: 'inline-block', cursor: 'pointer' }}
+      className="relative inline-block cursor-pointer"
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
     >
-      <video ref={vidRef} src={src} loop muted playsInline style={{
-        ...S.media, maxHeight: 300,
-      }} />
-      {frozen && <span style={{
-        position: 'absolute', bottom: 10, left: 10, padding: '2px 8px',
-        borderRadius: 'var(--radius-sm)', background: 'rgba(0,0,0,.7)', color: 'var(--color-white)',
-        fontSize: 'var(--font-xs)', fontWeight: 600, letterSpacing: '.5px',
-      }}>GIF</span>}
+      <video ref={vidRef} src={src} loop muted playsInline className="max-h-[300px]" style={S.media} />
+      {frozen && <span className="absolute bottom-2.5 left-2.5 px-2 py-0.5 rounded-sm bg-[var(--overlay-pill-bg)] text-white text-xs font-semibold tracking-[0.5px]">GIF</span>}
     </span>
   )
 }
@@ -135,15 +131,8 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
   }, [onClose])
 
   return (
-    <div onClick={onClose} style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,.85)', display: 'flex',
-      alignItems: 'center', justifyContent: 'center', cursor: 'zoom-out',
-    }}>
-      <img src={src} alt="" onClick={(e) => e.stopPropagation()} style={{
-        maxWidth: '90vw', maxHeight: '90vh', borderRadius: 'var(--radius-card)',
-        objectFit: 'contain', cursor: 'default',
-      }} />
+    <div className="lightbox" onClick={onClose}>
+      <img src={src} alt="" onClick={(e) => e.stopPropagation()} />
     </div>
   )
 }
@@ -175,21 +164,19 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
         href={att.post.url}
         target="_blank"
         rel="noopener noreferrer"
-        style={{
-          ...S.cardBordered, display: 'flex', flexDirection: 'column', gap: 4,
-          textDecoration: 'none',
-        }}
+        className="flex flex-col gap-1 no-underline"
+        style={S.cardBordered}
         onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-accent)' }}
         onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-border)' }}
       >
         <span style={S.meta}>
-          <LinkIcon size={14} style={{ verticalAlign: 'middle', marginRight: 4 }} />
+          <LinkIcon size={14} className="align-middle mr-1" />
           {author ? `@${author}` : 'Shared post'}
         </span>
         {desc && <span style={S.bodyText}>
           {desc.length > 120 ? `${desc.slice(0, 120)}...` : desc}
         </span>}
-        <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-accent)', wordBreak: 'break-all' }}>
+        <span className="text-xs text-accent break-all">
           {att.post.url}
         </span>
       </a>
@@ -199,28 +186,24 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
   const unavailable = !att.id || att.unavailable
 
   if (unavailable || isError) {
+    if (kind !== 'document' && kind !== 'audio') return null
     const label = att.name ?? `${kind} attachment`
-    const iconMap: Record<string, React.ReactNode> = {
-      audio: <Music size={18} />, document: <FileText size={18} />,
-      video: <Film size={18} />,
-    }
-    const icon = iconMap[kind] ?? <Paperclip size={18} />
-    const canOpen = !!att.id && !!messageId && (kind === 'document' || kind === 'audio')
+    const icon = kind === 'audio' ? <Music size={18} /> : <FileText size={18} />
+    const canOpen = !!att.id && !!messageId
     const handleClick = canOpen ? () => {
       invoke('open_attachment', {
         messageId, attachmentId: att.id, channel: channel ?? null, filename: att.name ?? null,
       }).catch(() => {})
     } : undefined
     return (
-      <button onClick={handleClick} disabled={!canOpen} style={{
-        ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8, border: 'none',
-        cursor: canOpen ? 'pointer' : 'default',
-      }}
+      <button onClick={handleClick} disabled={!canOpen}
+        className={`border-none ${canOpen ? 'cursor-pointer' : 'cursor-default'}`}
+        style={{ ...S.pillBadge, gap: 8 }}
       onMouseEnter={(e) => { if (canOpen) e.currentTarget.style.background = 'var(--color-surface-deep)' }}
       onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
-        <span style={{ color: 'var(--color-text-muted)' }}>{icon}</span>
+        <span className="text-text-muted">{icon}</span>
         <span style={{ ...S.label, fontWeight: 400, color: canOpen ? 'var(--color-link)' : 'var(--color-text-muted)' }}>{label}</span>
-        {canOpen && <Download size={14} style={{ flexShrink: 0, opacity: 0.6 }} />}
+        {canOpen && <Download size={14} className="shrink-0 opacity-60" />}
       </button>
     )
   }
@@ -228,27 +211,27 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
   if (isLoading) {
     if (kind === 'document' || kind === 'audio') {
       return (
-        <div style={{ ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8, opacity: 0.6 }}>
-          <span style={{ color: 'var(--color-text-muted)' }}><FileText size={18} /></span>
+        <div className="opacity-60" style={{ ...S.pillBadge, gap: 8 }}>
+          <span className="text-text-muted"><FileText size={18} /></span>
           <span style={{ ...S.label, fontWeight: 400, color: 'var(--color-text-muted)' }}>{att.name ?? 'Loading...'}</span>
         </div>
       )
     }
     return (
-      <div style={S.loadingPlaceholder}>
-        loading...
-      </div>
+      <div className="skeleton w-[200px] h-[140px] rounded-card" />
     )
   }
 
+  if (!src) return null
+
   if (kind === 'video') {
-    return <video src={src} controls style={{ ...S.media, maxHeight: 300 }} />
+    return <video src={src} controls className="max-h-[300px]" style={S.media} />
   }
   if (kind === 'voicenote') {
     return <VoiceNotePlayer src={src} duration={att.duration} />
   }
   if (kind === 'audio') {
-    return <audio src={src} controls style={{ marginTop: 4, display: 'block', maxWidth: 300 }} />
+    return <audio src={src} controls className="mt-1 block max-w-[300px]" />
   }
   if (kind === 'document') {
     const openDoc = () => {
@@ -257,17 +240,16 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
       }).catch(() => {})
     }
     return (
-      <button onClick={openDoc} style={{
-        ...S.pillBadge, display: 'inline-flex', alignItems: 'center', gap: 8,
-        color: 'var(--color-link)', textDecoration: 'none', cursor: 'pointer', border: 'none',
-      }}
+      <button onClick={openDoc}
+        className="text-link no-underline cursor-pointer border-none"
+        style={{ ...S.pillBadge, gap: 8 }}
       onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-surface-deep)' }}
       onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
-        <FileText size={16} style={{ flexShrink: 0 }} />
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <FileText size={16} className="shrink-0" />
+        <span className="flex-1 min-w-0 truncate">
           {att.name ?? 'Document'}
         </span>
-        <Download size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+        <Download size={14} className="shrink-0 opacity-60" />
       </button>
     )
   }
@@ -275,14 +257,14 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
     return <GifPlayer src={src} />
   }
   if (kind === 'sticker') {
-    return <img src={src} alt="" style={{ maxWidth: 160, maxHeight: 160, marginTop: 4, display: 'block' }} />
+    return <img src={src} alt="" className="max-w-[160px] max-h-[160px] mt-1 block" />
   }
   return (
     <>
       <img
         src={src} alt=""
         onClick={() => setLightbox(true)}
-        style={{ ...S.media, maxHeight: 350, cursor: 'zoom-in' }}
+        className="max-h-[350px] cursor-zoom-in" style={S.media}
       />
       {lightbox && <Lightbox src={src} onClose={() => setLightbox(false)} />}
     </>
@@ -318,6 +300,21 @@ function parseAttachments(raw: unknown): Attachment[] {
   return items.map((item, i) => normalizeAttachment(item, i))
 }
 
+type PendingFile = { name: string; data: string; mime: string; preview: string }
+
+function mergePendingFiles(prev: PendingFile[], next: PendingFile[]): PendingFile[] {
+  const keys = new Set(prev.map((f) => `${f.name}:${f.data.length}`))
+  const out = [...prev]
+  for (const f of next) {
+    const k = `${f.name}:${f.data.length}`
+    if (!keys.has(k)) {
+      keys.add(k)
+      out.push(f)
+    }
+  }
+  return out
+}
+
 const REACTION_RE = /^\{\{[^}]+\}\}\s*reacted\s+(.+)$/
 const LID_RE = /\{\{[^}]+@lid\}\}/g
 
@@ -344,13 +341,10 @@ function SystemEvent({ msg }: { msg: Message }) {
   const isVoice = lower.includes('voice') || lower.includes('call')
   const icon = isVideo ? <Video size={16} /> : isVoice ? <Phone size={16} /> : <MessageSquare size={16} />
   return (
-    <div style={{
-      textAlign: 'center', padding: '6px 16px', fontSize: 'var(--font-md)', color: 'var(--color-text-muted)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-    }}>
+    <div className="system-event">
       <span>{icon}</span>
-      <span style={{ fontStyle: 'italic' }}>{label}</span>
-      <span style={{ fontSize: 'var(--font-xs)' }}>{shortTime(msg.sent_at)}</span>
+      <span className="italic">{label}</span>
+      <span className="system-event-time">{shortTime(msg.sent_at)}</span>
     </div>
   )
 }
@@ -360,7 +354,10 @@ const SYSTEM_EVENT_PATTERNS = [
   /^(video|voice) call ended$/i,
   /^missed (video|voice) call$/i,
   /^group call$/i,
-  /^.+\s(added|removed|left|joined|created|changed)\s/i,
+  /^.+\s(added|removed)\s.+\s(to|from)\s(the\s)?(group|chat|conversation)/i,
+  /^.+\s(left|joined)\s(the\s)?(group|chat|conversation)/i,
+  /^.+\screated\s(the\s|this\s)?(group|chat|conversation)/i,
+  /^.+\schanged\s(the\s)?(subject|topic|description|icon|photo|name|title)/i,
   /^you were added$/i,
   /^messages? (and calls are|in this chat are) end-to-end encrypted/i,
   /^this message was deleted$/i,
@@ -403,13 +400,13 @@ function LocationCard({ loc }: { loc: ParsedLocation }) {
   const embedUrl = `https://maps.google.com/maps?q=${loc.lat},${loc.lng}&z=15&output=embed`
 
   return (
-    <div style={{ ...S.card, padding: 0, overflow: 'hidden' }}>
+    <div className="overflow-hidden" style={{ ...S.card, padding: 0 }}>
       {expanded ? (
         <iframe
           src={embedUrl}
           width="320"
           height="200"
-          style={{ border: 0, display: 'block', borderRadius: 'var(--radius-card) var(--radius-card) 0 0' }}
+          className="border-0 block rounded-t-card"
           allowFullScreen
           loading="lazy"
           referrerPolicy="no-referrer-when-downgrade"
@@ -417,20 +414,16 @@ function LocationCard({ loc }: { loc: ParsedLocation }) {
       ) : (
         <button
           onClick={() => setExpanded(true)}
-          style={{
-            width: '100%', height: 120, border: 'none', cursor: 'pointer',
-            background: 'var(--color-surface-deep)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            flexDirection: 'column', gap: 4,
-          }}
+          className="w-full h-[120px] border-none cursor-pointer bg-surface-deep flex items-center justify-center flex-col gap-1"
         >
           <span><MapPin size={32} /></span>
           <span style={S.meta}>Tap to load map</span>
         </button>
       )}
-      <div style={{ padding: 'var(--card-padding)' }}>
+      <div className="px-3.5 py-2.5">
         <div style={{ ...S.label, fontSize: 'var(--font-md)' }}>{loc.label}</div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
-          <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)' }}>
+        <div className="flex items-center justify-between mt-1">
+          <span className="text-xs text-text-muted">
             {loc.lat.toFixed(6)}, {loc.lng.toFixed(6)}
           </span>
           <a
@@ -462,23 +455,19 @@ function parseVCard(text: string): { name: string; phone: string | null; email: 
 
 function ContactCard({ name, phone, email }: { name: string; phone: string | null; email: string | null }) {
   return (
-    <div style={{ ...S.card, display: 'flex', alignItems: 'center', gap: 12 }}>
-      <div style={{
-        width: 40, height: 40, borderRadius: '50%', background: 'var(--color-accent)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        fontSize: 18, fontWeight: 600, color: 'var(--color-white)', flexShrink: 0,
-      }}>
+    <div className="flex items-center gap-3" style={S.card}>
+      <div className="w-10 h-10 rounded-full bg-accent flex items-center justify-center text-[18px] font-semibold text-white shrink-0">
         {initials(name)}
       </div>
-      <div style={{ minWidth: 0 }}>
+      <div className="min-w-0">
         <div style={S.label}>{name}</div>
         {_.isString(phone) && (
-          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--color-link)', marginTop: 2 }}>
-            <a href={`tel:${phone}`} style={{ color: 'inherit', textDecoration: 'none' }}>{phone}</a>
+          <div className="text-sm text-link mt-0.5">
+            <a href={`tel:${phone}`} className="text-[inherit] no-underline">{phone}</a>
           </div>
         )}
         {_.isString(email) && (
-          <div style={{ fontSize: 'var(--font-sm)', color: 'var(--color-text-muted)', marginTop: 1 }}>{email}</div>
+          <div className="text-sm text-text-muted mt-px">{email}</div>
         )}
       </div>
     </div>
@@ -522,10 +511,7 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
   const dur = duration ?? (audioRef.current?.duration && isFinite(audioRef.current.duration) ? audioRef.current.duration : 0)
 
   return (
-    <div style={{
-      ...S.card, display: 'flex', alignItems: 'center', gap: 8,
-      borderRadius: 'var(--radius-pill)', maxWidth: 280,
-    }}>
+    <div className="flex items-center gap-2" style={{ ...S.card, borderRadius: 'var(--radius-pill)', maxWidth: 280 }}>
       <audio ref={audioRef} src={src} preload="metadata" />
       <button
         onClick={toggle}
@@ -533,14 +519,14 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
       >
         {playing ? <Pause size={16} /> : <Play size={16} />}
       </button>
-      <div style={{ flex: 1, minWidth: 0 }}>
+      <div className="flex-1 min-w-0">
         <div style={S.progressTrack}>
-          <div style={{
+          <div className="transition-[width] duration-100 ease-linear" style={{
             ...S.progressFill,
-            width: `${progress * 100}%`, transition: 'width 0.1s linear',
+            width: `${progress * 100}%`,
           }} />
         </div>
-        <div style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', marginTop: 3 }}>
+        <div className="text-xs text-text-muted mt-[3px]">
           {playing || currentTime > 0 ? formatDuration(currentTime) : dur > 0 ? formatDuration(dur) : ''}
         </div>
       </div>
@@ -740,7 +726,7 @@ function EmailRenderer({ html }: { html: string }) {
     shadow.innerHTML = `<style>${EMAIL_SHADOW_STYLES}</style><div class="email-root">${sanitized}</div>`
   }, [html])
 
-  return <div ref={hostRef} style={{ marginTop: 8, borderRadius: 'var(--radius-sm)' }} />
+  return <div ref={hostRef} className="mt-2 rounded-sm" />
 }
 
 function EmailBody({ msg }: { msg: Message }) {
@@ -752,7 +738,7 @@ function EmailBody({ msg }: { msg: Message }) {
   return (
     <div>
       {_.isString(msg.subject) && msg.subject.trim() !== '' && (
-        <div style={{ fontWeight: 600, fontSize: 'var(--font-lg)', color: 'var(--color-text-primary)', marginBottom: 4 }}>
+        <div className="font-semibold text-lg text-text-primary mb-1">
           {msg.subject}
         </div>
       )}
@@ -760,7 +746,7 @@ function EmailBody({ msg }: { msg: Message }) {
       {expanded && hasHtml
         ? <EmailRenderer html={msg.body_html!} />
         : preview && (
-            <span style={{ color: 'var(--color-text-secondary)', whiteSpace: 'pre-wrap' }}>
+            <span className="text-text-secondary whitespace-pre-wrap">
               {isLong && !expanded ? preview.slice(0, 300) + '...' : preview}
             </span>
           )}
@@ -817,11 +803,11 @@ function MessageBody({ msg }: { msg: Message }) {
       {msg.quoted_text && (
         <div style={S.quotedBlock}>
           {_.isString(msg.quoted_sender) && (
-            <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, color: 'var(--color-accent)', marginBottom: 2 }}>
+            <div className="text-sm font-semibold text-accent mb-0.5">
               {msg.quoted_sender}
             </div>
           )}
-          <div style={{ fontSize: 'var(--font-md)', color: 'var(--color-text-muted)', lineHeight: '18px' }}>
+          <div className="text-md text-text-muted leading-[18px]">
             {msg.quoted_text.length > 200 ? msg.quoted_text.slice(0, 200) + '...' : msg.quoted_text}
           </div>
         </div>
@@ -831,7 +817,7 @@ function MessageBody({ msg }: { msg: Message }) {
         <>
           <RichText text={displayText} />
           {msg.edited && (
-            <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', marginLeft: 4 }}>(edited)</span>
+            <span className="text-xs text-text-muted ml-1">(edited)</span>
           )}
         </>
       )}
@@ -855,17 +841,16 @@ function Reactions({ reactions }: { reactions: { value?: string; emoji?: string;
   if (entries.length === 0) return null
 
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 4 }}>
+    <div className="reaction-bar">
       {entries.map(([emoji, reactors]) => (
-        <span key={emoji} title={reactors.map((r) => r.sender_id ?? (r.is_sender ? 'You' : 'Someone')).join(', ')} style={{
-          display: 'inline-flex', alignItems: 'center', gap: 4,
-          padding: '1px 6px', borderRadius: 'var(--radius-card)', fontSize: 'var(--font-base)', lineHeight: '20px',
-          background: reactors.some((r) => r.is_sender) ? 'color-mix(in srgb, var(--color-accent) 15%, transparent)' : 'var(--color-surface)',
-          border: reactors.some((r) => r.is_sender) ? '1px solid color-mix(in srgb, var(--color-accent) 40%, transparent)' : '1px solid var(--color-border)',
-          cursor: 'default',
-        }}>
+        <span key={emoji} title={reactors.map((r) => r.sender_id ?? (r.is_sender ? 'You' : 'Someone')).join(', ')}
+          className="reaction-chip"
+          style={{
+            background: reactors.some((r) => r.is_sender) ? 'color-mix(in srgb, var(--color-accent) 15%, transparent)' : undefined,
+            border: reactors.some((r) => r.is_sender) ? '1px solid color-mix(in srgb, var(--color-accent) 40%, transparent)' : undefined,
+          }}>
           {emoji}
-          {reactors.length > 1 && <span style={{ fontSize: 'var(--font-sm)', color: 'var(--color-text-body)' }}>{reactors.length}</span>}
+          {reactors.length > 1 && <span className="reaction-chip-count">{reactors.length}</span>}
         </span>
       ))}
     </div>
@@ -873,6 +858,7 @@ function Reactions({ reactions }: { reactions: { value?: string; emoji?: string;
 }
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
+const REACTION_CHANNELS: Set<Channel> = new Set(['whatsapp', 'linkedin'])
 
 function MessageActions({ msg, onReply, onEdit }: {
   msg: Message
@@ -904,33 +890,25 @@ function MessageActions({ msg, onReply, onEdit }: {
     }
   }
 
+  const canReact = REACTION_CHANNELS.has(msg.channel) && _.isString(msg.external_id)
+
   return (
-    <div className="msg-actions" style={{
-      position: 'absolute', top: -16, right: 16,
-      display: 'flex', gap: 2, background: 'var(--color-surface)',
-      borderRadius: 'var(--radius-sm)', border: '1px solid var(--color-border)',
-      padding: 2, zIndex: 10,
-    }}>
-      <button onClick={() => onReply(msg)} title="Reply" style={actionBtnStyle}><CornerDownLeft size={16} /></button>
-      <button onClick={() => setShowPicker((v) => !v)} title="React" style={actionBtnStyle}>
-        <Smile size={16} />
-      </button>
-      {onEdit && (
-        <button onClick={() => onEdit(msg)} title="Edit" style={actionBtnStyle}><Pencil size={16} /></button>
+    <div className="msg-actions msg-actions-bar -top-4 gap-0.5 p-0.5 z-10" data-picker-open={showPicker}>
+      <button onClick={() => onReply(msg)} title="Reply" className="msg-action-btn"><CornerDownLeft size={16} /></button>
+      {canReact && (
+        <button onClick={() => setShowPicker((v) => !v)} title="React" className="msg-action-btn">
+          <Smile size={16} />
+        </button>
       )}
-      {showPicker && (
-        <div ref={pickerRef} onClick={(e) => e.stopPropagation()} style={{
-          position: 'absolute', bottom: '100%', right: 0, marginBottom: 4,
-          display: 'flex', gap: 2, padding: 4, borderRadius: 'var(--radius-card)',
-          background: 'var(--color-surface-deep)', border: '1px solid var(--color-border)',
-        }}>
+      {onEdit && (
+        <button onClick={() => onEdit(msg)} title="Edit" className="msg-action-btn"><Pencil size={16} /></button>
+      )}
+      {canReact && showPicker && (
+        <div ref={pickerRef} onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-full right-0 mb-1 flex gap-0.5 p-1 rounded-card bg-surface-deep border border-border">
           {QUICK_EMOJIS.map((e) => (
-            <button key={e} onClick={() => handleReaction(e)} style={{
-              background: 'none', border: 'none', cursor: 'pointer',
-              fontSize: 20, padding: '2px 4px', borderRadius: 'var(--radius-sm)',
-            }}
-            onMouseEnter={(ev) => { ev.currentTarget.style.background = 'var(--color-border)' }}
-            onMouseLeave={(ev) => { ev.currentTarget.style.background = '' }}>
+            <button key={e} onClick={() => handleReaction(e)}
+              className="bg-transparent border-none cursor-pointer text-[20px] px-1 py-0.5 rounded-sm hover:bg-border">
               {e}
             </button>
           ))}
@@ -940,29 +918,87 @@ function MessageActions({ msg, onReply, onEdit }: {
   )
 }
 
-const actionBtnStyle: React.CSSProperties = {
-  background: 'none', border: 'none', cursor: 'pointer',
-  padding: '2px 6px', fontSize: 16, borderRadius: 'var(--radius-sm)',
-  color: 'var(--color-text-secondary)', lineHeight: 1,
-}
-
 export function ThreadView() {
   const pid = useInboxStore((s) => s.selectedPersonId)
   const markRead = useInboxStore((s) => s.markConversationRead)
   const { user } = useAuth()
   const rtConnected = useRealtimeConnected()
   const { data: convos = [] } = useConversations(user?.id, rtConnected)
-  const { data: thread = [] } = useThread(pid, user?.id, rtConnected)
+  const { data: thread = [], isLoading: threadLoading } = useThread(pid, user?.id, rtConnected)
   const [memberAvatars, setMemberAvatars] = useState<Record<string, string>>({})
   const [replyTo, setReplyTo] = useState<Message | null>(null)
   const [editingMsg, setEditingMsg] = useState<Message | null>(null)
+  const [threadChannelFilter, setThreadChannelFilter] = useState<Channel | 'all'>('all')
+  const [showLinkPerson, setShowLinkPerson] = useState(false)
+  const [pendingDropFiles, setPendingDropFiles] = useState<PendingFile[]>([])
+  const [dragOver, setDragOver] = useState(false)
+  const dragCounterRef = useRef(0)
+
+  useEffect(() => { setShowLinkPerson(false) }, [pid])
   const qc = useQueryClient()
+
+  useEffect(() => {
+    let cancelled = false
+    const setup = async () => {
+      const unlisten = await getCurrentWindow().onDragDropEvent(async (event) => {
+        if (cancelled) return
+        if (event.payload.type === 'enter') {
+          dragCounterRef.current++
+          setDragOver(true)
+        } else if (event.payload.type === 'leave') {
+          dragCounterRef.current--
+          if (dragCounterRef.current <= 0) { dragCounterRef.current = 0; setDragOver(false) }
+        } else if (event.payload.type === 'drop') {
+          dragCounterRef.current = 0
+          setDragOver(false)
+          if (event.payload.paths?.length) {
+            try {
+              const files = await invoke<{ name: string; data: string; mime: string; preview: string }[]>(
+                'read_dropped_files', { paths: event.payload.paths }
+              )
+              if (!cancelled) {
+                setPendingDropFiles((prev) => mergePendingFiles(prev, files))
+              }
+            } catch (e) {
+              if (import.meta.env.DEV) console.error('Drop read failed:', e)
+            }
+          }
+        }
+      })
+      return unlisten
+    }
+    let unlisten: (() => void) | undefined
+    setup().then((u) => { unlisten = u })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
+
+  const { data: personIdentities = [] } = useQuery({
+    queryKey: ['person-identities', pid],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('identities')
+        .select('*')
+        .eq('person_id', pid!)
+      if (error) throw error
+      return (data ?? []) as Identity[]
+    },
+    enabled: _.isString(pid),
+    staleTime: 60_000,
+  })
 
   const convo = convos.find((c) => c.person.id === pid)
   const person = convo?.person
   const isGroup = thread.some((m) => m.message_type === 'group')
   const chatId = _.last(thread)?.thread_id
     ?? convo?.lastMessage?.thread_id
+
+  const personChannels = _.uniq(personIdentities.map((i) => i.channel))
+  const threadChannels = _.uniq(thread.map((m) => m.channel))
+  const availableChannels = _.uniq([...personChannels, ...threadChannels])
+
+  const filteredThread = threadChannelFilter === 'all'
+    ? thread
+    : thread.filter((m) => m.channel === threadChannelFilter)
 
   const mySenderNames = isGroup
     ? new Set([
@@ -1074,6 +1110,7 @@ export function ThreadView() {
   useEffect(() => {
     setReplyTo(null)
     setEditingMsg(null)
+    setThreadChannelFilter('all')
   }, [pid])
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -1085,36 +1122,74 @@ export function ThreadView() {
 
   if (!pid) return <EmptyState />
 
+  if (threadLoading && thread.length === 0) return <ThreadSkeleton />
+
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--color-bg)' }}>
-      <div ref={scrollContainerRef} className="chat-scroll" style={{ flex: 1, minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column-reverse' }}>
+    <div
+      className="thread-col"
+      onDragOver={(e) => e.preventDefault()}
+      onDragEnter={(e) => { e.preventDefault(); dragCounterRef.current++; setDragOver(true) }}
+      onDragLeave={() => { dragCounterRef.current--; if (dragCounterRef.current <= 0) { dragCounterRef.current = 0; setDragOver(false) } }}
+      onDrop={(e) => {
+        e.preventDefault()
+        dragCounterRef.current = 0
+        setDragOver(false)
+        const dt = e.dataTransfer
+        if (!dt?.files?.length) return
+        Array.from(dt.files).forEach((f) => {
+          const reader = new FileReader()
+          reader.onload = () => {
+            const result = reader.result as string
+            const b64 = result.split(',')[1] ?? ''
+            const item = {
+              name: f.name,
+              data: b64,
+              mime: f.type || 'application/octet-stream',
+              preview: f.type.startsWith('image/') ? result : '',
+            }
+            setPendingDropFiles((prev) => mergePendingFiles(prev, [item]))
+          }
+          reader.readAsDataURL(f)
+        })
+      }}
+    >
+      <div className="thread-scroller-wrap">
+        <div ref={scrollContainerRef} className="thread-scroller chat-scroll">
         <div>
           {person && (
-            <div style={{ padding: '16px 16px 0' }}>
-              <div style={{ padding: '16px 0 12px' }}>
+            <div className="px-4 pt-4">
+              <div className="pt-4 pb-3">
                 {isGroup
-                  ? <div className={avatarCls(person.id)}
-                      style={{
-                        width: 80, height: 80, borderRadius: 'var(--radius-lg)',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        color: 'var(--color-white)',
-                      }}>
+                  ? <div className={`${avatarCls(person.id)} w-20 h-20 rounded-lg flex items-center justify-center text-white`}>
                       <Users size={36} />
                     </div>
                   : person.avatar_url
-                    ? <img src={person.avatar_url} alt="" style={{
-                        width: 80, height: 80, borderRadius: '50%', objectFit: 'cover',
-                      }} />
-                    : <div className={avatarCls(person.id)}
-                        style={{
-                          width: 80, height: 80, borderRadius: '50%',
-                          display: 'flex', alignItems: 'center', justifyContent: 'center',
-                          fontSize: 32, fontWeight: 700, color: 'var(--color-white)',
-                        }}>
+                    ? <img src={person.avatar_url} alt="" className="w-20 h-20 rounded-full object-cover" />
+                    : <div className={`${avatarCls(person.id)} avatar avatar--hero`}>
                         {initials(person.display_name)}
                       </div>}
-                <h3 style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text-primary)', marginTop: 8 }}>{person.display_name}</h3>
-                <p style={{ fontSize: 'var(--font-base)', color: 'var(--color-text-secondary)', marginTop: 4 }}>
+                <h3 className="text-[24px] font-bold text-text-primary mt-2 flex items-center gap-2">
+                  {person.display_name}
+                  {availableChannels.length > 1 && (
+                    <span className="flex gap-1">
+                      {availableChannels.map((ch) => (
+                        <span key={ch} className="w-5 h-5 rounded-sm flex items-center justify-center" style={{ background: channelColor(ch) }}>
+                          <ChannelLogo channel={ch} size={12} color={isLightBrandColor(channelColor(ch)) ? 'var(--color-black)' : 'var(--color-white)'} />
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                  {!isGroup && (
+                    <button
+                      onClick={() => setShowLinkPerson(true)}
+                      title="Link to another person"
+                      className="bg-transparent border border-border rounded-sm cursor-pointer px-2 py-0.5 text-text-muted flex items-center gap-1 text-sm"
+                    >
+                      <Link2 size={12} /> Link
+                    </button>
+                  )}
+                </h3>
+                <p className="text-base text-text-secondary mt-1">
                   {isGroup
                     ? <>This is the beginning of <strong>{person.display_name}</strong>.</>
                     : <>This is the beginning of your conversation with <strong>{person.display_name}</strong>.</>}
@@ -1124,13 +1199,25 @@ export function ThreadView() {
           )}
 
           {thread.length === 0 && !person && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <p style={{ color: 'var(--color-text-secondary)', fontSize: 'var(--font-body)' }}>No messages yet</p>
+            <div className="flex items-center justify-center h-full">
+              <p className="text-text-secondary text-body">No messages yet</p>
             </div>
           )}
 
-          <div style={{ paddingBottom: 16 }}>
-            {thread.filter((m) => !m.hidden).map((msg, i, visible) => {
+          {availableChannels.length > 1 && (
+            <div className="flex gap-1 px-4 pt-2 pb-1 flex-wrap">
+              <ChannelFilterPill active={threadChannelFilter === 'all'} onClick={() => setThreadChannelFilter('all')}>All</ChannelFilterPill>
+              {availableChannels.map((ch) => (
+                <ChannelFilterPill key={ch} active={threadChannelFilter === ch} onClick={() => setThreadChannelFilter(ch as Channel)}>
+                  <ChannelLogo channel={ch} size={11} color={threadChannelFilter === ch ? 'var(--color-white)' : channelColor(ch)} className="mr-1" />
+                  {ch.charAt(0).toUpperCase() + ch.slice(1)}
+                </ChannelFilterPill>
+              ))}
+            </div>
+          )}
+
+          <div className="pb-4">
+            {filteredThread.filter((m) => !m.hidden).map((msg, i, visible) => {
               const prev = visible[i - 1]
               const curDay = new Date(msg.sent_at).toDateString()
               const prevDay = prev ? new Date(prev.sent_at).toDateString() : null
@@ -1177,59 +1264,238 @@ export function ThreadView() {
           </div>
         </div>
       </div>
+      </div>
 
-      <ComposeBox personId={pid} thread={thread} chatId={chatId} convoLastMessage={convo?.lastMessage} personName={person?.display_name} replyTo={replyTo} onClearReply={() => setReplyTo(null)} />
+      <ComposeBox
+        personId={pid}
+        thread={thread}
+        convoLastMessage={convo?.lastMessage}
+        personName={person?.display_name}
+        replyTo={replyTo}
+        onClearReply={() => setReplyTo(null)}
+        personIdentities={personIdentities}
+        pendingDropFiles={pendingDropFiles}
+        onDropFilesConsumed={() => setPendingDropFiles([])}
+        onComposeDropDismiss={() => { dragCounterRef.current = 0; setDragOver(false) }}
+      />
+
+      {showLinkPerson && pid && person && (
+        <ManualMergeDialog
+          personId={pid}
+          personName={person.display_name}
+          userId={user?.id}
+          allConvos={convos}
+          onClose={() => setShowLinkPerson(false)}
+        />
+      )}
+
+      {dragOver && (
+        <div className="drop-overlay">
+          <div className="drop-overlay-inner">
+            <Upload size={48} className="drop-overlay-icon" />
+            <span className="drop-overlay-text">
+              Upload to {person?.display_name ?? 'conversation'}
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ManualMergeDialog({ personId, personName, userId, allConvos, onClose }: {
+  personId: string
+  personName: string
+  userId?: string
+  allConvos: import('../../types').ConversationPreview[]
+  onClose: () => void
+}) {
+  const [search, setSearch] = useState('')
+  const [selectedTarget, setSelectedTarget] = useState<import('../../types').ConversationPreview | null>(null)
+  const merge = useMergePersons(userId)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
+
+  useEffect(() => { inputRef.current?.focus() }, [])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const candidates = allConvos
+    .filter((c) => c.person.id !== personId && c.person.display_name.toLowerCase().includes(search.toLowerCase()))
+    .slice(0, 10)
+
+  const confirmMerge = () => {
+    if (!selectedTarget) return
+    merge.mutate({ keepId: personId, mergeId: selectedTarget.person.id }, {
+      onSuccess: () => onClose(),
+    })
+  }
+
+  return (
+    <div onClick={onClose} className="modal-backdrop">
+      <div onClick={(e) => e.stopPropagation()} className="modal-panel w-[420px] max-h-[70vh]">
+        <div className="border-b border-[var(--color-border)] px-4 pt-4 pb-3">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-base font-semibold text-white">
+              {selectedTarget ? 'Confirm merge' : `Link person to ${personName}`}
+            </h3>
+            <button onClick={onClose} className="cursor-pointer border-none bg-transparent p-1 text-text-muted">
+              <XIcon size={16} />
+            </button>
+          </div>
+          {!selectedTarget && (
+            <input
+              ref={inputRef}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search contacts..."
+              className="w-full rounded border border-[var(--color-border)] px-3 text-sm outline-none h-9 bg-bg text-white"
+            />
+          )}
+        </div>
+
+        {selectedTarget ? (
+          <div className="flex flex-col gap-3 p-4">
+            <p className="text-sm text-text-muted">
+              Merge <strong className="text-white">{selectedTarget.person.display_name}</strong> into <strong className="text-white">{personName}</strong>?
+            </p>
+            <p className="text-xs text-text-muted">
+              All conversations and identities will be moved to {personName}. This can be undone from Settings.
+            </p>
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => setSelectedTarget(null)}
+                className="flex-1 cursor-pointer rounded border border-[var(--color-border)] bg-transparent py-2 text-sm font-medium text-white"
+              >
+                Back
+              </button>
+              <button
+                onClick={confirmMerge}
+                disabled={merge.isPending}
+                className={`flex-1 cursor-pointer rounded border-none py-2 text-sm font-medium text-white bg-accent ${merge.isPending ? 'opacity-50' : ''}`}
+              >
+                {merge.isPending ? 'Merging...' : 'Confirm merge'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto p-2">
+            {search.length === 0 && (
+              <p className="p-3 text-center text-xs text-text-muted">
+                Type to search for a person to link
+              </p>
+            )}
+            {search.length > 0 && candidates.length === 0 && (
+              <p className="p-3 text-center text-xs text-text-muted">
+                No matching contacts
+              </p>
+            )}
+            {candidates.map((c) => (
+              <button
+                key={c.person.id}
+                onClick={() => setSelectedTarget(c)}
+                className="flex w-full items-center gap-2.5 rounded border-none bg-transparent px-2.5 py-2 text-left text-white cursor-pointer hover:bg-[var(--hover-row-subtle)]"
+              >
+                {_.isString(c.person.avatar_url) ? (
+                  <img src={c.person.avatar_url} alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" />
+                ) : (
+                  <div className={`${avatarCls(c.person.id)} flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white`}>
+                    {initials(c.person.display_name)}
+                  </div>
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium">{c.person.display_name}</div>
+                  <div className="mt-0.5 flex gap-1">
+                    {_.isArray(c.channels) && c.channels.map((ch) => (
+                      <span key={ch} className="rounded px-1 text-2xs bg-bg text-text-muted">{ch}</span>
+                    ))}
+                  </div>
+                </div>
+                <Link2 size={14} className="text-accent shrink-0" />
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
 
 function EmptyState() {
   return (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-bg)', userSelect: 'none' }}>
-      <div style={{ textAlign: 'center' }}>
-        <div className="av-1"
-          style={{
-            width: 80, height: 80, borderRadius: '50%',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 32, fontWeight: 700, color: 'var(--color-white)', margin: '0 auto 16px',
-          }}>
+    <div className="thread-empty bg-bg">
+      <div className="text-center">
+        <div className="av-1 avatar avatar--hero mx-auto mb-4">
           C
         </div>
-        <h2 style={{ fontSize: 24, fontWeight: 700, color: 'var(--color-text-primary)' }}>Welcome back!</h2>
-        <p style={{ fontSize: 'var(--font-body)', marginTop: 4, color: 'var(--color-text-secondary)' }}>Select a conversation to start</p>
+        <h2 className="text-[24px] font-bold text-text-primary">Welcome back!</h2>
+        <p className="text-body mt-1 text-text-secondary">Select a conversation to start</p>
       </div>
+    </div>
+  )
+}
+
+function ThreadSkeleton() {
+  const rows = [
+    { align: 'left', w1: '30%', w2: '55%' },
+    { align: 'left', w1: '25%', w2: '70%' },
+    { align: 'right', w1: '40%', w2: '45%' },
+    { align: 'left', w1: '20%', w2: '60%' },
+    { align: 'right', w1: '35%', w2: '50%' },
+    { align: 'left', w1: '28%', w2: '65%' },
+    { align: 'right', w1: '30%', w2: '40%' },
+  ] as const
+
+  return (
+    <div className="flex-1 flex flex-col justify-end bg-bg px-4 pt-4 pb-6 gap-5">
+      {rows.map((r, i) => (
+        <div key={i} className={`flex gap-3 max-w-[70%] ${r.align === 'right' ? 'self-end' : 'self-start'}`}>
+          {r.align === 'left' && <div className="skeleton w-10 h-10 rounded-full shrink-0" />}
+          <div className="flex-1">
+            <div className="skeleton h-3 mb-1.5" style={{ width: r.w1 }} />
+            <div className="skeleton h-4" style={{ width: r.w2 }} />
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
 
 function DayDivider({ iso }: { iso: string }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', margin: '24px 16px 8px', position: 'relative' }}>
-      <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
-      <span style={{
-        padding: '0 8px', fontSize: 'var(--font-sm)', fontWeight: 600, lineHeight: '13px',
-        color: 'var(--color-text-muted)', background: 'var(--color-bg)',
-      }}>
-        {dateDivider(iso)}
-      </span>
-      <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
+    <div className="day-divider">
+      <span className="day-divider-text">{dateDivider(iso)}</span>
     </div>
+  )
+}
+
+function ChannelFilterPill({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button onClick={onClick}
+      className={`inline-flex items-center text-sm font-semibold px-2.5 py-[3px] rounded-pill border-none cursor-pointer ${active ? 'text-text-primary' : 'text-text-muted'}`}
+      style={{ background: active ? 'color-mix(in srgb, var(--color-accent) 25%, transparent)' : 'var(--color-surface)' }}
+    >{children}</button>
   )
 }
 
 function DeliveryStatus({ msg }: { msg: Message }) {
   const isOptimistic = msg.id.startsWith('opt-')
-  const iconStyle: React.CSSProperties = { display: 'inline-flex', alignItems: 'center', marginLeft: 6, verticalAlign: 'middle' }
+  const iconCls = 'inline-flex items-center ml-1.5 align-middle'
   if (isOptimistic) {
-    return <span style={{ ...iconStyle, color: 'var(--color-text-pending)' }}><Clock size={12} /></span>
+    return <span className={`${iconCls} text-text-pending`}><Clock size={12} /></span>
   }
   if (msg.seen) {
-    return <span style={{ ...iconStyle, color: 'var(--color-link)' }}><CheckCheck size={12} /></span>
+    return <span className={`${iconCls} text-link`}><CheckCheck size={12} /></span>
   }
   if (msg.delivered) {
-    return <span style={{ ...iconStyle, color: 'var(--color-text-muted)' }}><CheckCheck size={12} /></span>
+    return <span className={`${iconCls} text-text-muted`}><CheckCheck size={12} /></span>
   }
-  return <span style={{ ...iconStyle, color: 'var(--color-text-muted)' }}><Check size={12} /></span>
+  return <span className={`${iconCls} text-text-muted`}><Check size={12} /></span>
 }
 
 function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: string, text: string) => void; onCancel: () => void }) {
@@ -1245,32 +1511,20 @@ function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: 
   }, [text])
 
   return (
-    <div style={{ padding: '4px 48px 4px 72px' }}>
-      <div style={{
-        borderRadius: 'var(--radius-card)', background: 'var(--color-surface-input)', padding: 8,
-        border: '1px solid var(--color-accent)',
-      }}>
+    <div className="py-1 pr-12 pl-[72px]">
+      <div className="rounded-card bg-surface-input p-2 border border-accent">
         <textarea ref={ref} rows={1} value={text} onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(msg.id, text.trim()) }
             if (e.key === 'Escape') onCancel()
           }}
-          style={{
-            width: '100%', background: 'transparent', border: 'none', outline: 'none',
-            resize: 'none', color: 'var(--color-text-body)', fontSize: 'var(--font-lg)', lineHeight: '20px',
-          }} />
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
-          <button onClick={onCancel} style={{
-            background: 'none', border: 'none', cursor: 'pointer',
-            color: 'var(--color-text-muted)', fontSize: 'var(--font-sm)', fontWeight: 600,
-          }}>Cancel</button>
-          <button onClick={() => onSubmit(msg.id, text.trim())} style={{
-            background: 'var(--color-accent)', border: 'none', cursor: 'pointer',
-            color: 'var(--color-white)', fontSize: 'var(--font-sm)', fontWeight: 600, padding: '4px 12px', borderRadius: 'var(--radius-sm)',
-          }}>Save</button>
+          className="w-full bg-transparent border-none outline-none resize-none text-text-body text-body leading-[22px]" />
+        <div className="flex gap-2 justify-end mt-1">
+          <button onClick={onCancel} className="bg-transparent border-none cursor-pointer text-text-muted text-sm font-semibold">Cancel</button>
+          <button onClick={() => onSubmit(msg.id, text.trim())} className="bg-accent border-none cursor-pointer text-white text-sm font-semibold px-3 py-1 rounded-sm">Save</button>
         </div>
       </div>
-      <span style={{ fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)' }}>Escape to cancel · Enter to save</span>
+      <span className="text-xs text-text-muted">Escape to cancel · Enter to save</span>
     </div>
   )
 }
@@ -1292,7 +1546,6 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
       ? (hasSender ? cleanSenderName(msg.sender_name!) : 'Member')
       : (person?.display_name ?? 'Unknown')
   const name = rawName
-  const nameClr = out ? 'var(--color-success)' : 'var(--color-text-primary)'
   const av = out ? 'av-6' : avatarCls(msg.sender_name ?? person?.id ?? msg.id)
 
   const senderPic = out
@@ -1301,34 +1554,21 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
       ? (memberAvatars?.[msg.sender_name] ?? memberAvatars?.[cleanSenderName(msg.sender_name)] ?? null)
       : person?.avatar_url ?? null
 
-  const [hovered, setHovered] = useState(false)
-
   return (
-    <div style={{
-      position: 'relative', padding: '2px 48px 2px 72px', marginTop: 17, minHeight: 44,
-    }}
-    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(2,2,2,.06)'; setHovered(true) }}
-    onMouseLeave={(e) => { e.currentTarget.style.background = ''; setHovered(false) }}>
-      {hovered && <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />}
+    <div className="msg-row msg-row--full">
+      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />
       {senderPic
-        ? <img src={senderPic} alt="" style={{
-            position: 'absolute', left: 16, top: 2, width: 40, height: 40,
-            borderRadius: '50%', objectFit: 'cover', cursor: 'pointer',
-          }} />
-        : <div className={av} style={{
-            position: 'absolute', left: 16, top: 2, width: 40, height: 40, borderRadius: '50%',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 'var(--font-lg)', fontWeight: 600, color: 'var(--color-white)', cursor: 'pointer',
-          }}>
+        ? <img src={senderPic} alt="" className="msg-avatar" />
+        : <div className={`${av} msg-avatar-initial`}>
             {out ? 'Y' : initials(name)}
           </div>}
 
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 4, flexWrap: 'wrap', minWidth: 0 }}>
-        <span style={{ fontSize: 'var(--font-body)', fontWeight: 500, lineHeight: '22px', color: nameClr, cursor: 'pointer' }}>
+      <div className="msg-name-row">
+        <span className={`msg-name ${out ? 'text-success' : 'text-text-primary'}`}>
           {name}
         </span>
-        <ChannelLogo channel={msg.channel} size={14} color={channelColor(msg.channel)} style={{ flexShrink: 0, verticalAlign: 'middle' }} />
-        <span style={{ fontSize: 'var(--font-sm)', lineHeight: '22px', color: 'var(--color-text-muted)', marginLeft: 4 }}>
+        <ChannelLogo channel={msg.channel} size={14} color={channelColor(msg.channel)} className="shrink-0 align-middle" />
+        <span className="msg-time">
           {formatTimestamp(msg.sent_at)}
         </span>
       </div>
@@ -1344,19 +1584,10 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
 
 function MsgCompact({ msg, onReply, onEdit }: { msg: Message; onReply: (msg: Message) => void; onEdit?: (msg: Message) => void }) {
   const out = msg.direction === 'outbound'
-  const [hovered, setHovered] = useState(false)
   return (
-    <div className="msg-compact" style={{
-      position: 'relative', padding: '2px 48px 2px 72px', minHeight: 22,
-    }}
-    onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(2,2,2,.06)'; setHovered(true) }}
-    onMouseLeave={(e) => { e.currentTarget.style.background = ''; setHovered(false) }}>
-      {hovered && <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />}
-      <span className="msg-hover-ts" style={{
-        position: 'absolute', left: 0, width: 56, textAlign: 'right', paddingRight: 4,
-        fontSize: 'var(--font-xs)', lineHeight: '22px', color: 'var(--color-text-muted)', opacity: 0,
-        transition: 'opacity .1s',
-      }}>
+    <div className="msg-compact msg-row msg-row--compact">
+      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />
+      <span className="msg-compact-ts">
         {shortTime(msg.sent_at)}
       </span>
 
@@ -1369,27 +1600,63 @@ function MsgCompact({ msg, onReply, onEdit }: { msg: Message; onReply: (msg: Mes
   )
 }
 
-function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, replyTo, onClearReply }: {
-  personId: string; thread: Message[]; chatId?: string; convoLastMessage?: Message; personName?: string
-  replyTo: Message | null; onClearReply: () => void
+function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, onClearReply, personIdentities, pendingDropFiles, onDropFilesConsumed, onComposeDropDismiss }: {
+  personId: string; thread: Message[]; convoLastMessage?: Message; personName?: string
+  replyTo: Message | null; onClearReply: () => void; personIdentities?: Identity[]
+  pendingDropFiles?: PendingFile[]
+  onDropFilesConsumed?: () => void
+  onComposeDropDismiss?: () => void
 }) {
   const [text, setText] = useState('')
   const [files, setFiles] = useState<{ name: string; data: string; mime: string; preview: string }[]>([])
-  const [dragOver, setDragOver] = useState(false)
+
+  useEffect(() => {
+    if (pendingDropFiles?.length) {
+      setFiles((prev) => mergePendingFiles(prev, pendingDropFiles))
+      onDropFilesConsumed?.()
+    }
+  }, [pendingDropFiles, onDropFilesConsumed])
   const [recording, setRecording] = useState(false)
   const [recordDuration, setRecordDuration] = useState(0)
+  const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null)
+  const [showChannelPicker, setShowChannelPicker] = useState(false)
   const sendErrors = useRef<Map<string, string>>(new Map())
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const channelPickerRef = useRef<HTMLDivElement>(null)
   const { user } = useAuth()
   const qc = useQueryClient()
   const addOptimistic = useAddOptimisticMessage(personId, user?.id)
 
   const last = _.last(thread) ?? convoLastMessage
-  const resolvedChatId = chatId ?? last?.thread_id
+
+  const identityChannels = _.uniqBy(personIdentities ?? [], (i) => i.channel)
+  const activeChannel = selectedChannel ?? (last?.channel as Channel) ?? 'whatsapp'
+  const activeIdentity = personIdentities?.find((i) => i.channel === activeChannel)
+
+  const channelThread = useMemo(
+    () => thread.filter((m) => m.channel === activeChannel),
+    [thread, activeChannel],
+  )
+  const lastForChannel = _.last(channelThread)
+    ?? (convoLastMessage?.channel === activeChannel ? convoLastMessage : null)
+  const resolvedChatId = lastForChannel?.thread_id
+  const resolvedAccountId = lastForChannel?.unipile_account_id
+    ?? activeIdentity?.unipile_account_id ?? ''
+
+  useEffect(() => { setSelectedChannel(null) }, [personId])
+
+  useEffect(() => {
+    if (!showChannelPicker) return
+    const handler = (e: MouseEvent) => {
+      if (channelPickerRef.current && !channelPickerRef.current.contains(e.target as Node)) setShowChannelPicker(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showChannelPicker])
 
   const failedMessages = thread.filter((m) => m.id.startsWith('opt-') && sendErrors.current.has(m.id))
 
@@ -1497,14 +1764,14 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
     const meta = {
       userId: last?.user_id ?? '',
       personId,
-      channel: last?.channel ?? 'whatsapp',
+      channel: activeChannel,
       messageType: last?.message_type ?? 'dm',
-      accountId: last?.unipile_account_id ?? '',
+      accountId: resolvedAccountId,
     }
     const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
     addOptimistic({
       id: optId, user_id: meta.userId, person_id: personId, identity_id: null,
-      external_id: null, channel: last?.channel ?? 'whatsapp', direction: 'outbound',
+      external_id: null, channel: activeChannel, direction: 'outbound',
       message_type: meta.messageType, subject: null, body_text: 'Voice message',
       body_html: null, attachments: [{ type: 'ptt' }], thread_id: resolvedChatId,
       sender_name: null, reactions: [], sent_at: new Date().toISOString(),
@@ -1518,7 +1785,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
       await invoke('send_voice_message', {
         chatId: resolvedChatId, voiceData: result.data, voiceMime: result.mime, ...meta,
       })
-      qc.invalidateQueries({ queryKey: ['thread', personId] })
+      // Keep optimistic visible — realtime will confirm.
     } catch (e) {
       if (import.meta.env.DEV) console.error('Voice send failed:', e)
     }
@@ -1535,7 +1802,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
       person_id: personId,
       identity_id: null,
       external_id: null,
-      channel: last?.channel ?? 'whatsapp',
+      channel: activeChannel,
       direction: 'outbound',
       message_type: last?.message_type ?? 'dm',
       subject: null,
@@ -1571,9 +1838,9 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
     const meta = {
       userId: last?.user_id ?? '',
       personId,
-      channel: last?.channel ?? 'whatsapp',
+      channel: activeChannel,
       messageType: last?.message_type ?? 'dm',
-      accountId: last?.unipile_account_id ?? '',
+      accountId: resolvedAccountId,
       quoteId: '',
     }
 
@@ -1581,8 +1848,11 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
       try {
         await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         sendErrors.current.delete(optId)
-        qc.invalidateQueries({ queryKey: ['thread', personId] })
+        // Don't immediately invalidate — keep the optimistic visible.
+        // Realtime will fire when the webhook processes the sent message,
+        // which triggers a refetch that replaces the optimistic with the real row.
       } catch (e) {
+        if (import.meta.env.DEV) console.error('Send failed:', e)
         sendErrors.current.set(optId, String(e))
         qc.setQueryData<Message[]>(
           ['thread', personId, user?.id],
@@ -1605,7 +1875,7 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
       person_id: personId,
       identity_id: null,
       external_id: null,
-      channel: last?.channel ?? 'whatsapp',
+      channel: activeChannel,
       direction: 'outbound',
       message_type: last?.message_type ?? 'dm',
       subject: null,
@@ -1645,9 +1915,9 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
     const meta = {
       userId: last?.user_id ?? '',
       personId,
-      channel: last?.channel ?? 'whatsapp',
+      channel: activeChannel,
       messageType: last?.message_type ?? 'dm',
-      accountId: last?.unipile_account_id ?? '',
+      accountId: resolvedAccountId,
       quoteId: replyTo?.external_id ?? '',
     }
 
@@ -1668,8 +1938,9 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
           await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         }
         sendErrors.current.delete(optId)
-        qc.invalidateQueries({ queryKey: ['thread', personId] })
+        // Keep optimistic visible — realtime will confirm and replace it.
       } catch (e) {
+        if (import.meta.env.DEV) console.error('Send failed:', e)
         sendErrors.current.set(optId, String(e))
         qc.setQueryData<Message[]>(
           ['thread', personId, user?.id],
@@ -1681,11 +1952,6 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
-  }
-
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault(); setDragOver(false)
-    addFiles(e.dataTransfer.files)
   }
 
   const onPaste = (e: React.ClipboardEvent) => {
@@ -1707,8 +1973,8 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
 
   if (!resolvedChatId) {
     return (
-      <div style={{ padding: '0 16px 24px' }}>
-        <div style={{ borderRadius: 'var(--radius-card)', padding: '11px 16px', background: 'var(--color-surface-input)', color: 'var(--color-text-muted)', fontSize: 'var(--font-body)' }}>
+      <div className="px-4 pb-6">
+        <div className="rounded-card px-4 py-[11px] bg-surface-input text-text-muted text-body">
           No chat context
         </div>
       </div>
@@ -1716,19 +1982,20 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
   }
 
   return (
-    <div style={{ padding: '0 16px 24px', marginTop: -8 }}
-      onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={onDrop}>
+    <div className="compose-wrap"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        addFiles(e.dataTransfer.files)
+        onComposeDropDismiss?.()
+      }}>
 
       {failedMessages.length > 0 && (
-        <div style={{ marginBottom: 6 }}>
+        <div className="mb-1.5">
           {failedMessages.map((m) => (
-            <div key={m.id} style={{
-              display: 'flex', alignItems: 'center', gap: 8, padding: '4px 8px',
-              borderRadius: 4, background: 'rgba(237, 66, 69, .1)', marginBottom: 2,
-            }}>
-              <span style={{ fontSize: 'var(--font-sm)', color: 'var(--color-danger)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div key={m.id} className="failed-msg-row">
+              <span className="failed-msg-text">
                 Failed to send: {cleanPreviewText(m.body_text ?? '').slice(0, 40)}
               </span>
               <button onClick={() => {
@@ -1739,88 +2006,78 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
                   (old) => old?.filter((msg) => msg.id !== m.id) ?? [],
                 )
                 sendText(bodyText)
-              }} style={{
-                background: 'none', border: 'none', cursor: 'pointer',
-                color: 'var(--color-danger)', fontSize: 'var(--font-sm)', fontWeight: 600, flexShrink: 0,
-              }}>Retry</button>
+              }} className="failed-msg-retry">Retry</button>
             </div>
           ))}
         </div>
       )}
 
       {replyTo && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-          background: 'var(--color-surface)', borderRadius: 'var(--radius-card) var(--radius-card) 0 0', borderBottom: '2px solid var(--color-accent)',
-        }}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 'var(--font-sm)', fontWeight: 600, color: 'var(--color-accent)' }}>
+        <div className="reply-bar">
+          <div className="flex-1 min-w-0">
+            <div className="reply-bar-name">
               Replying to {replyTo.direction === 'outbound' ? 'yourself' : (replyTo.sender_name ?? personName ?? 'message')}
             </div>
-            <div style={{ fontSize: 'var(--font-md)', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div className="reply-bar-text">
               {cleanPreviewText(replyTo.body_text ?? '').slice(0, 80)}
             </div>
           </div>
-          <button onClick={onClearReply} style={{
-            background: 'none', border: 'none', cursor: 'pointer',
-            color: 'var(--color-text-muted)', padding: 4, flexShrink: 0,
-          }}><XIcon size={16} /></button>
+          <button onClick={onClearReply} className="compose-icon-btn p-1"><XIcon size={16} /></button>
         </div>
       )}
 
-      <div style={{
-        borderRadius: replyTo ? '0 0 var(--radius-card) var(--radius-card)' : 'var(--radius-card)', background: 'var(--color-surface-input)',
-        border: dragOver ? '2px solid var(--color-accent)' : '2px solid transparent',
-        transition: 'border-color .15s',
-      }}>
+      <div className={`compose-box${replyTo ? ' compose-box--replying' : ''}`}>
         {files.length > 0 && (
-          <div style={{ display: 'flex', gap: 8, padding: '8px 12px 0', flexWrap: 'wrap' }}>
+          <div className="file-preview-row">
             {files.map((f, i) => (
-              <div key={i} style={{
-                position: 'relative', borderRadius: 'var(--radius-card)', background: 'var(--color-surface)',
-                overflow: 'hidden', width: 80, height: 80,
-              }}>
-                {f.preview
-                  ? <img src={f.preview} alt="" style={{ width: 80, height: 80, objectFit: 'cover' }} />
-                  : <div style={{
-                      width: 80, height: 80, display: 'flex', alignItems: 'center',
-                      justifyContent: 'center', fontSize: 'var(--font-xs)', color: 'var(--color-text-muted)', padding: 4,
-                      textAlign: 'center', wordBreak: 'break-all',
-                    }}>{f.name}</div>}
-                <button onClick={() => removeFile(i)} style={{
-                  position: 'absolute', top: 2, right: 2, width: 20, height: 20,
-                  borderRadius: '50%', background: 'rgba(0,0,0,.7)', color: 'var(--color-white)',
-                  border: 'none', cursor: 'pointer', lineHeight: '20px',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}><XIcon size={12} /></button>
+              <div key={i} className="file-preview-card">
+                <div className="file-preview-thumb">
+                  {f.preview
+                    ? <img src={f.preview} alt="" />
+                    : <div className="file-preview-placeholder">
+                        <FileText size={32} />
+                      </div>}
+                  <button onClick={() => removeFile(i)} className="file-preview-remove"><XIcon size={12} /></button>
+                </div>
+                <span className="file-preview-name">{f.name}</span>
               </div>
             ))}
           </div>
         )}
 
-        <div style={{ display: 'flex', alignItems: 'flex-end' }}>
-          <button onClick={() => fileRef.current?.click()} style={{
-            background: 'none', border: 'none', cursor: 'pointer', padding: '10px 4px 10px 12px',
-            color: 'var(--color-text-secondary)', lineHeight: 1, flexShrink: 0,
-          }} title="Attach file"><Paperclip size={20} /></button>
+        <div className="compose-row">
+          {identityChannels.length > 1 && (
+            <div className="relative" ref={channelPickerRef}>
+              <button onClick={() => setShowChannelPicker((v) => !v)} className="compose-icon-btn flex items-center gap-0.5" title={`Send via ${activeChannel}`}>
+                <ChannelLogo channel={activeChannel} size={16} color={channelColor(activeChannel)} />
+                <ChevronDown size={10} />
+              </button>
+              {showChannelPicker && (
+                <div className="channel-picker-dropdown">
+                  {identityChannels.map((ident) => (
+                    <button key={ident.id} onClick={() => { setSelectedChannel(ident.channel); setShowChannelPicker(false) }} className="channel-picker-item" data-active={ident.channel === activeChannel}>
+                      <ChannelLogo channel={ident.channel} size={14} color={channelColor(ident.channel)} />
+                      <span>{ident.channel.charAt(0).toUpperCase() + ident.channel.slice(1)}</span>
+                      {ident.handle && <span className="text-xs text-text-muted ml-auto">{ident.handle}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <button onClick={() => fileRef.current?.click()} className="compose-icon-btn" title="Attach file"><Paperclip size={20} /></button>
           <input ref={fileRef} type="file" multiple hidden
             onChange={(e) => { addFiles(e.target.files); e.target.value = '' }} />
 
           {recording ? (
-            <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, padding: '11px 10px' }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--color-danger)', animation: 'pulse 1s infinite' }} />
-              <span style={{ fontSize: 'var(--font-base)', color: 'var(--color-danger)', fontWeight: 600 }}>
+            <div className="recording-indicator">
+              <span className="recording-dot" />
+              <span className="recording-label">
                 Recording {formatDuration(recordDuration)}
               </span>
-              <div style={{ flex: 1 }} />
-              <button onClick={cancelRecording} style={{
-                background: 'none', border: 'none', cursor: 'pointer',
-                color: 'var(--color-text-muted)', fontSize: 'var(--font-base)', padding: '2px 8px',
-              }}>Cancel</button>
-              <button onClick={sendVoice} style={{
-                background: 'var(--color-accent)', border: 'none', cursor: 'pointer',
-                color: 'var(--color-white)', fontSize: 'var(--font-md)', fontWeight: 600, padding: '4px 12px', borderRadius: 'var(--radius-sm)',
-              }}>Send</button>
+              <div className="flex-1" />
+              <button onClick={cancelRecording} className="bg-transparent border-none cursor-pointer text-text-muted text-base px-2 py-0.5">Cancel</button>
+              <button onClick={sendVoice} className="bg-accent border-none cursor-pointer text-white text-md font-semibold px-3 py-1 rounded-sm">Send</button>
             </div>
           ) : (
             <>
@@ -1832,38 +2089,15 @@ function ComposeBox({ personId, thread, chatId, convoLastMessage, personName, re
                 onKeyDown={onKeyDown}
                 onPaste={onPaste}
                 placeholder={`Message @${personName ?? 'this chat'}`}
-                style={{
-                  flex: 1, background: 'transparent', outline: 'none', resize: 'none',
-                  padding: '11px 10px 11px 4px', fontSize: 'var(--font-body)', lineHeight: '22px',
-                  color: 'var(--color-text-body)', maxHeight: 200, border: 'none',
-                }}
+                className="compose-textarea"
               />
               {!text.trim() && files.length === 0 && (
-                <button onClick={startRecording} title="Voice message" style={{
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  padding: '10px 12px 10px 4px', color: 'var(--color-text-secondary)',
-                  lineHeight: 1, flexShrink: 0,
-                }}><Mic size={20} /></button>
+                <button onClick={startRecording} title="Voice message" className="compose-icon-btn"><Mic size={20} /></button>
               )}
             </>
           )}
         </div>
       </div>
-
-      {dragOver && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'color-mix(in srgb, var(--color-accent) 12%, transparent)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          pointerEvents: 'none', zIndex: 999,
-        }}>
-          <div style={{
-            padding: '32px 48px', borderRadius: 'var(--radius-lg)', background: 'var(--color-accent)',
-            color: 'var(--color-white)', fontSize: 20, fontWeight: 600,
-          }}>
-            Drop files to upload
-          </div>
-        </div>
-      )}
     </div>
   )
 }

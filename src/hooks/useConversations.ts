@@ -4,7 +4,7 @@ import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
 import type { ConversationPreview, Channel, Message, Person, TriageLevel } from '../types'
 
-function rowToPreview(row: Record<string, unknown>, userId: string): ConversationPreview {
+function rowToPreview(row: Record<string, unknown>, userId: string, status?: string): ConversationPreview {
   const person: Person = {
     id: row.person_id as string,
     user_id: userId,
@@ -13,6 +13,7 @@ function rowToPreview(row: Record<string, unknown>, userId: string): Conversatio
     notes: (row.notes as string | null) ?? null,
     ai_summary: (row.ai_summary as string | null) ?? null,
     ai_summary_updated_at: null,
+    status: (status as Person['status']) ?? 'approved',
     created_at: '',
     updated_at: '',
   }
@@ -61,6 +62,7 @@ function rowToPreview(row: Record<string, unknown>, userId: string): Conversatio
     unreadCount: Number(row.unread_count) || 0,
     prevInboundBody: null,
     prevInboundSender: null,
+    channels: _.isArray(row.channels) ? (row.channels as string[]) : [],
   }
 }
 
@@ -85,19 +87,23 @@ function enrichPrevInbound(previews: ConversationPreview[], userId: string, batc
   })
 }
 
-async function fetchConversations(userId: string): Promise<ConversationPreview[]> {
-  const { data: rows, error } = await supabase.rpc('get_conversations', { p_user_id: userId })
+async function fetchConversations(userId: string, status?: string, circleId?: string | null): Promise<ConversationPreview[]> {
+  const params: Record<string, unknown> = { p_user_id: userId }
+  if (_.isString(status)) params.p_status = status
+  if (_.isString(circleId)) params.p_circle_id = circleId
+
+  const { data: rows, error } = await supabase.rpc('get_conversations', params)
 
   if (error) throw error
   if (!rows?.length) return []
 
-  let previews = (rows as Record<string, unknown>[]).map((r) => rowToPreview(r, userId))
+  let previews = (rows as Record<string, unknown>[]).map((r) => rowToPreview(r, userId, status))
 
   const outboundPersonIds = previews
     .filter((c) => c.lastMessage.direction === 'outbound')
     .map((c) => c.person.id)
 
-  let batchMap: Record<string, Record<string, unknown>> = {}
+  const batchMap: Record<string, Record<string, unknown>> = {}
   if (outboundPersonIds.length > 0) {
     const { data: inboundRows } = await supabase.rpc('get_prev_inbound_batch', {
       p_user_id: userId,
@@ -115,12 +121,13 @@ async function fetchConversations(userId: string): Promise<ConversationPreview[]
   return previews
 }
 
-export function useConversations(userId: string | undefined, realtimeConnected?: boolean) {
+export function useConversations(userId: string | undefined, realtimeConnected?: boolean, status?: string, circleId?: string | null) {
   const interval = realtimeConnected === false ? 8_000 : 30_000
   return useQuery({
-    queryKey: ['conversations', userId],
-    queryFn: () => fetchConversations(userId!),
+    queryKey: ['conversations', userId, status ?? 'approved', circleId ?? null],
+    queryFn: () => fetchConversations(userId!, status, circleId),
     enabled: _.isString(userId),
     refetchInterval: interval,
+    staleTime: 60_000,
   })
 }

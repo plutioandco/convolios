@@ -21,6 +21,7 @@ pub fn run() {
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_zustand::init())
     .plugin(tauri_plugin_deep_link::init())
+    .plugin(tauri_plugin_notification::init())
     .setup(|app| {
       let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -62,7 +63,8 @@ pub fn run() {
       fetch_chat_avatars,
       reconcile_chats,
       connect_x_account,
-      connect_imessage
+      connect_imessage,
+      read_dropped_files
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -621,10 +623,10 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
   let client = &state.http;
   let accounts = match fetch_accounts_inner(client).await {
     Ok(a) => a,
-    Err(e) => { eprintln!("[startup_sync] account fetch failed: {e}"); return Ok(format!("Skipped: {e}")); }
+    Err(e) => { dev_log!("[startup_sync] account fetch failed: {e}"); return Ok(format!("Skipped: {e}")); }
   };
 
-  emit("syncing", &format!("Syncing {} accounts...", accounts.len()));
+  emit("syncing", &format!("Found {} accounts, checking recent activity...", accounts.len()));
 
   let now = chrono::Utc::now().to_rfc3339();
   let mut synced = 0u32;
@@ -665,14 +667,14 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
   emit("syncing", "Syncing X DMs...");
   match backfill_x_dms(client, user_id, &supabase_url, &service_key).await {
     Ok((m, c)) if m > 0 => dev_log!("[startup_sync] X: {m} msgs from {c} chats"),
-    Err(e) => eprintln!("[startup_sync] X DM error: {e}"),
+    Err(e) => dev_log!("[startup_sync] X DM error: {e}"),
     _ => {}
   }
 
   emit("syncing", "Syncing iMessage...");
   match backfill_imessage(client, user_id, &supabase_url, &service_key).await {
     Ok((m, c)) if m > 0 => dev_log!("[startup_sync] iMessage: {m} msgs from {c} chats"),
-    Err(e) => eprintln!("[startup_sync] iMessage error: {e}"),
+    Err(e) => dev_log!("[startup_sync] iMessage error: {e}"),
     _ => {}
   }
 
@@ -729,9 +731,14 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         );
       } else {
         let sender_handle_raw = chat.get("attendee_public_identifier")
-          .or(chat.get("attendee_provider_id"))
-          .or(chat.get("provider_id"))
           .and_then(|v| v.as_str())
+          .filter(|s| !s.is_empty() && !s.contains("@lid"))
+          .or_else(|| chat.get("attendee_provider_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && !s.contains("@lid")))
+          .or_else(|| chat.get("provider_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()))
           .unwrap_or(chat_id);
         let mut resolved = normalize_handle(sender_handle_raw, channel);
         let mut resolved_name = if !chat_name.is_empty() { chat_name.to_string() } else { resolved.clone() };
@@ -777,16 +784,29 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         display_name = resolved_name;
       }
 
+      let direction_param = if is_group {
+        Some("outbound")
+      } else if msg_cutoff.is_none() {
+        Some("inbound")
+      } else {
+        None
+      };
+
+      let mut rpc_body = serde_json::json!({
+        "p_user_id": user_id, "p_channel": channel,
+        "p_handle": sender_handle, "p_display_name": display_name,
+        "p_unipile_account_id": acc.id
+      });
+      if let Some(dir) = direction_param {
+        rpc_body.as_object_mut().unwrap().insert("p_direction".to_string(), serde_json::Value::String(dir.to_string()));
+      }
+
       let person_resp = client
         .post(format!("{supabase_url}/rest/v1/rpc/backfill_find_or_create_person"))
         .header("apikey", &service_key)
         .header("Authorization", format!("Bearer {service_key}"))
         .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-          "p_user_id": user_id, "p_channel": channel,
-          "p_handle": sender_handle, "p_display_name": display_name,
-          "p_unipile_account_id": acc.id
-        }))
+        .json(&rpc_body)
         .send().await;
 
       let (person_id, identity_id) = match person_resp {
@@ -817,7 +837,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
             let stale = p.get("avatar_stale").and_then(|v| v.as_bool()).unwrap_or(true);
             !has_url || stale
           }
-          _ => false,
+          _ => true,
         };
 
         if needs_avatar {
@@ -873,7 +893,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       };
       let messages = match fetch_paginated(client, &msgs_url, &api_key, 3).await {
         Ok(m) => { if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
-        Err(e) => { eprintln!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
+        Err(e) => { dev_log!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
       };
 
       for msg in &messages {
@@ -931,7 +951,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
         let chat_folder = chat.get("folder").and_then(|v| v.as_str()).unwrap_or("");
 
-        let row = serde_json::json!({
+        let mut row = serde_json::json!({
           "user_id": user_id, "person_id": person_id,
           "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
           "external_id": external_id, "channel": channel,
@@ -955,8 +975,10 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           "quoted_text": quoted_text,
           "quoted_sender": quoted_sender,
           "folder": if chat_folder.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(chat_folder.to_string()) },
-          "read_at": if !is_sender && seen_val { serde_json::Value::String(chrono::Utc::now().to_rfc3339()) } else { serde_json::Value::Null },
         });
+        if !is_sender && msg_cutoff.is_none() {
+          row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+        }
 
         let insert = client
           .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
@@ -965,6 +987,64 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           .json(&row).send().await;
         if let Ok(r) = insert {
           if r.status().is_success() || r.status().as_u16() == 409 { msgs_synced += 1; }
+        }
+      }
+    }
+  }
+
+  // Avatar catch-up: refresh avatars for persons with missing/stale ones
+  {
+    let avatar_q = format!(
+      "{supabase_url}/rest/v1/persons?user_id=eq.{user_id}&or=(avatar_url.is.null,avatar_stale.eq.true)&select=id&limit=100"
+    );
+    if let Ok(resp) = client.get(&avatar_q)
+      .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
+      .send().await
+    {
+      if let Ok(persons) = resp.json::<Vec<serde_json::Value>>().await {
+        let count = persons.len();
+        if count > 0 {
+          emit("syncing", &format!("Refreshing {count} avatars…"));
+          dev_log!("[startup_sync] avatar catch-up: {count} persons");
+        }
+        for p in &persons {
+          let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
+          if pid.is_empty() { continue; }
+
+          let thread_q = format!(
+            "{supabase_url}/rest/v1/messages?person_id=eq.{pid}&message_type=neq.group&select=thread_id&order=sent_at.desc&limit=1"
+          );
+          let tid = match client.get(&thread_q)
+            .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
+            .send().await
+          {
+            Ok(r) if r.status().is_success() => {
+              let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+              rows.first().and_then(|r| r.get("thread_id").and_then(|v| v.as_str())).unwrap_or("").to_string()
+            }
+            _ => continue,
+          };
+          if tid.is_empty() { continue; }
+
+          let att_url = format!("{base}/api/v1/chat_attendees?chat_id={tid}");
+          if let Ok(att_resp) = client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+            if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
+              if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
+                for att in items {
+                  let is_self = att.get("is_self").and_then(|v| v.as_bool()).unwrap_or(false);
+                  if is_self { continue; }
+                  let att_id = att.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                  if att_id.is_empty() { continue; }
+                  let pic_url = att.get("picture_url").and_then(|v| v.as_str());
+                  upload_avatar(
+                    client, &api_key, &base, &supabase_url, &service_key,
+                    pid, att_id, pic_url,
+                  ).await;
+                  break;
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -1031,13 +1111,14 @@ fn map_unipile_status(raw: &str) -> &'static str {
 }
 
 fn normalize_handle(raw: &str, channel: &str) -> String {
+  let is_lid = raw.contains("@lid");
   let mut h = raw
     .replace("@s.whatsapp.net", "")
     .replace("@lid", "")
     .replace("@c.us", "")
     .trim()
     .to_string();
-  if channel == "whatsapp" && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() {
+  if channel == "whatsapp" && !is_lid && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() && h.len() <= 15 {
     h = format!("+{h}");
   }
   if channel == "linkedin" {
@@ -1090,6 +1171,8 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let mut sender_handle: String;
       let mut dm_attendee_id: Option<String> = None;
       let mut dm_picture_url: Option<String> = None;
+      let mut att_phone = String::new();
+      let mut pub_id = String::new();
 
       if is_group {
         display_name = if chat_name.is_empty() { "Group Chat".to_string() } else { chat_name.to_string() };
@@ -1130,16 +1213,18 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
             .map(String::from);
         }
 
-        let att_phone = attendee_info
+        att_phone = attendee_info
           .and_then(|a| a.get("specifics"))
           .and_then(|s| s.get("phone_number"))
           .and_then(|v| v.as_str())
-          .unwrap_or("");
+          .unwrap_or("")
+          .to_string();
 
-        let pub_id = chat
+        pub_id = chat
           .get("attendee_public_identifier")
           .and_then(|v| v.as_str())
-          .unwrap_or("");
+          .unwrap_or("")
+          .to_string();
 
         display_name = if !att_name.is_empty() && att_name != "Unknown" {
           att_name.to_string()
@@ -1155,9 +1240,14 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
 
         sender_handle = chat
           .get("attendee_public_identifier")
-          .or(chat.get("attendee_provider_id"))
-          .or(chat.get("provider_id"))
           .and_then(|v| v.as_str())
+          .filter(|s| !s.is_empty() && !s.contains("@lid"))
+          .or_else(|| chat.get("attendee_provider_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && !s.contains("@lid")))
+          .or_else(|| chat.get("provider_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty()))
           .unwrap_or(chat_id)
           .to_string();
         sender_handle = normalize_handle(&sender_handle, channel);
@@ -1187,6 +1277,27 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         }
       }
 
+      let mut identity_metadata = serde_json::Map::new();
+      if !is_group {
+        if !att_phone.is_empty() {
+          identity_metadata.insert("phone".to_string(), serde_json::Value::String(att_phone.to_string()));
+        }
+        if !pub_id.is_empty() {
+          identity_metadata.insert("public_identifier".to_string(), serde_json::Value::String(pub_id.to_string()));
+        }
+        if let Some(pid) = chat.get("attendee_provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+          identity_metadata.insert("provider_id".to_string(), serde_json::Value::String(pid.to_string()));
+        }
+        if channel == "email" {
+          identity_metadata.insert("email".to_string(), serde_json::Value::String(sender_handle.clone()));
+        }
+      }
+      let metadata_json = if identity_metadata.is_empty() {
+        serde_json::Value::Null
+      } else {
+        serde_json::Value::Object(identity_metadata)
+      };
+
       let person_resp = client
         .post(format!("{supabase_url}/rest/v1/rpc/backfill_find_or_create_person"))
         .header("apikey", &service_key)
@@ -1197,7 +1308,9 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           "p_channel": channel,
           "p_handle": sender_handle,
           "p_display_name": display_name,
-          "p_unipile_account_id": acc.id
+          "p_unipile_account_id": acc.id,
+          "p_metadata": metadata_json,
+          "p_direction": "outbound"
         }))
         .send()
         .await;
@@ -1335,7 +1448,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
         let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
 
-        let row = serde_json::json!({
+        let mut row = serde_json::json!({
           "user_id": user_id,
           "person_id": person_id,
           "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
@@ -1365,8 +1478,10 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           "quoted_text": quoted_text,
           "quoted_sender": quoted_sender,
           "folder": if chat_folder.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(chat_folder.to_string()) },
-          "read_at": if !is_sender && seen_val { serde_json::Value::String(chrono::Utc::now().to_rfc3339()) } else { serde_json::Value::Null }
         });
+        if !is_sender {
+          row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+        }
 
         let insert_resp = client
           .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
@@ -1390,7 +1505,6 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         }
       }
 
-      patch_stale_thread_ids(client, &supabase_url, &service_key, &person_id, channel, chat_id).await;
       total_chats += 1;
     }
   }
@@ -1550,7 +1664,7 @@ async fn sync_chat(
     let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
     let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
 
-    let row = serde_json::json!({
+    let mut row = serde_json::json!({
       "user_id": user_id,
       "person_id": person_id,
       "identity_id": identity_id,
@@ -1579,8 +1693,10 @@ async fn sync_chat(
       "chat_provider_id": msg_chat_provider_id,
       "quoted_text": quoted_text,
       "quoted_sender": quoted_sender,
-      "read_at": if !is_sender && seen_val { serde_json::Value::String(chrono::Utc::now().to_rfc3339()) } else { serde_json::Value::Null },
     });
+    if !is_sender {
+      row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+    }
 
     let insert = client
       .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
@@ -1623,46 +1739,37 @@ async fn send_message(
     ).await;
   }
 
+  if chat_id.is_empty() {
+    return Err("No chat_id provided — cannot send without a target chat".to_string());
+  }
+
   let (api_key, base) = unipile_config()?;
   let client = &state.http;
+  let aid = account_id.as_deref().unwrap_or("");
 
-  let try_send = |cid: &str, aid: Option<&str>| {
-    let url = format!("{base}/api/v1/chats/{cid}/messages");
-    let mut form = reqwest::multipart::Form::new().text("text", text.clone());
-    if let Some(a) = aid { if !a.is_empty() { form = form.text("account_id", a.to_string()); } }
-    if let Some(ref qid) = quote_id { if !qid.is_empty() { form = form.text("quote_id", qid.clone()); } }
-    if let Some(ref td) = typing_duration { if !td.is_empty() { form = form.text("typing_duration", td.clone()); } }
-    client.post(url).header("X-API-KEY", &api_key).multipart(form).send()
-  };
+  dev_log!("[send_message] person={person_id} channel={channel} chat_id={chat_id} account_id={aid}");
 
-  let response = try_send(&chat_id, account_id.as_deref()).await
-    .map_err(|e| format!("Send failed: {e}"))?;
+  let url = format!("{base}/api/v1/chats/{chat_id}/messages");
+  let mut form = reqwest::multipart::Form::new().text("text", text.clone());
+  if !aid.is_empty() { form = form.text("account_id", aid.to_string()); }
+  if let Some(ref qid) = quote_id { if !qid.is_empty() { form = form.text("quote_id", qid.clone()); } }
+  if let Some(ref td) = typing_duration { if !td.is_empty() { form = form.text("typing_duration", td.clone()); } }
+
+  let response = client.post(url).header("X-API-KEY", &api_key).multipart(form).send()
+    .await.map_err(|e| format!("Send failed: {e}"))?;
 
   let status = response.status();
   let body = response.text().await.unwrap_or_default();
 
-  let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    dev_log!("[send_message] chat returned 404, resolving current chat");
-    match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
-      Ok((new_cid, new_aid)) => {
-        let r2 = try_send(&new_cid, Some(&new_aid)).await
-          .map_err(|e| format!("Retry send failed: {e}"))?;
-        let s2 = r2.status();
-        let b2 = r2.text().await.unwrap_or_default();
-        if !s2.is_success() {
-          return Err(format!("Send error {s2}: {b2}"));
-        }
-        (new_cid, b2, Some(new_aid))
-      }
-      Err(e) => return Err(format!("Chat not found for this contact. Try pulling history first. ({e})")),
-    }
-  } else if !status.is_success() {
+  if !status.is_success() {
+    log_send_audit(
+      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      account_id.as_deref(), "error", Some(&format!("{status}: {body}")),
+    ).await;
     return Err(format!("Send error {status}: {body}"));
-  } else {
-    (chat_id.clone(), body, account_id.clone())
-  };
+  }
 
-  let resp: serde_json::Value = serde_json::from_str(&final_body).unwrap_or_default();
+  let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
   let external_id = resp.get("message_id")
     .or_else(|| resp.get("id"))
     .and_then(|v| v.as_str())
@@ -1670,102 +1777,50 @@ async fn send_message(
 
   persist_outbound(
     &state.http, &user_id, &person_id, &channel, &message_type,
-    &text, &final_chat_id, external_id, &serde_json::json!([]),
-    final_account_id.as_deref(),
-  ).await.unwrap_or_else(|e| eprintln!("[send_message] persist warning: {e}"));
+    &text, &chat_id, external_id, &serde_json::json!([]),
+    account_id.as_deref(),
+  ).await.unwrap_or_else(|e| dev_log!("[send_message] persist warning: {e}"));
 
-  Ok(final_body)
+  log_send_audit(
+    client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+    account_id.as_deref(), "sent", None,
+  ).await;
+
+  Ok(body)
 }
 
-async fn resolve_chat(
+async fn log_send_audit(
   client: &reqwest::Client,
-  api_key: &str,
-  base: &str,
   user_id: &str,
   person_id: &str,
   channel: &str,
-) -> Result<(String, String), String> {
-  let sb_url = std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
-  let sb_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
-
-  let ident_url = format!(
-    "{sb_url}/rest/v1/identities?select=handle,channel&person_id=eq.{person_id}&channel=eq.{channel}&handle=not.like.*%40g.us&limit=1"
-  );
-  let ident_resp = client.get(&ident_url)
-    .header("apikey", &sb_key)
-    .header("Authorization", format!("Bearer {sb_key}"))
-    .send().await.map_err(|e| format!("identity lookup: {e}"))?;
-  let ident_body: serde_json::Value = ident_resp.json().await.unwrap_or_default();
-  let handle = ident_body.as_array()
-    .and_then(|arr| arr.first())
-    .and_then(|row| row.get("handle"))
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| "No identity handle found".to_string())?;
-
-  let accts_url = format!(
-    "{sb_url}/rest/v1/connected_accounts?select=account_id&channel=eq.{channel}&status=eq.active&user_id=eq.{user_id}"
-  );
-  let accts_resp = client.get(&accts_url)
-    .header("apikey", &sb_key)
-    .header("Authorization", format!("Bearer {sb_key}"))
-    .send().await.map_err(|e| format!("accounts lookup: {e}"))?;
-  let accts_body: serde_json::Value = accts_resp.json().await.unwrap_or_default();
-  let account_ids: Vec<&str> = accts_body.as_array()
-    .map(|arr| arr.iter().filter_map(|r| r.get("account_id").and_then(|v| v.as_str())).collect())
-    .unwrap_or_default();
-
-  if account_ids.is_empty() {
-    return Err("No active accounts for this channel".to_string());
-  }
-
-  for aid in &account_ids {
-    let search_url = format!(
-      "{base}/api/v1/chats?account_id={aid}&attendees_identifier={handle}&limit=1",
-      handle = urlencoding::encode(handle),
-    );
-    let resp = client.get(&search_url)
-      .header("X-API-KEY", api_key)
-      .send().await;
-    if let Ok(r) = resp {
-      if r.status().is_success() {
-        let body: serde_json::Value = r.json().await.unwrap_or_default();
-        if let Some(chat_id) = body.get("items")
-          .and_then(|v| v.as_array())
-          .and_then(|arr| arr.first())
-          .and_then(|c| c.get("id"))
-          .and_then(|v| v.as_str())
-        {
-          dev_log!("[resolve_chat] found chat on matching account");
-          patch_stale_thread_ids(client, &sb_url, &sb_key, person_id, channel, chat_id).await;
-          return Ok((chat_id.to_string(), aid.to_string()));
-        }
-      }
-    }
-  }
-
-  Err(format!("No chat found for handle {handle} on any active account"))
-}
-
-async fn patch_stale_thread_ids(
-  client: &reqwest::Client,
-  sb_url: &str,
-  sb_key: &str,
-  person_id: &str,
-  channel: &str,
-  new_thread_id: &str,
+  frontend_chat_id: &str,
+  resolved_chat_id: &str,
+  resolved_account_id: Option<&str>,
+  outcome: &str,
+  detail: Option<&str>,
 ) {
-  let encoded_tid = urlencoding::encode(new_thread_id);
-  let url = format!(
-    "{sb_url}/rest/v1/messages?person_id=eq.{person_id}&channel=eq.{channel}&thread_id=neq.{encoded_tid}",
-  );
-  let _ = client
-    .patch(&url)
-    .header("apikey", sb_key)
+  let sb_url = match std::env::var("VITE_SUPABASE_URL") { Ok(v) => v, Err(_) => return };
+  let sb_key = match std::env::var("SUPABASE_SERVICE_ROLE_KEY") { Ok(v) => v, Err(_) => return };
+
+  let row = serde_json::json!({
+    "user_id": user_id,
+    "person_id": person_id,
+    "channel": channel,
+    "frontend_chat_id": frontend_chat_id,
+    "resolved_chat_id": resolved_chat_id,
+    "resolved_account_id": resolved_account_id.unwrap_or(""),
+    "outcome": outcome,
+    "detail": detail.unwrap_or(""),
+  });
+
+  let _ = client.post(format!("{sb_url}/rest/v1/send_audit_log"))
+    .header("apikey", &sb_key)
     .header("Authorization", format!("Bearer {sb_key}"))
     .header("Content-Type", "application/json")
-    .json(&serde_json::json!({ "thread_id": new_thread_id }))
-    .send()
-    .await;
+    .header("Prefer", "return=minimal")
+    .body(row.to_string())
+    .send().await;
 }
 
 #[tauri::command]
@@ -1783,27 +1838,31 @@ async fn send_attachment(
   quote_id: Option<String>,
   state: State<'_, AppState>,
 ) -> Result<String, String> {
+  if chat_id.is_empty() {
+    return Err("No chat_id provided — cannot send without a target chat".to_string());
+  }
+
   let (api_key, base) = unipile_config()?;
   let client = &state.http;
+  let aid = account_id.as_deref().unwrap_or("");
 
   let raw = base64::Engine::decode(&base64_engine(), &file_data)
     .map_err(|e| format!("base64 decode: {e}"))?;
 
   let body_text = text.clone().unwrap_or_default();
 
-  let build_form = |raw_bytes: Vec<u8>, aid: Option<&str>| -> Result<reqwest::multipart::Form, String> {
-    let file_part = reqwest::multipart::Part::bytes(raw_bytes)
-      .file_name(file_name.clone())
-      .mime_str(&mime_type)
-      .map_err(|e| format!("mime: {e}"))?;
-    let mut form = reqwest::multipart::Form::new().part("attachments", file_part);
-    if !body_text.is_empty() { form = form.text("text", body_text.clone()); }
-    if let Some(a) = aid { if !a.is_empty() { form = form.text("account_id", a.to_string()); } }
-    if let Some(ref qid) = quote_id { if !qid.is_empty() { form = form.text("quote_id", qid.clone()); } }
-    Ok(form)
-  };
+  dev_log!("[send_attachment] person={person_id} channel={channel} chat_id={chat_id} file={file_name}");
 
-  let form = build_form(raw.clone(), account_id.as_deref())?;
+  let file_part = reqwest::multipart::Part::bytes(raw)
+    .file_name(file_name.clone())
+    .mime_str(&mime_type)
+    .map_err(|e| format!("mime: {e}"))?;
+
+  let mut form = reqwest::multipart::Form::new().part("attachments", file_part);
+  if !body_text.is_empty() { form = form.text("text", body_text); }
+  if !aid.is_empty() { form = form.text("account_id", aid.to_string()); }
+  if let Some(ref qid) = quote_id { if !qid.is_empty() { form = form.text("quote_id", qid.clone()); } }
+
   let url = format!("{base}/api/v1/chats/{chat_id}/messages");
   let response = client.post(&url).header("X-API-KEY", &api_key).multipart(form).send().await
     .map_err(|e| format!("Send attachment failed: {e}"))?;
@@ -1811,44 +1870,34 @@ async fn send_attachment(
   let status = response.status();
   let body = response.text().await.unwrap_or_default();
 
-  let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    dev_log!("[send_attachment] chat returned 404, resolving...");
-    match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
-      Ok((new_cid, new_aid)) => {
-        let retry_form = build_form(raw, Some(&new_aid))?;
-        let retry_url = format!("{base}/api/v1/chats/{new_cid}/messages");
-        let r2 = client.post(&retry_url).header("X-API-KEY", &api_key).multipart(retry_form).send().await
-          .map_err(|e| format!("Retry send attachment failed: {e}"))?;
-        let s2 = r2.status();
-        let b2 = r2.text().await.unwrap_or_default();
-        if !s2.is_success() {
-          return Err(format!("Send attachment error {s2}: {b2}"));
-        }
-        (new_cid, b2, Some(new_aid))
-      }
-      Err(e) => return Err(format!("Chat not found for this contact. Try pulling history first. ({e})")),
-    }
-  } else if !status.is_success() {
+  if !status.is_success() {
+    log_send_audit(
+      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      account_id.as_deref(), "error", Some(&format!("attachment {status}: {body}")),
+    ).await;
     return Err(format!("Send attachment error {status}: {body}"));
-  } else {
-    (chat_id.clone(), body, account_id.clone())
-  };
+  }
 
-  let resp: serde_json::Value = serde_json::from_str(&final_body).unwrap_or_default();
+  let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
   let external_id = resp.get("message_id")
     .or_else(|| resp.get("id"))
     .and_then(|v| v.as_str())
     .unwrap_or("");
 
   let att_json = serde_json::json!([{ "name": file_name, "mimetype": mime_type }]);
-  let display_text = if body_text.is_empty() { String::new() } else { body_text };
+  let display_text = text.unwrap_or_default();
 
   persist_outbound(
     &state.http, &user_id, &person_id, &channel, &message_type,
-    &display_text, &final_chat_id, external_id, &att_json, final_account_id.as_deref(),
-  ).await.unwrap_or_else(|e| eprintln!("[send_attachment] persist warning: {e}"));
+    &display_text, &chat_id, external_id, &att_json, account_id.as_deref(),
+  ).await.unwrap_or_else(|e| dev_log!("[send_attachment] persist warning: {e}"));
 
-  Ok(final_body)
+  log_send_audit(
+    client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+    account_id.as_deref(), "sent", Some("attachment"),
+  ).await;
+
+  Ok(body)
 }
 
 #[tauri::command]
@@ -1915,8 +1964,13 @@ async fn send_voice_message(
   account_id: Option<String>,
   state: State<'_, AppState>,
 ) -> Result<String, String> {
+  if chat_id.is_empty() {
+    return Err("No chat_id provided — cannot send without a target chat".to_string());
+  }
+
   let (api_key, base) = unipile_config()?;
   let client = &state.http;
+  let aid = account_id.as_deref().unwrap_or("");
 
   let raw = base64::Engine::decode(&base64_engine(), &voice_data)
     .map_err(|e| format!("base64 decode: {e}"))?;
@@ -1925,17 +1979,15 @@ async fn send_voice_message(
     else if voice_mime.contains("ogg") { "ogg" }
     else { "mp3" };
 
-  let build_form = |raw_bytes: Vec<u8>, aid: Option<&str>| -> Result<reqwest::multipart::Form, String> {
-    let voice_part = reqwest::multipart::Part::bytes(raw_bytes)
-      .file_name(format!("voice.{ext}"))
-      .mime_str(&voice_mime)
-      .map_err(|e| format!("mime: {e}"))?;
-    let mut form = reqwest::multipart::Form::new().part("voice_message", voice_part);
-    if let Some(a) = aid { if !a.is_empty() { form = form.text("account_id", a.to_string()); } }
-    Ok(form)
-  };
+  dev_log!("[send_voice] person={person_id} channel={channel} chat_id={chat_id}");
 
-  let form = build_form(raw.clone(), account_id.as_deref())?;
+  let voice_part = reqwest::multipart::Part::bytes(raw)
+    .file_name(format!("voice.{ext}"))
+    .mime_str(&voice_mime)
+    .map_err(|e| format!("mime: {e}"))?;
+  let mut form = reqwest::multipart::Form::new().part("voice_message", voice_part);
+  if !aid.is_empty() { form = form.text("account_id", aid.to_string()); }
+
   let url = format!("{base}/api/v1/chats/{chat_id}/messages");
   let response = client.post(&url).header("X-API-KEY", &api_key).multipart(form).send().await
     .map_err(|e| format!("Voice send failed: {e}"))?;
@@ -1943,30 +1995,15 @@ async fn send_voice_message(
   let status = response.status();
   let body = response.text().await.unwrap_or_default();
 
-  let (final_chat_id, final_body, final_account_id) = if status.as_u16() == 404 {
-    dev_log!("[send_voice] chat returned 404, resolving...");
-    match resolve_chat(client, &api_key, &base, &user_id, &person_id, &channel).await {
-      Ok((new_cid, new_aid)) => {
-        let retry_form = build_form(raw, Some(&new_aid))?;
-        let retry_url = format!("{base}/api/v1/chats/{new_cid}/messages");
-        let r2 = client.post(&retry_url).header("X-API-KEY", &api_key).multipart(retry_form).send().await
-          .map_err(|e| format!("Retry voice send failed: {e}"))?;
-        let s2 = r2.status();
-        let b2 = r2.text().await.unwrap_or_default();
-        if !s2.is_success() {
-          return Err(format!("Voice send error {s2}: {b2}"));
-        }
-        (new_cid, b2, Some(new_aid))
-      }
-      Err(e) => return Err(format!("Chat not found for this contact. Try pulling history first. ({e})")),
-    }
-  } else if !status.is_success() {
+  if !status.is_success() {
+    log_send_audit(
+      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      account_id.as_deref(), "error", Some(&format!("voice {status}: {body}")),
+    ).await;
     return Err(format!("Voice send error {status}: {body}"));
-  } else {
-    (chat_id.clone(), body, account_id.clone())
-  };
+  }
 
-  let resp: serde_json::Value = serde_json::from_str(&final_body).unwrap_or_default();
+  let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
   let external_id = resp.get("message_id")
     .or_else(|| resp.get("id"))
     .and_then(|v| v.as_str())
@@ -1975,10 +2012,15 @@ async fn send_voice_message(
   let att_json = serde_json::json!([{ "type": "ptt", "mimetype": voice_mime }]);
   persist_outbound(
     &state.http, &user_id, &person_id, &channel, &message_type,
-    "", &final_chat_id, external_id, &att_json, final_account_id.as_deref(),
-  ).await.unwrap_or_else(|e| eprintln!("[send_voice] persist warning: {e}"));
+    "", &chat_id, external_id, &att_json, account_id.as_deref(),
+  ).await.unwrap_or_else(|e| dev_log!("[send_voice] persist warning: {e}"));
 
-  Ok(final_body)
+  log_send_audit(
+    client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+    account_id.as_deref(), "sent", Some("voice"),
+  ).await;
+
+  Ok(body)
 }
 
 // ─── X / TWITTER INTEGRATION ─────────────────────────────────────────────────
@@ -2246,7 +2288,7 @@ async fn send_x_dm(
     persist_outbound(
       client, user_id, person_id, "x", "dm", text,
       dm_conversation_id, event_id, &serde_json::json!([]), None,
-    ).await.unwrap_or_else(|e| eprintln!("[send_x_dm] persist: {e}"));
+    ).await.unwrap_or_else(|e| dev_log!("[send_x_dm] persist: {e}"));
     return Ok(serde_json::to_string(&b2).unwrap_or_default());
   }
 
@@ -2261,7 +2303,7 @@ async fn send_x_dm(
   persist_outbound(
     client, user_id, person_id, "x", "dm", text,
     dm_conversation_id, event_id, &serde_json::json!([]), None,
-  ).await.unwrap_or_else(|e| eprintln!("[send_x_dm] persist: {e}"));
+  ).await.unwrap_or_else(|e| dev_log!("[send_x_dm] persist: {e}"));
 
   Ok(serde_json::to_string(&body).unwrap_or_default())
 }
@@ -2361,6 +2403,12 @@ async fn backfill_x_dms(
       .unwrap_or("");
     let handle = if !username.is_empty() { username.to_string() } else { other_id.clone() };
 
+    let earliest_sender = msgs.iter()
+      .min_by_key(|m| m.get("created_at").and_then(|v| v.as_str()).unwrap_or(""))
+      .and_then(|m| m.get("sender_id").and_then(|v| v.as_str()))
+      .unwrap_or("");
+    let direction = if earliest_sender == my_x_id { "outbound" } else { "inbound" };
+
     let person_url = format!("{sb_url}/rest/v1/rpc/backfill_find_or_create_person");
     let person_resp = client
       .post(&person_url)
@@ -2374,6 +2422,7 @@ async fn backfill_x_dms(
         "p_handle": handle,
         "p_display_name": display_name,
         "p_unipile_account_id": my_x_id,
+        "p_direction": direction
       }))
       .send()
       .await;
@@ -2410,7 +2459,7 @@ async fn backfill_x_dms(
       let text = msg.get("text").and_then(|v| v.as_str());
       let created_at = msg.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
 
-      let row = serde_json::json!({
+      let mut row = serde_json::json!({
         "user_id": user_id,
         "person_id": person_id,
         "external_id": external_id,
@@ -2423,6 +2472,9 @@ async fn backfill_x_dms(
         "sent_at": created_at,
         "triage": "unclassified",
       });
+      if direction == "inbound" {
+        row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+      }
 
       let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
       let msg_resp = client
@@ -2650,6 +2702,12 @@ async fn backfill_imessage(
 
     let message_type = if is_group { "group" } else { "dm" };
 
+    let earliest = msgs.iter().min_by_key(|m| m.date);
+    let direction = match earliest {
+      Some(m) if m.is_from_me => "outbound",
+      _ => "inbound",
+    };
+
     let person_url = format!("{sb_url}/rest/v1/rpc/backfill_find_or_create_person");
     let person_resp = client
       .post(&person_url)
@@ -2663,6 +2721,7 @@ async fn backfill_imessage(
         "p_handle": handle,
         "p_display_name": display_name,
         "p_unipile_account_id": "local-imessage",
+        "p_direction": direction
       }))
       .send().await;
 
@@ -2688,7 +2747,7 @@ async fn backfill_imessage(
         } else { "" })
       };
 
-      let row = serde_json::json!({
+      let mut row = serde_json::json!({
         "user_id": user_id,
         "person_id": person_id,
         "external_id": format!("imsg-{}", msg.guid),
@@ -2702,6 +2761,9 @@ async fn backfill_imessage(
         "sent_at": sent_at,
         "triage": "unclassified",
       });
+      if direction == "inbound" {
+        row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+      }
 
       let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
       let msg_resp = client
@@ -2760,7 +2822,7 @@ async fn send_imessage_dm(
   persist_outbound(
     client, user_id, person_id, "imessage", "dm", text,
     chat_id, &event_id, &serde_json::json!([]), None,
-  ).await.unwrap_or_else(|e| eprintln!("[send_imessage] persist: {e}"));
+  ).await.unwrap_or_else(|e| dev_log!("[send_imessage] persist: {e}"));
 
   Ok(r#"{"status":"sent"}"#.to_string())
 }
@@ -2916,7 +2978,7 @@ async fn fetch_attachment(message_id: String, attachment_id: String, channel: Op
   }
 
   if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-    eprintln!("[attachment-cache] Failed to create cache dir: {e}");
+    dev_log!("[attachment-cache] Failed to create cache dir: {e}");
   } else {
     let _ = std::fs::write(&cache_file, &bytes);
     let _ = std::fs::write(&meta_file, &content_type);
@@ -3320,6 +3382,36 @@ fn base64_encode(data: &[u8]) -> String {
     encoder.finish().unwrap();
   }
   String::from_utf8(buf).unwrap()
+}
+
+#[tauri::command]
+async fn read_dropped_files(paths: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
+    let mut results = Vec::new();
+    for p in &paths {
+        let data = std::fs::read(p).map_err(|e| format!("Read {p}: {e}"))?;
+        let name = std::path::Path::new(p)
+            .file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let ext = std::path::Path::new(p)
+            .extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let mime = match ext.as_str() {
+            "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "gif" => "image/gif",
+            "webp" => "image/webp", "svg" => "image/svg+xml", "bmp" => "image/bmp",
+            "mp4" => "video/mp4", "webm" => "video/webm", "mov" => "video/quicktime",
+            "pdf" => "application/pdf", "zip" => "application/zip",
+            "mp3" => "audio/mpeg", "ogg" => "audio/ogg", "wav" => "audio/wav",
+            "txt" => "text/plain", "html" => "text/html", "css" => "text/css",
+            "json" => "application/json", "xml" => "application/xml",
+            _ => "application/octet-stream",
+        };
+        let b64 = base64::Engine::encode(&base64_engine(), &data);
+        results.push(serde_json::json!({
+            "name": name, "data": b64, "mime": mime,
+            "preview": if mime.starts_with("image/") {
+                format!("data:{mime};base64,{b64}")
+            } else { String::new() },
+        }));
+    }
+    Ok(results)
 }
 
 fn base64_engine() -> base64::engine::GeneralPurpose {

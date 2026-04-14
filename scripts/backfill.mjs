@@ -3,7 +3,8 @@ import { createClient } from '@supabase/supabase-js'
 const API = process.env.UNIPILE_API_URL || 'https://api4.unipile.com:13443'
 const KEY = process.env.UNIPILE_API_KEY
 const SB = createClient(process.env.VITE_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
-const USER_ID = '0ca4c58c-98b0-49a4-a7e2-876650228b85'
+const USER_ID = process.env.BACKFILL_USER_ID
+if (!USER_ID) { console.error('BACKFILL_USER_ID env var is required'); process.exit(1) }
 
 const hdr = { 'X-API-KEY': KEY }
 
@@ -48,6 +49,7 @@ async function findOrCreatePerson(channel, handle, displayName, accountId) {
     p_handle: handle,
     p_display_name: displayName,
     p_unipile_account_id: accountId,
+    p_direction: 'outbound',
   })
   return data
 }

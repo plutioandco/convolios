@@ -6,6 +6,7 @@ export interface Person {
   notes: string | null
   ai_summary: string | null
   ai_summary_updated_at: string | null
+  status: 'approved' | 'pending' | 'blocked'
   created_at: string
   updated_at: string
 }
@@ -107,4 +108,53 @@ export interface ConversationPreview {
   unreadCount: number
   prevInboundBody: string | null
   prevInboundSender: string | null
+  channels: string[]
+}
+
+export interface Circle {
+  id: string
+  user_id: string
+  name: string
+  color: string
+  emoji: string | null
+  notify: 'all' | 'muted'
+  sort_order: number
+  created_at: string
+}
+
+export interface CircleMember {
+  circle_id: string
+  person_id: string
+  added_at: string
+}
+
+export interface MergeClusterMember {
+  id: string
+  name: string
+  avatar: string | null
+  channels: string[]
+  is_group: boolean
+}
+
+export interface MergeCluster {
+  cluster_id: string
+  keep_person_id: string
+  keep_person_name: string
+  keep_person_avatar: string | null
+  members: MergeClusterMember[]
+  match_type: 'identifier' | 'name'
+  match_detail: string
+  score: number
+}
+
+export interface MergeLogEntry {
+  id: string
+  user_id: string
+  keep_person_id: string
+  merged_person_id: string
+  merged_person_name: string
+  merged_identities: { id: string; channel: string; handle: string }[]
+  merged_message_count: number
+  merged_at: string
+  undone_at: string | null
 }

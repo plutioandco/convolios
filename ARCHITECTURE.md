@@ -14,8 +14,7 @@ This document describes the actual implementation as it exists today. For the vi
 - **One feature per file** — `Sidebar.tsx`, `InboxList.tsx`, `ThreadView.tsx`, `Settings.tsx`. No deep component tree.
 - **Helper components live in the same file** as their parent — `GifPlayer`, `AttachmentMedia`, `ComposeBox` all live inside `ThreadView.tsx`.
 - **Named exports** for components: `export function Sidebar()`, not default exports (except `App`).
-- **Inline styles** for layout, colors, and spacing. Use CSS custom property tokens defined in `src/index.css` `@theme` block (e.g. `var(--color-surface)`, `var(--color-accent)`, `var(--radius-card)`). Never hardcode hex values.
-- **CSS classes** only for reusable behaviors: `thin-scroll`, `chat-scroll`, `guild-pill`, `guild-icon`, `av-1`–`av-8`, `msg-compact`, `pulse-dot`.
+- **CSS component classes** (in `src/index.css`) and **Tailwind utility classes** for layout, colors, and spacing. Inline `style` only for dynamic runtime values (positions, computed colors). Never hardcode hex values.
 - **Conditional rendering** uses `&&` (never `? : null`).
 - **Zustand selectors** pull one field per call: `useInboxStore((s) => s.activeChannel)`.
 
@@ -60,11 +59,13 @@ This document describes the actual implementation as it exists today. For the vi
 
 ### Styling Conventions
 
-- **Design tokens** defined in `src/index.css` via Tailwind v4 `@theme` block. All colors, radii, spacing, and typography are CSS custom properties (`var(--color-surface)`, `var(--radius-card)`, `var(--font-sm)`, etc.). Never use raw hex values — always reference the tokens.
-- **Style primitives** in `src/components/thread/threadStyles.ts` — composable `CSSProperties` objects (`S.card`, `S.label`, `S.meta`, `S.media`, etc.) shared across all thread/media components. Spread with overrides: `{ ...S.card, display: 'flex' }`.
-- **Inline styles** for layout, colors, and spacing — referencing `var(--color-*)` tokens, not hardcoded hex.
-- **CSS classes** only for reusable behaviors: `thin-scroll`, `chat-scroll`, `guild-pill`, `guild-icon`, `av-1`–`av-8`, `msg-compact`, `pulse-dot`.
-- **Hover states** use `onMouseEnter`/`onMouseLeave` mutating `e.currentTarget.style`.
+- **Design tokens** defined in `src/index.css` via Tailwind v4 `@theme` block. All colors, radii, spacing, and typography are CSS custom properties. Never use raw hex values — always reference the tokens.
+- **Three-layer styling** (in order of preference):
+  1. **CSS component classes** in `src/index.css` — for multi-property patterns that repeat (`.top-bar`, `.conv-row`, `.compose-box`, `.msg-row`, etc.)
+  2. **Tailwind utility classes** — for single-property styling (`flex`, `items-center`, `text-text-muted`, `bg-surface-deep`, `rounded-card`, etc.)
+  3. **Inline `style` prop** — only for truly dynamic runtime values (computed positions, `channelColor()` return values, `S.*` spread objects from threadStyles)
+- **Style primitives** in `src/components/thread/threadStyles.ts` — composable `CSSProperties` objects (`S.card`, `S.label`, `S.meta`, `S.media`, etc.) shared across thread/media components. Used via `style={S.card}`.
+- **No hardcoded hex** in components — only in data arrays (`CIRCLE_COLORS`) and regex patterns.
 - **Scrollbars**: use `chat-scroll` for main scroll areas, `thin-scroll` for narrow sidebars.
 
 ---
@@ -156,10 +157,11 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `dedupe_accounts()` | Deduplicate Unipile accounts (phone/email normalization) |
 | `channel_from_type()` | Map account types (LINKEDIN, WHATSAPP, MAIL, MOBILE, X, IMESSAGE...) to our `Channel` |
 | `map_unipile_status()` | Map Unipile status strings to our status enum |
-| `normalize_handle()` | Strip WhatsApp suffixes, normalize LinkedIn URLs, lowercase |
+| `normalize_handle()` | Strip WhatsApp suffixes, filter LID handles, normalize LinkedIn URLs, lowercase |
 | `persist_outbound()` | Save a sent message to Supabase via REST API |
-| `resolve_chat()` | Find or create a chat for sending (lookup by thread_id or person handle) |
-| `patch_stale_thread_ids()` | Fix messages with outdated thread_ids after chat resolution |
+| `resolve_chat()` | Find DM chat for a person on their primary Unipile account (DM-only, account-prioritized) |
+| `verify_chat_ownership()` | Pre-send safety check: ensure resolved chat_id isn't already owned by a different person |
+| `log_send_audit()` | Log every send attempt to `send_audit_log` table for forensic debugging |
 | `base64_encode()` / `base64_engine()` | Encode binary data (avatars, attachments) to base64 |
 
 ### Environment Variables Used by Rust
@@ -716,6 +718,18 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 | 020 | `020_rpc_include_avatar_url.sql` | Re-include `avatar_url` in `get_conversations` RPC (now short Storage URLs, not base64). Remove `SECURITY DEFINER`. |
 | 021 | `021_remove_name_based_matching.sql` | Remove dangerous display_name fallback from `backfill_find_or_create_person`. Handle-only matching. |
 | 022 | `022_harden_security_definer.sql` | Revoke EXECUTE on backfill RPC from frontend roles. Add `auth.uid()` validation to `mark_conversation_read`. |
+| 023 | `023_x_oauth_state.sql` | X/Twitter OAuth state table for PKCE flow. |
+| 024 | `024_search_messages.sql` | Full-text search on messages. |
+| 025 | `025_screener_circles_merge.sql` | Screener (pending contacts), circles, person merging system with audit log. |
+| 026 | `026_identity_enrichment.sql` | Identity metadata enrichment (phone, email) for merge suggestions. |
+| 027 | `027_merge_suggestions_quality.sql` | Exclude same-channel name matches from merge suggestions. |
+| 028 | `028_merge_clusters.sql` | Cluster-based merge: union-find grouping + bulk merge RPC. |
+| 029 | `029_fix_merge_dismissed_pk.sql` | Fix `merge_dismissed` PK to include `user_id`. |
+| 030 | `030_fix_merge_clusters_volatile.sql` | Fix `get_merge_clusters` volatility for temp tables. |
+| 031 | `031_sidebar_unread_counts.sql` | `get_sidebar_unread` RPC for per-channel/circle badge counts. |
+| 032 | `032_backfill_read_at.sql` | One-time fix: mark all historical inbound messages as read. |
+| 033 | `033_exclude_groups_from_merge.sql` | Exclude group chats from merge candidate pairs. |
+| 034 | `034_message_routing_safeguards.sql` | **Safety triggers**: DM thread→person ownership enforcement, immutable thread_id/person_id on messages, send audit log table. Rewrites `merge_persons` and `undo_merge` to bypass triggers. |
 
 ---
 

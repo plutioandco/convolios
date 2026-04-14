@@ -35,3 +35,4 @@ sha2 = "0.10"
 getrandom = "0.2"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 open = "5"
+tauri-plugin-notification = "2.3.3"

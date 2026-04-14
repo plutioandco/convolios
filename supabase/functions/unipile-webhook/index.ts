@@ -201,11 +201,13 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   let messageType: string;
 
   if (threadLookup) {
+    direction = resolveSenderDirection(fullMsg, payload);
+
     if (isGroup) {
       const groupHandle = chatInfo.provider_id ?? payload.chat_id;
       const groupName = chatInfo.name ?? "Group Chat";
       const result = await findOrCreatePerson(
-        userId, channel, groupHandle, groupName, payload.account_id
+        userId, channel, groupHandle, groupName, payload.account_id, direction
       );
       personId = result.personId;
       identityId = result.identityId;
@@ -214,8 +216,6 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       identityId = threadLookup.identity_id;
     }
     messageType = isGroup ? "group" : threadLookup.message_type;
-
-    direction = resolveSenderDirection(fullMsg, payload);
   } else {
     const isSender = resolveSenderDirection(fullMsg, payload) === "outbound";
     direction = isSender ? "outbound" : "inbound";
@@ -247,7 +247,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     }
 
     const result = await findOrCreatePerson(
-      userId, channel, contactHandle, contactName, payload.account_id
+      userId, channel, contactHandle, contactName, payload.account_id, direction
     );
     personId = result.personId;
     identityId = result.identityId;
@@ -420,7 +420,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
     }
 
     const { personId, identityId } = await findOrCreatePerson(
-      userId, "email", otherAddr, otherName, accountId
+      userId, "email", otherAddr, otherName, accountId, direction as "inbound" | "outbound"
     );
 
     const folders = Array.isArray(em.folders) ? em.folders : [];
@@ -747,7 +747,8 @@ async function findOrCreatePerson(
   channel: string,
   handle: string,
   displayName: string,
-  unipileAccountId: string
+  unipileAccountId: string,
+  direction: "inbound" | "outbound" = "inbound"
 ): Promise<{ personId: string; identityId: string }> {
   const normalizedHandle = normalizeHandle(handle, channel);
 
@@ -810,6 +811,7 @@ async function findOrCreatePerson(
     .insert({
       user_id: userId,
       display_name: displayName,
+      status: direction === "outbound" ? "approved" : "pending",
     })
     .select("id")
     .single();

@@ -60,19 +60,6 @@ export const pillBadge: CSSProperties = {
   marginTop: 4,
 }
 
-export const loadingPlaceholder: CSSProperties = {
-  width: 200,
-  height: 100,
-  borderRadius: 'var(--radius-card)',
-  background: 'var(--color-surface-deep)',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  color: 'var(--color-text-muted)',
-  fontSize: 'var(--font-sm)',
-  marginTop: 4,
-}
-
 export const quotedBlock: CSSProperties = {
   borderLeft: '3px solid var(--color-accent)',
   padding: '4px 12px',

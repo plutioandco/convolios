@@ -1,25 +1,27 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Lock } from 'lucide-react'
+import { Lock, Plus, Trash2, Undo2, Link2, Check, X } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
 import { useAccountsStore } from '../../stores/accountsStore'
 import { useSyncStore } from '../../stores/inboxStore'
 import { queryClient } from '../../lib/queryClient'
-import { channelLabel, channelColor, relativeTime } from '../../utils'
+import { useCircles, useCreateCircle, useUpdateCircle, useDeleteCircle } from '../../hooks/useCircles'
+import { useDismissMerge, useMergeLog, useUndoMerge, useMergeClusters, useMergeCluster, useFuzzyMergeSuggestions } from '../../hooks/useMergeSuggestions'
+import { channelLabel, channelColor, relativeTime, initials, avatarCls } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
-import type { ConnectedAccount } from '../../types'
+import type { ConnectedAccount, MergeCluster } from '../../types'
 import _ from 'lodash'
 
 const PROVIDERS = [
-  { providers: ['WHATSAPP'],  label: 'WhatsApp',  desc: 'QR code',  channel: 'whatsapp' },
-  { providers: ['GOOGLE'],    label: 'Gmail',      desc: 'OAuth',    channel: 'email' },
-  { providers: ['LINKEDIN'],  label: 'LinkedIn',   desc: 'Sign in',  channel: 'linkedin' },
-  { providers: ['INSTAGRAM'], label: 'Instagram',  desc: 'Sign in',  channel: 'instagram' },
-  { providers: ['TELEGRAM'],  label: 'Telegram',   desc: 'QR code',  channel: 'telegram' },
-  { providers: ['MICROSOFT'], label: 'Outlook',    desc: 'OAuth',    channel: 'email' },
-  { providers: ['X'],         label: 'X',          desc: 'OAuth',    channel: 'x' },
-  { providers: ['IMESSAGE'],  label: 'iMessage',   desc: 'Local',    channel: 'imessage' },
+  { providers: ['WHATSAPP'],  label: 'WhatsApp',  desc: 'QR code',  channel: 'whatsapp',  logo: 'whatsapp' },
+  { providers: ['GOOGLE'],    label: 'Gmail',      desc: 'OAuth',    channel: 'email',     logo: 'email' },
+  { providers: ['LINKEDIN'],  label: 'LinkedIn',   desc: 'Sign in',  channel: 'linkedin',  logo: 'linkedin' },
+  { providers: ['INSTAGRAM'], label: 'Instagram',  desc: 'Sign in',  channel: 'instagram', logo: 'instagram' },
+  { providers: ['TELEGRAM'],  label: 'Telegram',   desc: 'QR code',  channel: 'telegram',  logo: 'telegram' },
+  { providers: ['MICROSOFT'], label: 'Outlook',    desc: 'OAuth',    channel: 'email',     logo: 'outlook' },
+  { providers: ['X'],         label: 'X',          desc: 'OAuth',    channel: 'x',         logo: 'x' },
+  { providers: ['IMESSAGE'],  label: 'iMessage',   desc: 'Local',    channel: 'imessage',  logo: 'imessage' },
 ]
 
 export function Settings() {
@@ -28,7 +30,6 @@ export function Settings() {
   const loading = useAccountsStore((s) => s.loading)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const removeAccount = useAccountsStore((s) => s.removeAccount)
-  const syncPhase = useSyncStore((s) => s.phase)
   const lastSyncedAt = useSyncStore((s) => s.lastSyncedAt)
   const [syncing, setSyncing] = useState(false)
   const [syncMsg, setSyncMsg] = useState('')
@@ -36,6 +37,7 @@ export function Settings() {
   const [pullMsg, setPullMsg] = useState('')
   const [disconnecting, setDisconnecting] = useState<string | null>(null)
   const [disconnectErr, setDisconnectErr] = useState('')
+  const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges'>('connections')
 
   const refresh = useCallback(() => {
     if (user?.id) fetchAccounts(user.id)
@@ -89,77 +91,82 @@ export function Settings() {
   }
 
   return (
-    <div style={{ flex: 1, display: 'flex', background: '#2b2d31', overflow: 'hidden' }}>
+    <div className="flex flex-1 bg-surface overflow-hidden">
       {/* left nav */}
-      <div style={{ width: 218, flexShrink: 0, display: 'flex', justifyContent: 'flex-end' }}>
-        <div style={{ width: 192, paddingTop: 60, paddingBottom: 20, paddingRight: 6, paddingLeft: 20 }}>
+      <div className="w-[218px] shrink-0 flex justify-end">
+        <div className="w-48 pt-6 pb-5 pr-1.5 pl-5">
           <SectionLabel>User Settings</SectionLabel>
-          <NavItem active>Connections</NavItem>
+          <NavItem active={activeTab === 'connections'} onClick={() => setActiveTab('connections')}>Connections</NavItem>
+          <NavItem active={activeTab === 'circles'} onClick={() => setActiveTab('circles')}>Circles</NavItem>
+          <NavItem active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>Merge Suggestions</NavItem>
+          <NavItem active={activeTab === 'merges'} onClick={() => setActiveTab('merges')}>Merge History</NavItem>
         </div>
       </div>
 
       {/* main content */}
-      <div style={{ flex: 1, maxWidth: 740, paddingTop: 60, paddingBottom: 80, paddingLeft: 40, paddingRight: 40, overflowY: 'auto' }}>
+      <div className="settings-page thin-scroll">
 
-        <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, color: '#f2f3f5' }}>Connections</h2>
-        <p style={{ fontSize: 14, marginBottom: 20, color: '#b5bac1' }}>
-          Connect your accounts to bring messages into Convolios
-        </p>
-
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 40 }}>
-          {PROVIDERS.map((p) => (
-            <ProviderCard key={p.label} {...p} userId={user?.id} />
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <h2 style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.02em', color: '#b5bac1' }}>
-              Connected Accounts
-            </h2>
-            {syncPhase === 'syncing' && (
-              <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: '#5865f2' }} />
-            )}
-            {lastSyncedAt && syncPhase !== 'syncing' && (
-              <span style={{ fontSize: 11, color: '#6d6f78' }}>Last synced {relativeTime(lastSyncedAt)}</span>
-            )}
-          </div>
-          <Btn small onClick={sync} busy={syncing}>{syncing ? 'Syncing...' : 'Sync All'}</Btn>
-        </div>
-        {syncMsg && <Hint>{syncMsg}</Hint>}
-        {disconnectErr && <Hint>{disconnectErr}</Hint>}
-        {loading && accounts.length === 0 && <Hint>Loading accounts...</Hint>}
-        {!loading && accounts.length === 0 && <Hint>No accounts connected yet</Hint>}
-
-        {accounts.map((a) => (
-          <AccountCard key={a.id} account={a} disconnecting={disconnecting} onDisconnect={disconnect} />
-        ))}
-
-        <div style={{ height: 1, background: '#3f4147', margin: '40px 0' }} />
-
-        <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, color: '#f2f3f5' }}>Data & Privacy</h2>
-
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 16, padding: 16,
-          borderRadius: 8, marginBottom: 8, background: '#1e1f22', border: '1px solid #3f4147',
-        }}>
-          <div style={{ flex: 1 }}>
-            <p style={{ fontSize: 16, color: '#f2f3f5' }}>Message History</p>
-            <p style={{ fontSize: 14, marginTop: 4, color: '#b5bac1' }}>
-              Pull recent chats from all your connected accounts
+        {activeTab === 'connections' && (
+          <>
+            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Connections</h2>
+            <p className="text-base mb-5 text-text-secondary">
+              Connect your accounts to bring messages into Convolios
             </p>
-          </div>
-          <Btn onClick={pull} busy={pulling}>{pulling ? 'Pulling...' : 'Pull History'}</Btn>
-        </div>
-        {pullMsg && <Hint>{pullMsg}</Hint>}
 
-        <div style={{ height: 1, background: '#3f4147', margin: '40px 0' }} />
+            <div className="flex flex-wrap gap-2 mb-10">
+              {PROVIDERS.map((p) => (
+                <ProviderCard key={p.label} {...p} userId={user?.id} />
+              ))}
+            </div>
 
-        <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 20, color: '#f2f3f5' }}>System Health</h2>
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-bold uppercase tracking-wide text-text-secondary">
+                  Connected Accounts
+                </h2>
+                {lastSyncedAt && (
+                  <span className="text-xs text-text-pending">Last synced {relativeTime(lastSyncedAt)}</span>
+                )}
+              </div>
+              <Btn small onClick={sync} busy={syncing}>{syncing ? 'Syncing...' : 'Sync All'}</Btn>
+            </div>
+            {syncMsg && <Hint>{syncMsg}</Hint>}
+            {disconnectErr && <Hint>{disconnectErr}</Hint>}
+            {loading && accounts.length === 0 && <SettingsSkeleton />}
+            {!loading && accounts.length === 0 && <Hint>No accounts connected yet</Hint>}
 
-        <HealthCard label="Unipile API" cmd="check_unipile_connection" />
-        <HealthCard label="Gemini AI" cmd="check_gemini_connection" />
-        <WebhookCard />
+            {accounts.map((a) => (
+              <AccountCard key={a.id} account={a} disconnecting={disconnecting} onDisconnect={disconnect} />
+            ))}
+
+            <div className="h-px bg-border my-10" />
+
+            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Data & Privacy</h2>
+
+            <div className="settings-card">
+              <div className="settings-card-body">
+                <p className="settings-card-name">Message History</p>
+                <p className="settings-card-desc">
+                  Pull recent chats from all your connected accounts
+                </p>
+              </div>
+              <Btn onClick={pull} busy={pulling}>{pulling ? 'Pulling...' : 'Pull History'}</Btn>
+            </div>
+            {pullMsg && <Hint>{pullMsg}</Hint>}
+
+            <div className="h-px bg-border my-10" />
+
+            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">System Health</h2>
+
+            <HealthCard label="Unipile API" cmd="check_unipile_connection" />
+            <HealthCard label="Gemini AI" cmd="check_gemini_connection" />
+            <WebhookCard />
+          </>
+        )}
+
+        {activeTab === 'circles' && <CircleManagement userId={user?.id} />}
+        {activeTab === 'suggestions' && <MergeSuggestionsView userId={user?.id} />}
+        {activeTab === 'merges' && <MergeHistory userId={user?.id} />}
       </div>
     </div>
   )
@@ -167,19 +174,18 @@ export function Settings() {
 
 function SectionLabel({ children }: { children: string }) {
   return (
-    <div style={{ fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.02em', padding: '0 10px 6px', color: '#b5bac1' }}>
+    <div className="section-label px-2.5 pb-1.5">
       {children}
     </div>
   )
 }
 
-function NavItem({ children, active }: { children: string; active?: boolean }) {
+function NavItem({ children, active, onClick }: { children: string; active?: boolean; onClick?: () => void }) {
   return (
-    <div style={{
-      fontSize: 16, padding: '6px 10px', borderRadius: 4, marginBottom: 2, cursor: 'pointer',
-      color: active ? '#f2f3f5' : '#b5bac1',
-      background: active ? 'rgba(79,84,92,.6)' : 'transparent',
-    }}>
+    <div
+      onClick={onClick}
+      className={`text-base py-1.5 px-2.5 rounded-sm mb-0.5 cursor-pointer ${active ? 'text-text-primary bg-[var(--hover-row-strong)]' : 'text-text-secondary bg-transparent'}`}
+    >
       {children}
     </div>
   )
@@ -189,25 +195,38 @@ function Btn({ onClick, busy, small, children }: {
   onClick: () => void; busy?: boolean; small?: boolean; children: React.ReactNode
 }) {
   return (
-    <button onClick={onClick} disabled={busy} style={{
-      fontSize: 14, fontWeight: 500, borderRadius: 3, height: 32,
-      padding: '2px 16px', minWidth: small ? 60 : 96,
-      background: '#5865f2', color: '#fff', opacity: busy ? .5 : 1,
-      cursor: busy ? 'not-allowed' : 'pointer', border: 'none',
-    }}
-    onMouseEnter={(e) => { e.currentTarget.style.background = '#4752c4' }}
-    onMouseLeave={(e) => { e.currentTarget.style.background = '#5865f2' }}>
+    <button
+      className={`btn-primary text-base h-8 py-0.5 px-4 ${small ? 'min-w-[60px]' : 'min-w-[96px]'}`}
+      onClick={onClick}
+      disabled={busy}
+    >
       {children}
     </button>
   )
 }
 
 function Hint({ children }: { children: string }) {
-  return <p style={{ fontSize: 14, marginTop: 4, marginBottom: 8, color: '#949ba4' }}>{children}</p>
+  return <p className="text-base mt-1 mb-2 text-text-muted">{children}</p>
 }
 
-function ProviderCard({ providers, label, desc, channel, userId }: {
-  providers: string[]; label: string; desc: string; channel: string; userId?: string
+function SettingsSkeleton() {
+  return (
+    <>
+      {Array.from({ length: 3 }, (_, i) => (
+        <div key={i} className="settings-skeleton-card">
+          <div className="skeleton w-10 h-10 rounded-full shrink-0" />
+          <div className="flex-1">
+            <div className="skeleton w-[30%] h-3.5 mb-1.5" />
+            <div className="skeleton w-1/2 h-[11px]" />
+          </div>
+        </div>
+      ))}
+    </>
+  )
+}
+
+function ProviderCard({ providers, label, desc, channel, logo, userId }: {
+  providers: string[]; label: string; desc: string; channel: string; logo: string; userId?: string
 }) {
   const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err' | 'permission'>('idle')
   const [errMsg, setErrMsg] = useState('')
@@ -324,41 +343,33 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
 
   if (st === 'permission') {
     return (
-      <div style={{
-        width: 340, borderRadius: 8, background: '#1e1f22', border: '1px solid #f0b132',
-        padding: 16, display: 'flex', flexDirection: 'column', gap: 12,
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ display: 'flex', alignItems: 'center' }}><Lock size={18} /></span>
-          <span style={{ fontSize: 14, fontWeight: 600, color: '#f2f3f5' }}>Full Disk Access Required</span>
+      <div className="w-[340px] rounded-card bg-surface-deep border border-warning p-4 flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <span className="flex items-center"><Lock size={18} /></span>
+          <span className="text-base font-semibold text-text-primary">Full Disk Access Required</span>
         </div>
-        <p style={{ fontSize: 13, color: '#b5bac1', lineHeight: 1.5 }}>
+        <p className="text-md text-text-secondary leading-normal">
           Convolios needs permission to read your Messages database. Open System Settings, find Convolios in the list and toggle it on.
         </p>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button onClick={openFdaSettings} style={{
-            flex: 1, height: 32, borderRadius: 3, fontSize: 14, fontWeight: 500,
-            background: '#5865f2', color: '#fff', border: 'none', cursor: 'pointer',
-          }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = '#4752c4' }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = '#5865f2' }}>
+        <div className="flex gap-2">
+          <button className="btn-primary flex-1 h-8 text-base" onClick={openFdaSettings}>
             Open Settings
           </button>
-          <button onClick={() => setSt('idle')} style={{
-            height: 32, borderRadius: 3, fontSize: 14, fontWeight: 500, padding: '0 12px',
-            background: 'transparent', color: '#b5bac1', border: '1px solid #3f4147', cursor: 'pointer',
-          }}>
+          <button
+            onClick={() => setSt('idle')}
+            className="h-8 rounded-[3px] text-base font-medium px-3 bg-transparent text-text-secondary border border-border cursor-pointer"
+          >
             Cancel
           </button>
         </div>
-        <p style={{ fontSize: 11, color: '#6d6f78' }}>
+        <p className="text-xs text-text-pending">
           When you come back, we'll retry automatically.
         </p>
       </div>
     )
   }
 
-  const stColor = st === 'done' ? '#23a559' : st === 'err' ? '#ed4245' : st === 'waiting' || st === 'syncing' ? '#f0b132' : '#949ba4'
+  const stColor = st === 'done' ? 'var(--color-success)' : st === 'err' ? 'var(--color-danger)' : st === 'waiting' || st === 'syncing' ? 'var(--color-warning)' : 'var(--color-text-muted)'
   const stText = st === 'loading' ? 'Opening...'
     : st === 'waiting' ? 'Waiting...'
     : st === 'syncing' ? 'Syncing messages...'
@@ -366,24 +377,24 @@ function ProviderCard({ providers, label, desc, channel, userId }: {
     : st === 'err' ? (errMsg || 'Error') : desc
 
   return (
-    <div style={{ position: 'relative' }}>
-      <button onClick={go} disabled={st === 'loading' || st === 'waiting'} title={st === 'err' ? errMsg : undefined} style={{
-        width: 164, height: 48, borderRadius: 8, display: 'flex', alignItems: 'center',
-        gap: 8, padding: '0 12px', background: '#1e1f22',
-        border: st === 'waiting' ? '1px solid #f0b132' : st === 'done' ? '1px solid #23a559' : st === 'err' ? '1px solid #ed4245' : '1px solid #3f4147',
-        cursor: st === 'loading' || st === 'waiting' ? 'default' : 'pointer',
-      }}
-      onMouseEnter={(e) => { if (st === 'idle') e.currentTarget.style.background = '#313338' }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '#1e1f22' }}>
-        <ChannelLogo channel={channel} size={16} color="#f2f3f5" style={{ flexShrink: 0 }} />
-        <span style={{ fontSize: 14, fontWeight: 500, flex: 1, textAlign: 'left', color: '#f2f3f5' }}>{label}</span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: stColor, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 80 }}>
-          {st === 'waiting' && <span className="pulse-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: stColor, flexShrink: 0 }} />}
+    <div className="relative">
+      <button
+        onClick={go}
+        disabled={st === 'loading' || st === 'waiting'}
+        title={st === 'err' ? errMsg : undefined}
+        className={`w-[164px] h-12 rounded-card flex items-center gap-2 px-3 bg-surface-deep border ${st === 'waiting' ? 'border-warning' : st === 'done' ? 'border-success' : st === 'err' ? 'border-danger' : 'border-border'} ${st === 'loading' || st === 'waiting' ? 'cursor-default' : 'cursor-pointer'}`}
+        onMouseEnter={(e) => { if (st === 'idle') e.currentTarget.style.background = 'var(--color-bg)' }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--color-surface-deep)' }}
+      >
+        <ChannelLogo channel={logo} size={16} color="var(--color-text-primary)" className="shrink-0" />
+        <span className="text-base font-medium flex-1 text-left text-text-primary">{label}</span>
+        <span className="flex items-center gap-1 text-xs truncate max-w-[80px]" style={{ color: stColor }}>
+          {st === 'waiting' && <span className="pulse-dot w-1.5 h-1.5 rounded-full shrink-0" style={{ background: stColor }} />}
           {st === 'err' ? 'Failed' : stText}
         </span>
       </button>
       {st === 'err' && errMsg && (
-        <div style={{ position: 'absolute', left: 0, right: 0, top: 52, zIndex: 10, padding: '6px 10px', borderRadius: 6, background: '#2b2d31', border: '1px solid #ed4245', fontSize: 12, color: '#ed4245', lineHeight: 1.4, maxWidth: 260, wordBreak: 'break-word' }}>
+        <div className="absolute left-0 right-0 top-[52px] z-10 py-1.5 px-2.5 rounded-[6px] bg-surface border border-danger text-sm text-danger leading-[1.4] max-w-[260px] break-words">
           {errMsg}
         </div>
       )}
@@ -400,15 +411,11 @@ function HealthCard({ label, cmd }: { label: string; cmd: string }) {
     catch (e) { setDetail(String(e)); setSt('err') }
   }
   return (
-    <div style={{
-      display: 'flex', alignItems: 'center', gap: 12, padding: 16,
-      borderRadius: 8, marginBottom: 8, background: '#1e1f22', border: '1px solid #3f4147',
-    }}>
-      <span style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
-        background: st === 'ok' ? '#23a559' : st === 'err' ? '#ed4245' : '#5865f2' }} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <span style={{ fontSize: 16, color: '#f2f3f5' }}>{label}</span>
-        {detail && <span style={{ fontSize: 12, marginLeft: 8, color: '#949ba4' }}>{detail}</span>}
+    <div className="settings-card">
+      <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${st === 'ok' ? 'bg-success' : st === 'err' ? 'bg-danger' : 'bg-accent'}`} />
+      <div className="settings-card-body">
+        <span className="settings-card-name">{label}</span>
+        {detail && <span className="text-sm ml-2 text-text-muted">{detail}</span>}
       </div>
       <Btn small onClick={check} busy={st === 'busy'}>{st === 'busy' ? '...' : 'Test'}</Btn>
     </div>
@@ -425,19 +432,18 @@ function WebhookCard() {
     catch (e) { setDetail(String(e)); setSt('err') }
   }
   return (
-    <div style={{ borderRadius: 8, marginBottom: 8, background: '#1e1f22', border: '1px solid #3f4147' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 16 }}>
-        <span style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
-          background: st === 'ok' ? '#23a559' : st === 'err' ? '#ed4245' : '#5865f2' }} />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <p style={{ fontSize: 16, color: '#f2f3f5' }}>Webhook</p>
-          <p style={{ fontSize: 12, wordBreak: 'break-all', marginTop: 2, color: '#949ba4' }}>{url}</p>
+    <div className="rounded-card mb-2 bg-[var(--color-sidebar-rail)] border border-border overflow-hidden">
+      <div className="flex items-center gap-3 p-4">
+        <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${st === 'ok' ? 'bg-success' : st === 'err' ? 'bg-danger' : 'bg-accent'}`} />
+        <div className="flex-1 min-w-0">
+          <p className="text-body text-text-primary">Webhook</p>
+          <p className="text-sm break-all mt-0.5 text-text-muted">{url}</p>
         </div>
         <Btn small onClick={reg} busy={st === 'busy'}>{st === 'ok' ? 'Done' : 'Register'}</Btn>
       </div>
       {detail && (
-        <div style={{ padding: '0 16px 12px' }}>
-          <p style={{ fontSize: 12, color: st === 'ok' ? '#23a559' : '#ed4245' }}>{detail}</p>
+        <div className="px-4 pb-3">
+          <p className={`text-sm ${st === 'ok' ? 'text-success' : 'text-danger'}`}>{detail}</p>
         </div>
       )}
     </div>
@@ -477,6 +483,9 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
   const color = channelColor(a.channel)
   const synced = _.isString(a.last_synced_at) ? relativeTime(a.last_synced_at) : null
   const connected = _.isString(a.created_at) ? relativeTime(a.created_at) : null
+  const accountLogo = (a.channel === 'email' && _.isString(a.provider_type) && a.provider_type.toUpperCase() === 'MICROSOFT')
+    ? 'outlook'
+    : a.channel
   const needsReconnect = a.status === 'credentials' || a.status === 'error'
   const [reconnecting, setReconnecting] = useState(false)
 
@@ -501,39 +510,31 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
   }
 
   return (
-    <div style={{
-      borderRadius: 8, marginBottom: 8, background: '#1e1f22', border: '1px solid #3f4147',
-      overflow: 'hidden',
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '14px 16px' }}>
-        <div style={{
-          width: 40, height: 40, borderRadius: '50%', flexShrink: 0,
-          background: color, display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <ChannelLogo channel={a.channel} size={20} color="#fff" />
+    <div className="rounded-card mb-2 bg-surface-deep border border-border overflow-hidden">
+      <div className="flex items-center gap-3 py-3.5 px-4">
+        <div
+          className="w-10 h-10 rounded-full shrink-0 flex items-center justify-center"
+          style={{ background: color }}
+        >
+          <ChannelLogo channel={accountLogo} size={20} color="var(--color-white)" />
         </div>
 
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 15, fontWeight: 600, color: '#f2f3f5' }}>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-lg font-semibold text-text-primary">
               {channelLabel(a.channel)}
             </span>
-            <span style={{
-              fontSize: 11, fontWeight: 600, padding: '1px 6px', borderRadius: 3,
-              background: a.status === 'active' ? 'rgba(35,165,89,.15)' : 'rgba(237,66,69,.15)',
-              color: a.status === 'active' ? '#23a559' : '#ed4245',
-              textTransform: 'capitalize',
-            }}>
+            <span className={`text-xs font-semibold py-px px-1.5 rounded-[3px] capitalize ${a.status === 'active' ? 'bg-[var(--hover-success-subtle)] text-success' : 'bg-[var(--hover-danger-strong)] text-danger'}`}>
               {needsReconnect ? 'Reconnect required' : a.status}
             </span>
           </div>
           {detail && (
-            <p style={{ fontSize: 13, color: '#dbdee1', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <p className="text-md text-text-body mt-0.5 truncate">
               {detail}
             </p>
           )}
           {sub && (
-            <p style={{ fontSize: 12, color: '#949ba4', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <p className="text-sm text-text-muted mt-px truncate">
               {sub}
             </p>
           )}
@@ -543,12 +544,7 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
           <button
             onClick={handleReconnect}
             disabled={reconnecting}
-            style={{
-              fontSize: 12, fontWeight: 500, borderRadius: 3, height: 28, flexShrink: 0,
-              padding: '2px 12px', background: '#f0b132', color: '#000',
-              border: 'none', cursor: reconnecting ? 'not-allowed' : 'pointer',
-              opacity: reconnecting ? 0.5 : 1, marginRight: 6,
-            }}
+            className={`text-sm font-medium rounded-[3px] h-7 shrink-0 py-0.5 px-3 bg-warning text-black mr-1.5 ${reconnecting ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
           >
             {reconnecting ? 'Opening...' : 'Reconnect'}
           </button>
@@ -556,25 +552,390 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
         <button
           onClick={() => a.account_id && onDisconnect(a.account_id)}
           disabled={isDisconnecting || _.isNil(a.account_id)}
-          style={{
-            fontSize: 12, fontWeight: 500, borderRadius: 3, height: 28, flexShrink: 0,
-            padding: '2px 12px', background: 'transparent', color: '#ed4245',
-            border: '1px solid rgba(237,66,69,.4)', cursor: isDisconnecting ? 'not-allowed' : 'pointer',
-            opacity: isDisconnecting ? 0.5 : 1,
-          }}
-          onMouseEnter={(e) => { if (!isDisconnecting) { e.currentTarget.style.background = '#ed4245'; e.currentTarget.style.color = '#fff' } }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = '#ed4245' }}
+          className={`text-sm font-medium rounded-[3px] h-7 shrink-0 py-0.5 px-3 bg-transparent text-danger border border-[var(--hover-warning-strong)] ${isDisconnecting ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+          onMouseEnter={(e) => { if (!isDisconnecting) { e.currentTarget.style.background = 'var(--color-danger)'; e.currentTarget.style.color = 'var(--color-white)' } }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--color-danger)' }}
         >
           {isDisconnecting ? 'Removing...' : 'Disconnect'}
         </button>
       </div>
 
-      <div style={{
-        display: 'flex', gap: 16, padding: '0 16px 10px 68px', fontSize: 11, color: '#6d6f78',
-      }}>
+      <div className="flex gap-4 pr-4 pb-2.5 pl-[68px] text-xs text-text-pending">
         {connected && <span>Connected {connected}</span>}
         {synced && <span>Synced {synced}</span>}
       </div>
     </div>
+  )
+}
+
+const CIRCLE_COLORS = ['#5865f2', '#ed4245', '#23a559', '#f0b132', '#e4405f', '#0a66c2', '#26a5e4', '#9b59b6', '#e67e22', '#1abc9c']
+
+function CircleManagement({ userId }: { userId?: string }) {
+  const { data: circles = [] } = useCircles(userId)
+  const create = useCreateCircle(userId)
+  const update = useUpdateCircle(userId)
+  const remove = useDeleteCircle(userId)
+  const [newName, setNewName] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editName, setEditName] = useState('')
+  const [editColor, setEditColor] = useState('')
+  const [editEmoji, setEditEmoji] = useState('')
+  const [editNotify, setEditNotify] = useState<'all' | 'muted'>('all')
+
+  const handleCreate = () => {
+    if (!newName.trim()) return
+    create.mutate({ name: newName.trim() })
+    setNewName('')
+  }
+
+  const startEdit = (c: { id: string; name: string; color: string; emoji: string | null; notify: string }) => {
+    setEditingId(c.id)
+    setEditName(c.name)
+    setEditColor(c.color)
+    setEditEmoji(c.emoji ?? '')
+    setEditNotify(c.notify as 'all' | 'muted')
+  }
+
+  const saveEdit = () => {
+    if (!editingId) return
+    update.mutate({ id: editingId, name: editName.trim() || undefined, color: editColor, emoji: editEmoji || null, notify: editNotify })
+    setEditingId(null)
+  }
+
+  return (
+    <>
+      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Circles</h2>
+      <p className="text-base mb-5 text-text-secondary">
+        Organize your contacts into custom groups
+      </p>
+
+      <div className="flex gap-2 mb-6">
+        <input
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') handleCreate() }}
+          placeholder="New circle name..."
+          className="flex-1 h-9 rounded-sm px-3 bg-surface-deep text-text-primary text-base border border-border outline-none"
+        />
+        <button className="btn-primary h-9 px-4 text-base flex items-center gap-1" onClick={handleCreate}>
+          <Plus size={16} /> Create
+        </button>
+      </div>
+
+      {circles.length === 0 && <Hint>No circles yet</Hint>}
+
+      {circles.map((c) => (
+        <div key={c.id} className={`rounded-card mb-2 bg-surface-deep p-4 border ${editingId === c.id ? 'border-accent' : 'border-border'}`}>
+          {editingId === c.id ? (
+            <div className="flex flex-col gap-3">
+              <div className="flex gap-2">
+                <input
+                  value={editEmoji}
+                  onChange={(e) => setEditEmoji(e.target.value)}
+                  placeholder="Emoji"
+                  className="w-[50px] h-9 rounded-sm px-2 text-center bg-surface text-text-primary text-[18px] border border-border outline-none"
+                />
+                <input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="flex-1 h-9 rounded-sm px-3 bg-surface text-text-primary text-base border border-border outline-none"
+                />
+              </div>
+              <div className="flex gap-1.5 flex-wrap">
+                {CIRCLE_COLORS.map((clr) => (
+                  <button
+                    key={clr}
+                    onClick={() => setEditColor(clr)}
+                    className={`w-6 h-6 rounded-full cursor-pointer border-2 ${editColor === clr ? 'border-white' : 'border-transparent'}`}
+                    style={{ background: clr }}
+                  />
+                ))}
+              </div>
+              <div className="flex gap-2 items-center">
+                <span className="text-md text-text-secondary">Notifications:</span>
+                <button
+                  onClick={() => setEditNotify('all')}
+                  className={`text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${editNotify === 'all' ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`}
+                >All</button>
+                <button
+                  onClick={() => setEditNotify('muted')}
+                  className={`text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${editNotify === 'muted' ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`}
+                >Muted</button>
+              </div>
+              <div className="flex gap-2 justify-end">
+                <button
+                  onClick={() => setEditingId(null)}
+                  className="text-md py-1 px-3 rounded-sm border-none bg-transparent text-text-secondary cursor-pointer"
+                >Cancel</button>
+                <button className="btn-primary text-md py-1 px-4" onClick={saveEdit}>Save</button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-3">
+              <span
+                className="w-8 h-8 rounded-full flex items-center justify-center text-body shrink-0"
+                style={{ background: c.color }}
+              >
+                {c.emoji ?? c.name.charAt(0).toUpperCase()}
+              </span>
+              <div className="flex-1 min-w-0">
+                <span className="text-lg font-semibold text-text-primary">{c.name}</span>
+                {c.notify === 'muted' && (
+                  <span className="text-xs text-text-pending ml-2">muted</span>
+                )}
+              </div>
+              <button
+                onClick={() => startEdit(c)}
+                className="text-sm py-1 px-2.5 rounded-sm border border-border bg-transparent text-text-secondary cursor-pointer"
+              >Edit</button>
+              <button
+                onClick={() => remove.mutate(c.id)}
+                className="py-1 px-2 rounded-sm border-none bg-transparent text-danger cursor-pointer"
+              ><Trash2 size={14} /></button>
+            </div>
+          )}
+        </div>
+      ))}
+    </>
+  )
+}
+
+function confidenceTier(score: number): { label: string; cls: string } {
+  if (score >= 0.95) return { label: 'Exact match', cls: 'bg-[var(--hover-success-subtle)] text-success' }
+  if (score >= 0.85) return { label: 'Strong match', cls: 'bg-[var(--hover-accent-subtle)] text-accent' }
+  return { label: 'Likely match', cls: 'bg-[var(--color-warning-bg,rgba(234,179,8,0.1))] text-[var(--color-warning,#eab308)]' }
+}
+
+function mergeSuggestionSources(
+  deterministic: MergeCluster[],
+  fuzzy: MergeCluster[],
+): MergeCluster[] {
+  const seen = new Set<string>()
+  const result: MergeCluster[] = []
+
+  for (const c of deterministic) {
+    const ids = (_.isArray(c.members) ? c.members : []).map((m) => m.id).sort()
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        seen.add(`${ids[i]}|${ids[j]}`)
+      }
+    }
+    result.push(c)
+  }
+
+  for (const c of fuzzy) {
+    const ids = (_.isArray(c.members) ? c.members : []).map((m) => m.id).sort()
+    const isDuplicate = ids.some((a, i) =>
+      ids.slice(i + 1).some((b) => seen.has(`${a}|${b}`))
+    )
+    if (isDuplicate) continue
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        seen.add(`${ids[i]}|${ids[j]}`)
+      }
+    }
+    result.push(c)
+  }
+
+  return result.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+}
+
+function MergeSuggestionsView({ userId }: { userId?: string }) {
+  const { data: deterministicClusters = [], isLoading: detLoading, isError: detError, error: detFetchError } = useMergeClusters(userId)
+  const { data: fuzzyClusters = [], isLoading: fuzzyLoading, isError: fuzzyError } = useFuzzyMergeSuggestions(userId)
+  const mergeCluster = useMergeCluster(userId)
+  const dismiss = useDismissMerge(userId)
+  const [error, setError] = useState('')
+
+  const isLoading = detLoading || fuzzyLoading
+  const clusters = mergeSuggestionSources(deterministicClusters, fuzzyClusters)
+
+  const handleMergeCluster = (keepId: string, mergeIds: string[]) => {
+    setError('')
+    mergeCluster.mutate({ keepId, mergeIds }, {
+      onError: (e) => setError(_.isString(e?.message) ? e.message : 'Merge failed'),
+    })
+  }
+
+  const handleDismissPair = (idA: string, idB: string) => {
+    setError('')
+    dismiss.mutate({ personA: idA, personB: idB }, {
+      onError: (e) => setError(_.isString(e?.message) ? e.message : 'Dismiss failed'),
+    })
+  }
+
+  const handleDismissAll = (members: { id: string }[]) => {
+    const ids = members.map((m) => m.id).sort()
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        dismiss.mutate({ personA: ids[i], personB: ids[j] })
+      }
+    }
+  }
+
+  return (
+    <>
+      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Merge Suggestions</h2>
+      <p className="text-base mb-5 text-text-secondary">
+        Contacts that appear to be the same person across channels. When you merge, all their conversations and identities are unified into one.
+      </p>
+
+      {error && (
+        <div className="py-2 px-3 rounded-[6px] mb-3 bg-[var(--hover-danger)] text-danger text-md">
+          {error}
+        </div>
+      )}
+
+      {isLoading && <SettingsSkeleton />}
+      {(detError || fuzzyError) && (
+        <div className="py-2 px-3 rounded-[6px] mb-3 bg-[var(--hover-danger)] text-danger text-md">
+          {_.isString((detFetchError as Error)?.message) ? (detFetchError as Error).message : 'Failed to load merge suggestions'}
+        </div>
+      )}
+      {!isLoading && !detError && clusters.length === 0 && <Hint>No merge suggestions right now</Hint>}
+
+      {clusters.map((cluster) => {
+        const members = _.isArray(cluster.members) ? cluster.members : []
+        const mergeIds = members.map((m) => m.id)
+        const tier = confidenceTier(cluster.score ?? 0)
+
+        return (
+          <div key={cluster.cluster_id} className="rounded-card mb-3 p-4 bg-surface-deep border border-border">
+            {/* Member list */}
+            <div className="flex flex-wrap gap-3 mb-3">
+              {members.map((m, i) => (
+                <div key={m.id} className="flex items-center gap-2 min-w-0">
+                  {i > 0 && <Link2 size={12} className="text-accent shrink-0" />}
+                  <SuggestionAvatar name={m.name} avatar={m.avatar} id={m.id} />
+                  <div className="min-w-0">
+                    <span className="text-md font-semibold text-text-primary">{m.name}</span>
+                    <div className="flex gap-[3px] mt-0.5 flex-wrap">
+                      {_.isArray(m.channels) && m.channels.map((ch) => <ChannelPill key={ch} channel={ch} />)}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Match signal with confidence tier */}
+            <div className="flex items-center gap-2 mb-3">
+              <span className={`text-xs py-0.5 px-2 rounded-[3px] ${tier.cls}`}>
+                {tier.label}
+              </span>
+              <span className="text-sm text-text-muted">{cluster.match_detail}</span>
+              <span className="text-xs text-text-pending">{Math.round((cluster.score ?? 0) * 100)}%</span>
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-2 flex-wrap">
+              {members.map((m) => {
+                const otherIds = mergeIds.filter((id) => id !== m.id)
+                const namesMatch = members.every((mm) => mm.name.split(' ')[0] === m.name.split(' ')[0])
+                const channelHint = namesMatch && _.isArray(m.channels) ? ` (${m.channels[0]})` : ''
+                const label = members.length > 2
+                  ? `Keep ${m.name.split(' ')[0]}${channelHint} (merge ${otherIds.length} others)`
+                  : `Keep ${m.name.split(' ')[0]}${channelHint}`
+                const isSuggested = m.id === cluster.keep_person_id
+                return (
+                  <button key={m.id}
+                    onClick={() => handleMergeCluster(m.id, otherIds)}
+                    disabled={mergeCluster.isPending}
+                    className={`text-sm font-medium py-1.5 px-3.5 rounded-sm flex items-center gap-1 ${isSuggested ? 'border-none bg-accent text-white' : 'border border-border bg-transparent text-text-secondary'} ${mergeCluster.isPending ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
+                  >
+                    <Check size={12} /> {label}
+                  </button>
+                )
+              })}
+              <button
+                onClick={() => members.length === 2
+                  ? handleDismissPair(members[0].id, members[1].id)
+                  : handleDismissAll(members)
+                }
+                disabled={dismiss.isPending}
+                className="text-sm font-medium py-1.5 px-3.5 rounded-sm border border-[var(--hover-accent-strong)] bg-transparent text-danger cursor-pointer flex items-center gap-1 ml-auto"
+              >
+                <X size={12} /> Not the same
+              </button>
+            </div>
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
+function SuggestionAvatar({ name, avatar, id }: { name: string; avatar: string | null; id?: string }) {
+  return (
+    <div className={`${id ? avatarCls(id) : 'bg-[var(--color-accent)]'} flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full`}>
+      {_.isString(avatar) ? (
+        <img src={avatar} alt="" className="h-full w-full object-cover" />
+      ) : (
+        <span className="text-base font-semibold text-white">
+          {initials(name)}
+        </span>
+      )}
+    </div>
+  )
+}
+
+function ChannelPill({ channel }: { channel: string }) {
+  return (
+    <span className="text-2xs py-px px-1.5 rounded-[3px] bg-surface text-text-muted flex items-center gap-[3px]">
+      <ChannelLogo channel={channel} size={10} color="var(--color-text-muted)" />
+      {channelLabel(channel as import('../../types').Channel)}
+    </span>
+  )
+}
+
+function MergeHistory({ userId }: { userId?: string }) {
+  const { data: log = [], isLoading } = useMergeLog(userId)
+  const undoMerge = useUndoMerge(userId)
+
+  return (
+    <>
+      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Merge History</h2>
+      <p className="text-base mb-5 text-text-secondary">
+        View and undo past person merges
+      </p>
+
+      {isLoading && <Hint>Loading merge history...</Hint>}
+
+      {!isLoading && log.length === 0 && <Hint>No merges yet</Hint>}
+
+      {log.map((entry) => (
+        <div key={entry.id} className={`rounded-card mb-2 p-4 bg-surface-deep border border-border ${entry.undone_at ? 'opacity-50' : ''}`}>
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-base font-semibold text-text-primary">
+              {entry.merged_person_name}
+            </span>
+            <span className="text-sm text-text-pending">
+              merged {relativeTime(entry.merged_at)}
+            </span>
+            {entry.undone_at && (
+              <span className="text-xs py-px px-1.5 rounded-[3px] bg-[var(--hover-warning-subtle)] text-warning">undone</span>
+            )}
+          </div>
+          <div className="text-sm text-text-muted mb-1">
+            {entry.merged_message_count} messages reassigned
+          </div>
+          <div className="flex gap-1 flex-wrap mb-2">
+            {_.isArray(entry.merged_identities) && entry.merged_identities.map((ident) => (
+              <span key={ident.id} className="text-xs py-px px-1.5 rounded-[3px] bg-surface text-text-secondary">
+                {ident.channel}: {ident.handle}
+              </span>
+            ))}
+          </div>
+          {!entry.undone_at && (
+            <button
+              onClick={() => undoMerge.mutate(entry.id)}
+              disabled={undoMerge.isPending}
+              className="text-sm font-medium py-1 px-3 rounded-sm border border-[var(--hover-warning-strong)] bg-transparent text-warning cursor-pointer flex items-center gap-1"
+            >
+              <Undo2 size={12} /> Undo merge
+            </button>
+          )}
+        </div>
+      ))}
+    </>
   )
 }

@@ -1,3 +1,5 @@
+import { encryptJson } from "../_shared/crypto.ts";
+
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const code = url.searchParams.get("code");
@@ -88,6 +90,18 @@ Deno.serve(async (req: Request) => {
     const username = xData.username ?? null;
 
     const now = new Date().toISOString();
+    const plainParams = {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      x_user_id: xUserId,
+    };
+    let connectionParams: unknown = plainParams;
+    try {
+      connectionParams = { encrypted: await encryptJson(plainParams) };
+    } catch {
+      // TOKEN_ENCRYPTION_KEY not configured — store plaintext (backward compat)
+    }
+
     const accountRow = {
       user_id,
       provider: "x",
@@ -97,11 +111,7 @@ Deno.serve(async (req: Request) => {
       display_name: displayName,
       username,
       provider_type: "X",
-      connection_params: {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        x_user_id: xUserId,
-      },
+      connection_params: connectionParams,
       last_synced_at: now,
       updated_at: now,
     };

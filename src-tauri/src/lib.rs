@@ -2339,6 +2339,78 @@ async fn connect_x_account(
   Ok(auth_url)
 }
 
+fn decrypt_x_params(params: &serde_json::Value) -> Result<serde_json::Value, String> {
+  use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+  use base64::Engine;
+
+  let encrypted = match params.get("encrypted").and_then(|v| v.as_str()) {
+    Some(e) => e,
+    None => return Ok(params.clone()),
+  };
+
+  let key_b64 = std::env::var("TOKEN_ENCRYPTION_KEY")
+    .map_err(|_| "TOKEN_ENCRYPTION_KEY not set — cannot decrypt X tokens".to_string())?;
+  let key_bytes = base64::engine::general_purpose::STANDARD
+    .decode(&key_b64)
+    .map_err(|e| format!("TOKEN_ENCRYPTION_KEY decode: {e}"))?;
+  if key_bytes.len() != 32 {
+    return Err(format!("TOKEN_ENCRYPTION_KEY must be 32 bytes, got {}", key_bytes.len()));
+  }
+
+  let combined = base64::engine::general_purpose::STANDARD
+    .decode(encrypted)
+    .map_err(|e| format!("encrypted params decode: {e}"))?;
+  if combined.len() < 12 {
+    return Err("encrypted params too short".to_string());
+  }
+
+  let nonce = Nonce::from_slice(&combined[..12]);
+  let ciphertext = &combined[12..];
+
+  let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    .map_err(|e| format!("AES key init: {e}"))?;
+  let plaintext = cipher.decrypt(nonce, ciphertext)
+    .map_err(|_| "X token decryption failed — key mismatch or corrupted data".to_string())?;
+
+  serde_json::from_slice(&plaintext)
+    .map_err(|e| format!("decrypted params parse: {e}"))
+}
+
+fn encrypt_x_params(params: &serde_json::Value) -> Result<serde_json::Value, String> {
+  use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead, Nonce};
+  use base64::Engine;
+
+  let key_b64 = match std::env::var("TOKEN_ENCRYPTION_KEY") {
+    Ok(k) => k,
+    Err(_) => return Ok(params.clone()),
+  };
+  let key_bytes = base64::engine::general_purpose::STANDARD
+    .decode(&key_b64)
+    .map_err(|e| format!("TOKEN_ENCRYPTION_KEY decode: {e}"))?;
+  if key_bytes.len() != 32 {
+    return Err(format!("TOKEN_ENCRYPTION_KEY must be 32 bytes, got {}", key_bytes.len()));
+  }
+
+  let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    .map_err(|e| format!("AES key init: {e}"))?;
+
+  let mut iv = [0u8; 12];
+  getrandom::getrandom(&mut iv).map_err(|e| format!("RNG: {e}"))?;
+  let nonce = Nonce::from_slice(&iv);
+
+  let plaintext = serde_json::to_vec(params)
+    .map_err(|e| format!("params serialize: {e}"))?;
+  let ciphertext = cipher.encrypt(nonce, plaintext.as_slice())
+    .map_err(|e| format!("encryption: {e}"))?;
+
+  let mut combined = Vec::with_capacity(12 + ciphertext.len());
+  combined.extend_from_slice(&iv);
+  combined.extend_from_slice(&ciphertext);
+
+  let encoded = base64::engine::general_purpose::STANDARD.encode(&combined);
+  Ok(serde_json::json!({ "encrypted": encoded }))
+}
+
 async fn get_x_access_token(
   client: &reqwest::Client,
   sb_url: &str,
@@ -2359,7 +2431,8 @@ async fn get_x_access_token(
   let rows: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
   let row = rows.first().ok_or_else(|| "No active X account connected".to_string())?;
 
-  let params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let raw_params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let params = decrypt_x_params(raw_params)?;
   let token = params.get("access_token").and_then(|v| v.as_str())
     .ok_or_else(|| "No X access_token stored".to_string())?;
   let account_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2386,7 +2459,8 @@ async fn refresh_and_store_x_token(
 
   let rows: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
   let row = rows.first().ok_or_else(|| "No active X account for refresh".to_string())?;
-  let params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let raw_params = row.get("connection_params").ok_or_else(|| "No connection_params".to_string())?;
+  let params = decrypt_x_params(raw_params)?;
   let refresh_token = params.get("refresh_token").and_then(|v| v.as_str())
     .ok_or_else(|| "No refresh_token stored".to_string())?;
   let account_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2434,6 +2508,8 @@ async fn refresh_and_store_x_token(
   new_params["access_token"] = serde_json::Value::String(new_access.to_string());
   new_params["refresh_token"] = serde_json::Value::String(new_refresh.to_string());
 
+  let store_params = encrypt_x_params(&new_params).unwrap_or(new_params);
+
   let update_url = format!(
     "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&account_id=eq.{account_id}"
   );
@@ -2443,7 +2519,7 @@ async fn refresh_and_store_x_token(
     .header("Authorization", format!("Bearer {sb_key}"))
     .header("Content-Type", "application/json")
     .json(&serde_json::json!({
-      "connection_params": new_params,
+      "connection_params": store_params,
       "updated_at": chrono::Utc::now().to_rfc3339(),
     }))
     .send()

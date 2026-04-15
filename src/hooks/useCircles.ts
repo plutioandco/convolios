@@ -134,6 +134,7 @@ export function useApprovePerson(userId: string | undefined) {
       qc.invalidateQueries({ queryKey: ['conversations'] })
       qc.invalidateQueries({ queryKey: ['pending-count', userId] })
       qc.invalidateQueries({ queryKey: ['blocked-count', userId] })
+      qc.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
     },
   })
 }
@@ -149,6 +150,7 @@ export function useBlockPerson(userId: string | undefined) {
       qc.invalidateQueries({ queryKey: ['conversations'] })
       qc.invalidateQueries({ queryKey: ['pending-count', userId] })
       qc.invalidateQueries({ queryKey: ['blocked-count', userId] })
+      qc.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
     },
   })
 }

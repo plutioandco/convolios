@@ -65,11 +65,17 @@ function normalizeHandle(raw: string, channel: string): string {
     .replace(/@lid$/, "")
     .replace(/@c\.us$/, "")
     .trim();
-  if (channel === "whatsapp" && /^\d+$/.test(h)) {
+  if (channel === "whatsapp" && /^\d+$/.test(h) && h.length <= 15) {
     h = `+${h}`;
   }
   if (channel === "linkedin") {
     h = h.replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//i, "").replace(/\/$/, "");
+  }
+  if ((channel === "imessage" || channel === "sms") && h.length > 0) {
+    const digits = h.replace(/\D/g, "");
+    if (digits.length >= 7 && digits.length <= 15) {
+      h = `+${digits}`;
+    }
   }
   return h.toLowerCase();
 }
@@ -422,6 +428,21 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
     const { personId, identityId } = await findOrCreatePerson(
       userId, "email", otherAddr, otherName, accountId, direction as "inbound" | "outbound"
     );
+
+    if (direction === "outbound") {
+      const allRecipients = [
+        ...(em.to_attendees ?? []).slice(1),
+        ...(em.cc_attendees ?? []),
+        ...(em.bcc_attendees ?? []),
+      ];
+      for (const r of allRecipients) {
+        const addr = r?.identifier?.toLowerCase();
+        if (addr && addr !== otherAddr) {
+          findOrCreatePerson(userId, "email", addr, r?.display_name ?? addr, accountId, "outbound")
+            .catch(() => {});
+        }
+      }
+    }
 
     const folders = Array.isArray(em.folders) ? em.folders : [];
     const folder = folders[0] ?? null;

@@ -704,8 +704,8 @@ function SearchModal({ userId, onClose, onSelectPerson }: {
                 <div key={i} className="flex items-center gap-2.5 py-1.5">
                   <div className="skeleton w-7 h-7 rounded-full shrink-0" />
                   <div className="flex-1">
-                    <div className="skeleton w-[40%] h-3 mb-1" />
-                    <div className="skeleton w-[70%] h-2.5" />
+                    <div className="skeleton w-[40%] h-3 rounded-sm mb-1" />
+                    <div className="skeleton w-[70%] h-2.5 rounded-sm" />
                   </div>
                 </div>
               ))}

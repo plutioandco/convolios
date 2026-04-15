@@ -81,6 +81,8 @@ export interface Message {
   unipile_account_id: string | null
   folder: string | null
   read_at: string | null
+  _pending?: boolean
+  _failed?: boolean
 }
 
 export interface ConnectedAccount {

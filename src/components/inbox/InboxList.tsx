@@ -599,8 +599,12 @@ function InboxSkeleton() {
         <div key={i} className="inbox-skeleton-row">
           <div className="skeleton w-[42px] h-[42px] rounded-full shrink-0" />
           <div className="flex-1 min-w-0">
-            <div className="skeleton h-3.5 mb-1.5" style={{ width: `${60 + (i % 3) * 15}%` }} />
-            <div className="skeleton h-2.5" style={{ width: `${40 + (i % 4) * 12}%` }} />
+            <div className="flex items-center gap-2 mb-1">
+              <div className="skeleton h-3.5 rounded-sm flex-1" style={{ maxWidth: `${60 + (i % 3) * 15}%` }} />
+              <div className="skeleton h-2.5 rounded-sm w-8 shrink-0" />
+            </div>
+            <div className="skeleton h-2.5 rounded-sm mb-1" style={{ width: `${40 + (i % 4) * 12}%` }} />
+            <div className="skeleton h-2.5 rounded-sm" style={{ width: `${55 + (i % 3) * 10}%` }} />
           </div>
         </div>
       ))}

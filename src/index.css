@@ -607,7 +607,7 @@ button { border: none; background: none; cursor: pointer; }
 
 /* Inbox skeleton */
 .inbox-skeleton-row {
-  display: flex; align-items: center; gap: 12px; padding: 8px;
+  display: flex; align-items: center; gap: 10px; padding: 6px 8px;
 }
 
 /* ════════════════════════════════════════════════════
@@ -975,5 +975,4 @@ button { border: none; background: none; cursor: pointer; }
 .skeleton {
   background: linear-gradient(90deg, var(--color-surface-deep) 25%, var(--color-surface-input) 50%, var(--color-surface-deep) 75%);
   background-size: 200% 100%; animation: shimmer 1.5s ease-in-out infinite;
-  border-radius: var(--radius-sm);
 }

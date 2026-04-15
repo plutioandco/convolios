@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
-import { useThread, useAddOptimisticMessage } from '../../hooks/useThread'
+import { useThread, addPendingMessage, markPendingFailed, removePending, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { supabase } from '../../lib/supabase'
 import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
@@ -968,7 +968,10 @@ export function ThreadView() {
       return unlisten
     }
     let unlisten: (() => void) | undefined
-    setup().then((u) => { unlisten = u })
+    setup().then((u) => {
+      if (cancelled) { u() }
+      else { unlisten = u }
+    })
     return () => { cancelled = true; unlisten?.() }
   }, [])
 
@@ -1014,10 +1017,10 @@ export function ThreadView() {
     markRead(user.id, pid)
   }, [pid, markRead, user?.id])
 
+  const syncArgsRef = useRef<Record<string, unknown> | null>(null)
   useEffect(() => {
-    if (!pid || !user?.id || !chatId) return
     const last = _.last(thread)
-    const args = {
+    syncArgsRef.current = (pid && user?.id && chatId) ? {
       chatId,
       userId: user.id,
       personId: pid,
@@ -1025,10 +1028,15 @@ export function ThreadView() {
       messageType: last?.message_type ?? convo?.lastMessage?.message_type ?? 'dm',
       identityId: last?.identity_id ?? null,
       unipileAccountId: last?.unipile_account_id ?? convo?.lastMessage?.unipile_account_id ?? null,
-    }
-    if (!args.channel) return
+    } : null
+  }, [pid, user?.id, chatId, thread, convo])
+
+  useEffect(() => {
+    if (!pid || !user?.id || !chatId) return
 
     const doSync = () => {
+      const args = syncArgsRef.current
+      if (!args || !args.channel) return
       invoke<string>('sync_chat', args)
         .then((n) => {
           const count = parseInt(n as string, 10)
@@ -1251,7 +1259,7 @@ export function ThreadView() {
                 (new Date(msg.sent_at).getTime() - new Date(prev.sent_at).getTime() <= 420_000)
 
               return (
-                <div key={msg.id}>
+                <div key={msg.id} style={msg._pending ? { opacity: msg._failed ? 0.5 : 0.7 } : undefined}>
                   {showDivider && <DayDivider iso={msg.sent_at} />}
                   {editingMsg?.id === msg.id
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
@@ -1452,16 +1460,18 @@ function ThreadSkeleton() {
   ] as const
 
   return (
-    <div className="flex-1 flex flex-col justify-end bg-bg px-4 pt-4 pb-6 gap-5">
-      {rows.map((r, i) => (
-        <div key={i} className={`flex gap-3 max-w-[70%] ${r.align === 'right' ? 'self-end' : 'self-start'}`}>
-          {r.align === 'left' && <div className="skeleton w-10 h-10 rounded-full shrink-0" />}
-          <div className="flex-1">
-            <div className="skeleton h-3 mb-1.5" style={{ width: r.w1 }} />
-            <div className="skeleton h-4" style={{ width: r.w2 }} />
+    <div className="thread-col">
+      <div className="flex-1 flex flex-col justify-end px-4 pt-4 pb-6 gap-5">
+        {rows.map((r, i) => (
+          <div key={i} className={`flex gap-3 max-w-[70%] ${r.align === 'right' ? 'self-end' : 'self-start'}`}>
+            {r.align === 'left' && <div className="skeleton w-10 h-10 rounded-full shrink-0" />}
+            <div className="flex-1">
+              <div className="skeleton h-3 rounded-sm mb-1.5" style={{ width: r.w1 }} />
+              <div className="skeleton h-4 rounded-sm" style={{ width: r.w2 }} />
+            </div>
           </div>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   )
 }
@@ -1484,9 +1494,16 @@ function ChannelFilterPill({ active, onClick, children }: { active: boolean; onC
 }
 
 function DeliveryStatus({ msg }: { msg: Message }) {
-  const isOptimistic = msg.id.startsWith('opt-')
   const iconCls = 'inline-flex items-center ml-1.5 align-middle'
-  if (isOptimistic) {
+  if (msg._failed) {
+    return (
+      <span className={`${iconCls} text-danger cursor-pointer`} title="Failed to send — tap to dismiss"
+        onClick={() => removePending(msg.person_id!, msg.id)}>
+        <XIcon size={12} />
+      </span>
+    )
+  }
+  if (msg._pending) {
     return <span className={`${iconCls} text-text-pending`}><Clock size={12} /></span>
   }
   if (msg.seen) {
@@ -1620,7 +1637,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const [recordDuration, setRecordDuration] = useState(0)
   const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null)
   const [showChannelPicker, setShowChannelPicker] = useState(false)
-  const sendErrors = useRef<Map<string, string>>(new Map())
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -1628,8 +1644,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const channelPickerRef = useRef<HTMLDivElement>(null)
   const { user } = useAuth()
-  const qc = useQueryClient()
-  const addOptimistic = useAddOptimisticMessage(personId, user?.id)
+  const cancelThread = useCancelThreadQueries(personId, user?.id)
 
   const last = _.last(thread) ?? convoLastMessage
 
@@ -1658,7 +1673,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
     return () => document.removeEventListener('mousedown', handler)
   }, [showChannelPicker])
 
-  const failedMessages = thread.filter((m) => m.id.startsWith('opt-') && sendErrors.current.has(m.id))
+  const failedMessages = thread.filter((m) => m._failed)
 
   useEffect(() => {
     return () => {
@@ -1769,7 +1784,8 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       accountId: resolvedAccountId,
     }
     const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    addOptimistic({
+    cancelThread()
+    addPendingMessage(personId, {
       id: optId, user_id: meta.userId, person_id: personId, identity_id: null,
       external_id: null, channel: activeChannel, direction: 'outbound',
       message_type: meta.messageType, subject: null, body_text: 'Voice message',
@@ -1785,9 +1801,9 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       await invoke('send_voice_message', {
         chatId: resolvedChatId, voiceData: result.data, voiceMime: result.mime, ...meta,
       })
-      // Keep optimistic visible — realtime will confirm.
     } catch (e) {
       if (import.meta.env.DEV) console.error('Voice send failed:', e)
+      markPendingFailed(personId, optId)
     }
   }
 
@@ -1833,7 +1849,8 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       folder: null,
       read_at: null,
     }
-    addOptimistic(optimistic)
+    cancelThread()
+    addPendingMessage(personId, optimistic)
 
     const meta = {
       userId: last?.user_id ?? '',
@@ -1847,17 +1864,9 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
     ;(async () => {
       try {
         await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
-        sendErrors.current.delete(optId)
-        // Don't immediately invalidate — keep the optimistic visible.
-        // Realtime will fire when the webhook processes the sent message,
-        // which triggers a refetch that replaces the optimistic with the real row.
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
-        sendErrors.current.set(optId, String(e))
-        qc.setQueryData<Message[]>(
-          ['thread', personId, user?.id],
-          (old) => old ? [...old] : old,
-        )
+        markPendingFailed(personId, optId)
       }
     })()
   }
@@ -1906,7 +1915,8 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       folder: null,
       read_at: null,
     }
-    addOptimistic(optimistic)
+    cancelThread()
+    addPendingMessage(personId, optimistic)
     setText('')
     setFiles([])
     onClearReply()
@@ -1937,15 +1947,9 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
         } else {
           await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         }
-        sendErrors.current.delete(optId)
-        // Keep optimistic visible — realtime will confirm and replace it.
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
-        sendErrors.current.set(optId, String(e))
-        qc.setQueryData<Message[]>(
-          ['thread', personId, user?.id],
-          (old) => old ? [...old] : old,
-        )
+        markPendingFailed(personId, optId)
       }
     })()
   }
@@ -2000,11 +2004,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
               </span>
               <button onClick={() => {
                 const bodyText = m.body_text ?? ''
-                sendErrors.current.delete(m.id)
-                qc.setQueryData<Message[]>(
-                  ['thread', personId, user?.id],
-                  (old) => old?.filter((msg) => msg.id !== m.id) ?? [],
-                )
+                removePending(personId, m.id)
                 sendText(bodyText)
               }} className="failed-msg-retry">Retry</button>
             </div>

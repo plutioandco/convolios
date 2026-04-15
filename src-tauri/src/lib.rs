@@ -989,6 +989,26 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           if r.status().is_success() || r.status().as_u16() == 409 { msgs_synced += 1; }
         }
       }
+
+      if !is_group {
+        let had_outbound = messages.iter().any(|m| {
+          m.get("is_sender")
+            .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+            .unwrap_or(false)
+        });
+        if had_outbound {
+          let _ = client
+            .patch(format!(
+              "{supabase_url}/rest/v1/persons?id=eq.{person_id}&status=eq.pending"
+            ))
+            .header("apikey", &service_key)
+            .header("Authorization", format!("Bearer {service_key}"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({"status": "approved", "updated_at": chrono::Utc::now().to_rfc3339()}))
+            .send()
+            .await;
+        }
+      }
     }
   }
 
@@ -1111,15 +1131,20 @@ fn map_unipile_status(raw: &str) -> &'static str {
 }
 
 fn normalize_handle(raw: &str, channel: &str) -> String {
-  let is_lid = raw.contains("@lid");
   let mut h = raw
     .replace("@s.whatsapp.net", "")
     .replace("@lid", "")
     .replace("@c.us", "")
     .trim()
     .to_string();
-  if channel == "whatsapp" && !is_lid && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() && h.len() <= 15 {
+  if channel == "whatsapp" && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() && h.len() <= 15 {
     h = format!("+{h}");
+  }
+  if (channel == "imessage" || channel == "sms") && !h.is_empty() {
+    let digits: String = h.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 7 && digits.len() <= 15 {
+      h = format!("+{digits}");
+    }
   }
   if channel == "linkedin" {
     if let Some(stripped) = h.strip_prefix("https://www.linkedin.com/in/") {
@@ -1310,7 +1335,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           "p_display_name": display_name,
           "p_unipile_account_id": acc.id,
           "p_metadata": metadata_json,
-          "p_direction": "outbound"
+          "p_direction": if is_group { "outbound" } else { "inbound" }
         }))
         .send()
         .await;
@@ -1502,6 +1527,26 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
             errors.push(format!("insert msg: {body}"));
           }
           Err(e) => { errors.push(format!("insert msg: {e}")); }
+        }
+      }
+
+      if !is_group {
+        let had_outbound = messages.iter().any(|m| {
+          m.get("is_sender")
+            .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+            .unwrap_or(false)
+        });
+        if had_outbound {
+          let _ = client
+            .patch(format!(
+              "{supabase_url}/rest/v1/persons?id=eq.{person_id}&status=eq.pending"
+            ))
+            .header("apikey", &service_key)
+            .header("Authorization", format!("Bearer {service_key}"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({"status": "approved", "updated_at": chrono::Utc::now().to_rfc3339()}))
+            .send()
+            .await;
         }
       }
 
@@ -2319,11 +2364,25 @@ async fn backfill_x_dms(
     Err(_) => return Ok((0, 0)),
   };
 
-  let dm_url = "https://api.twitter.com/2/dm_events?dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id&event_types=MessageCreate&max_results=100";
-  let dm_body = x_authed_get(client, dm_url, sb_url, sb_key, user_id).await?;
+  let base_dm_url = "https://api.twitter.com/2/dm_events?dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id&event_types=MessageCreate&max_results=100";
 
-  let events = dm_body.get("data")
-    .and_then(|v| v.as_array()).cloned().unwrap_or_default();
+  let mut events: Vec<serde_json::Value> = Vec::new();
+  let mut next_url = base_dm_url.to_string();
+  let max_pages = 5;
+
+  for _ in 0..max_pages {
+    let dm_body = x_authed_get(client, &next_url, sb_url, sb_key, user_id).await?;
+    if let Some(page) = dm_body.get("data").and_then(|v| v.as_array()) {
+      events.extend(page.iter().cloned());
+    }
+    match dm_body.get("meta").and_then(|m| m.get("next_token")).and_then(|v| v.as_str()) {
+      Some(token) => {
+        next_url = format!("{base_dm_url}&pagination_token={token}");
+      }
+      None => break,
+    }
+  }
+
   if events.is_empty() {
     return Ok((0, 0));
   }
@@ -2401,13 +2460,19 @@ async fn backfill_x_dms(
     let username = user
       .and_then(|u| u.get("username").and_then(|v| v.as_str()))
       .unwrap_or("");
-    let handle = if !username.is_empty() { username.to_string() } else { other_id.clone() };
+    let handle = if !username.is_empty() { username.to_lowercase() } else { other_id.clone() };
 
     let earliest_sender = msgs.iter()
       .min_by_key(|m| m.get("created_at").and_then(|v| v.as_str()).unwrap_or(""))
       .and_then(|m| m.get("sender_id").and_then(|v| v.as_str()))
       .unwrap_or("");
     let direction = if earliest_sender == my_x_id { "outbound" } else { "inbound" };
+
+    let mut x_metadata = serde_json::Map::new();
+    x_metadata.insert("x_user_id".to_string(), serde_json::Value::String(other_id.clone()));
+    if !username.is_empty() {
+      x_metadata.insert("username".to_string(), serde_json::Value::String(username.to_lowercase()));
+    }
 
     let person_url = format!("{sb_url}/rest/v1/rpc/backfill_find_or_create_person");
     let person_resp = client
@@ -2422,7 +2487,8 @@ async fn backfill_x_dms(
         "p_handle": handle,
         "p_display_name": display_name,
         "p_unipile_account_id": my_x_id,
-        "p_direction": direction
+        "p_direction": direction,
+        "p_metadata": serde_json::Value::Object(x_metadata)
       }))
       .send()
       .await;
@@ -2683,14 +2749,15 @@ async fn backfill_imessage(
     let handle = if is_group {
       chat_guid.clone()
     } else {
-      if !first.chat_identifier.is_empty() {
+      let raw = if !first.chat_identifier.is_empty() {
         first.chat_identifier.clone()
       } else {
         msgs.iter()
           .find(|m| !m.is_from_me && !m.sender_handle.is_empty())
           .map(|m| m.sender_handle.clone())
           .unwrap_or_else(|| chat_guid.clone())
-      }
+      };
+      normalize_handle(&raw, "imessage")
     };
 
     let display_name = if is_group {
@@ -3082,21 +3149,61 @@ async fn fetch_chat_avatars(
       .unwrap_or(false);
     if is_self { continue; }
 
-    let person_url = format!(
-      "{supabase_url}/rest/v1/persons?display_name=eq.{}&select=id,avatar_url,avatar_stale",
-      urlencoding::encode(&att_name)
-    );
-    let person_row = client.get(&person_url)
-      .header("apikey", &service_key)
-      .header("Authorization", format!("Bearer {service_key}"))
-      .send().await.ok()
-      .and_then(|r| if r.status().is_success() { Some(r) } else { None });
+    let att_provider_id = att.get("provider_id").and_then(|v| v.as_str()).unwrap_or("");
+    let att_pub_id = att.get("public_identifier").and_then(|v| v.as_str()).unwrap_or("");
 
-    let person_data: Option<serde_json::Value> = match person_row {
-      Some(r) => r.json::<serde_json::Value>().await.ok()
-        .and_then(|arr| arr.as_array().and_then(|a| a.first().cloned())),
-      None => None,
-    };
+    let mut person_data: Option<serde_json::Value> = None;
+
+    if !att_provider_id.is_empty() || !att_pub_id.is_empty() {
+      let handle_to_find = if !att_pub_id.is_empty() { att_pub_id } else { att_provider_id };
+      let identity_url = format!(
+        "{supabase_url}/rest/v1/identities?handle=eq.{}&select=person_id",
+        urlencoding::encode(handle_to_find)
+      );
+      if let Some(pid) = client.get(&identity_url)
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .send().await.ok()
+        .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+      {
+        if let Ok(arr) = pid.json::<serde_json::Value>().await {
+          if let Some(pid_str) = arr.as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.get("person_id"))
+            .and_then(|v| v.as_str())
+          {
+            let purl = format!(
+              "{supabase_url}/rest/v1/persons?id=eq.{pid_str}&select=id,avatar_url,avatar_stale"
+            );
+            if let Some(pr) = client.get(&purl)
+              .header("apikey", &service_key)
+              .header("Authorization", format!("Bearer {service_key}"))
+              .send().await.ok()
+              .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+            {
+              person_data = pr.json::<serde_json::Value>().await.ok()
+                .and_then(|arr| arr.as_array()?.first().cloned());
+            }
+          }
+        }
+      }
+    }
+
+    if person_data.is_none() {
+      let person_url = format!(
+        "{supabase_url}/rest/v1/persons?display_name=eq.{}&select=id,avatar_url,avatar_stale",
+        urlencoding::encode(&att_name)
+      );
+      if let Some(r) = client.get(&person_url)
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .send().await.ok()
+        .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+      {
+        person_data = r.json::<serde_json::Value>().await.ok()
+          .and_then(|arr| arr.as_array()?.first().cloned());
+      }
+    }
 
     if let Some(person) = person_data {
       let pid = person.get("id").and_then(|v| v.as_str()).unwrap_or("");

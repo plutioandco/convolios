@@ -216,8 +216,8 @@ function SettingsSkeleton() {
         <div key={i} className="settings-skeleton-card">
           <div className="skeleton w-10 h-10 rounded-full shrink-0" />
           <div className="flex-1">
-            <div className="skeleton w-[30%] h-3.5 mb-1.5" />
-            <div className="skeleton w-1/2 h-[11px]" />
+            <div className="skeleton w-[30%] h-3.5 rounded-sm mb-1.5" />
+            <div className="skeleton w-1/2 h-[11px] rounded-sm" />
           </div>
         </div>
       ))}

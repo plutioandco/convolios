@@ -2508,7 +2508,13 @@ async fn refresh_and_store_x_token(
   new_params["access_token"] = serde_json::Value::String(new_access.to_string());
   new_params["refresh_token"] = serde_json::Value::String(new_refresh.to_string());
 
-  let store_params = encrypt_x_params(&new_params).unwrap_or(new_params);
+  let store_params = match encrypt_x_params(&new_params) {
+    Ok(p) => p,
+    Err(e) => {
+      dev_log!("[x-refresh] encrypt failed, storing plaintext: {e}");
+      new_params
+    }
+  };
 
   let update_url = format!(
     "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&account_id=eq.{account_id}"

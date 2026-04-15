@@ -1,5 +1,3 @@
-import { encryptJson } from "../_shared/crypto.ts";
-
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const code = url.searchParams.get("code");
@@ -90,17 +88,6 @@ Deno.serve(async (req: Request) => {
     const username = xData.username ?? null;
 
     const now = new Date().toISOString();
-    let connectionParams: unknown = {
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      x_user_id: xUserId,
-    };
-    try {
-      connectionParams = { encrypted: await encryptJson(connectionParams) };
-    } catch (e) {
-      console.error("[x-callback] encryption unavailable, storing plaintext:", e);
-    }
-
     const accountRow = {
       user_id,
       provider: "x",
@@ -110,7 +97,11 @@ Deno.serve(async (req: Request) => {
       display_name: displayName,
       username,
       provider_type: "X",
-      connection_params: connectionParams,
+      connection_params: {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        x_user_id: xUserId,
+      },
       last_synced_at: now,
       updated_at: now,
     };

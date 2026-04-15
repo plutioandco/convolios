@@ -54,6 +54,7 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     unipile_account_id: null,
     folder: null,
     read_at: null,
+    flagged_at: null,
   }
 
   return {
@@ -63,6 +64,8 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     prevInboundBody: null,
     prevInboundSender: null,
     channels: _.isArray(row.channels) ? (row.channels as string[]) : [],
+    markedUnread: (row.marked_unread as boolean) ?? false,
+    pinnedAt: (row.pinned_at as string | null) ?? null,
   }
 }
 

@@ -5,11 +5,12 @@ import { useInboxStore, useFilterStore } from '../../stores/inboxStore'
 import { useAccountsStore } from '../../stores/accountsStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
+import { useFlaggedMessages } from '../../hooks/useFlaggedMessages'
 import { useCircles, useApprovePerson, useBlockPerson, useAddToCircle, useRemoveFromCircle } from '../../hooks/useCircles'
-import { Check, CheckCheck, Users, X, ChevronRight, ShieldOff } from 'lucide-react'
+import { Check, CheckCheck, Users, X, ChevronRight, ShieldOff, Pin, BellDot, Flag } from 'lucide-react'
 import { channelColor, channelLabel, relativeTime, initials, avatarCls, cleanPreviewText, accountDisplayLabel } from '../../utils'
 import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
-import type { ConversationPreview } from '../../types'
+import type { ConversationPreview, FlaggedMessage } from '../../types'
 
 const REACTION_PREVIEW_RE = /^\{\{[^}]+\}\}\s*reacted\s+/
 
@@ -63,7 +64,7 @@ export function InboxList() {
     : null
 
   const [showAddPeople, setShowAddPeople] = useState(false)
-  const [rowContextMenu, setRowContextMenu] = useState<{ personId: string; x: number; y: number } | null>(null)
+  const [rowContextMenu, setRowContextMenu] = useState<{ convo: ConversationPreview; x: number; y: number } | null>(null)
 
   const { data: convos = [], isLoading, error } = useConversations(
     user?.id, rtConnected, 'approved', activeCircleId
@@ -72,8 +73,12 @@ export function InboxList() {
     user?.id, rtConnected, 'pending'
   )
   const showBlocked = activeView === 'blocked'
+  const showFlagged = activeView === 'flagged'
   const { data: blockedAll = [], isLoading: blockedLoading } = useConversations(
     showBlocked ? user?.id : undefined, rtConnected, 'blocked'
+  )
+  const { data: flaggedAll = [], isLoading: flaggedLoading } = useFlaggedMessages(
+    showFlagged ? user?.id : undefined
   )
 
   const channelAccounts = ch !== 'all'
@@ -87,7 +92,7 @@ export function InboxList() {
   const list = convos.filter((c) => {
     if (ch !== 'all' && c.lastMessage.channel !== ch) return false
     if (triageFilter !== 'all' && c.lastMessage.triage !== triageFilter) return false
-    if (readFilter === 'unread' && c.unreadCount === 0) return false
+    if (readFilter === 'unread' && c.unreadCount === 0 && !c.markedUnread) return false
     if (query && !c.person.display_name.toLowerCase().includes(query.toLowerCase())) return false
     return true
   })
@@ -98,6 +103,9 @@ export function InboxList() {
     seenIds.add(c.person.id)
     return true
   })
+
+  const pinned = deduped.filter((c) => _.isString(c.pinnedAt))
+  const unpinned = deduped.filter((c) => !_.isString(c.pinnedAt))
 
   const pendingSeenIds = new Set<string>()
   const pending = pendingAll.filter((c) => {
@@ -114,9 +122,11 @@ export function InboxList() {
 
   const heading = showBlocked
     ? 'Blocked'
-    : activeCircleName
-      ? activeCircleName
-      : ch !== 'all' ? channelLabel(ch) : 'Conversations'
+    : showFlagged
+      ? 'Action Items'
+      : activeCircleName
+        ? activeCircleName
+        : ch !== 'all' ? channelLabel(ch) : 'Conversations'
 
   return (
     <div className="inbox-panel">
@@ -133,13 +143,13 @@ export function InboxList() {
       <div className="section-header">
         <div>
           {heading}
-          {!showBlocked && connectionSummary && (
+          {!showBlocked && !showFlagged && connectionSummary && (
             <p className="text-xs font-normal normal-case tracking-normal text-text-pending mt-0.5 truncate">
               {connectionSummary}
             </p>
           )}
         </div>
-        {!showBlocked && (
+        {!showBlocked && !showFlagged && (
           <div className="flex gap-0.5 items-center">
             {activeCircleId && (
               <button
@@ -155,7 +165,19 @@ export function InboxList() {
       </div>
 
       <div className="thin-scroll flex-1 min-h-0 px-2 pb-2">
-        {showBlocked ? (
+        {showFlagged ? (
+          <>
+            {flaggedLoading && flaggedAll.length === 0 && <InboxSkeleton />}
+            {!flaggedLoading && flaggedAll.length === 0 && (
+              <Empty>No flagged messages</Empty>
+            )}
+            {flaggedAll.filter((f) =>
+              !query || f.displayName.toLowerCase().includes(query.toLowerCase())
+            ).map((f) => (
+              <FlaggedRow key={f.messageId} f={f} active={sel === f.personId} onSelect={pick} />
+            ))}
+          </>
+        ) : showBlocked ? (
           <>
             {blockedLoading && blocked.length === 0 && <InboxSkeleton />}
             {!blockedLoading && blocked.length === 0 && (
@@ -200,9 +222,18 @@ export function InboxList() {
               )
             )}
 
-            {deduped.map((c) => (
+            {pinned.map((c) => (
               <ConversationRow key={c.person.id} c={c} active={sel === c.person.id} onSelect={pick}
-                  onContextMenu={(personId, x, y) => setRowContextMenu({ personId, x, y })} />
+                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} />
+            ))}
+
+            {pinned.length > 0 && unpinned.length > 0 && (
+              <div className="h-px bg-border mx-1 my-1" />
+            )}
+
+            {unpinned.map((c) => (
+              <ConversationRow key={c.person.id} c={c} active={sel === c.person.id} onSelect={pick}
+                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} />
             ))}
           </>
         )}
@@ -210,7 +241,7 @@ export function InboxList() {
 
       {rowContextMenu && (
         <ConversationContextMenu
-          personId={rowContextMenu.personId}
+          convo={rowContextMenu.convo}
           x={rowContextMenu.x}
           y={rowContextMenu.y}
           circles={circles}
@@ -318,13 +349,14 @@ function ChannelBadges({ channels }: { channels: string[] }) {
 function ConversationRow({ c, active, onSelect, onContextMenu }: {
   c: ConversationPreview; active: boolean
   onSelect: (id: string) => void
-  onContextMenu: (personId: string, x: number, y: number) => void
+  onContextMenu: (convo: ConversationPreview, x: number, y: number) => void
 }) {
   const isGroup = c.lastMessage.message_type === 'group'
   const clr = channelColor(c.lastMessage.channel)
-  const hasUnread = c.unreadCount > 0
+  const hasUnread = c.unreadCount > 0 || c.markedUnread
   const isOutbound = c.lastMessage.direction === 'outbound'
   const prevLine = prevInboundText(c)
+  const isPinned = _.isString(c.pinnedAt)
   const senderPrefix = isGroup && _.isString(c.lastMessage.sender_name)
     ? `${c.lastMessage.sender_name.split(' ')[0]}: `
     : ''
@@ -332,7 +364,7 @@ function ConversationRow({ c, active, onSelect, onContextMenu }: {
   return (
     <div
       onClick={() => onSelect(c.person.id)}
-      onContextMenu={(e) => { e.preventDefault(); onContextMenu(c.person.id, e.clientX, e.clientY) }}
+      onContextMenu={(e) => { e.preventDefault(); onContextMenu(c, e.clientX, e.clientY) }}
       className="conv-row"
       data-active={active}
     >
@@ -356,6 +388,7 @@ function ConversationRow({ c, active, onSelect, onContextMenu }: {
             {c.person.display_name}
           </span>
           <ChannelBadges channels={c.channels} />
+          {isPinned && <Pin size={11} className="text-text-pending shrink-0" />}
           <span className="text-xs text-text-pending shrink-0">
             {relativeTime(c.lastMessage.sent_at)}
           </span>
@@ -523,8 +556,58 @@ function BlockedRow({ c, userId }: { c: ConversationPreview; userId?: string }) 
   )
 }
 
-function ConversationContextMenu({ personId, x, y, circles, userId, onClose }: {
-  personId: string; x: number; y: number
+function FlaggedRow({ f, active, onSelect }: {
+  f: FlaggedMessage; active: boolean; onSelect: (id: string) => void
+}) {
+  const clr = channelColor(f.channel)
+  const body = _.isString(f.subject) && f.subject.trim()
+    ? cleanPreviewText(f.subject).slice(0, 60)
+    : _.isString(f.bodyText)
+      ? cleanPreviewText(f.bodyText).slice(0, 60)
+      : 'Flagged message'
+
+  return (
+    <div
+      onClick={() => onSelect(f.personId)}
+      className="conv-row"
+      data-active={active}
+    >
+      <div className="relative w-[42px] h-[42px] shrink-0">
+        {f.avatarUrl
+          ? <img src={f.avatarUrl} alt="" className="w-[42px] h-[42px] rounded-full object-cover" />
+          : <div className={`avatar avatar--2xl ${avatarCls(f.personId)}`}>
+              {initials(f.displayName)}
+            </div>}
+        <span
+          className="absolute -bottom-0.5 -right-1 w-4 h-4 rounded-[3px] flex items-center justify-center"
+          style={{ background: clr }}
+        >
+          <ChannelLogo channel={f.channel} size={10} color={isLightBrandColor(clr) ? 'var(--color-black)' : 'var(--color-white)'} />
+        </span>
+      </div>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1">
+          <span className={`flex-1 text-base truncate ${active ? 'font-semibold text-text-primary' : 'font-normal text-text-muted'}`}>
+            {f.displayName}
+          </span>
+          <Flag size={11} className="text-warning shrink-0" fill="currentColor" />
+          <span className="text-xs text-text-pending shrink-0">
+            {relativeTime(f.flaggedAt)}
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="flex-1 text-md truncate text-text-muted">
+            {body}
+          </span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ConversationContextMenu({ convo, x, y, circles, userId, onClose }: {
+  convo: ConversationPreview; x: number; y: number
   circles: import('../../types').Circle[]
   userId?: string
   onClose: () => void
@@ -534,6 +617,13 @@ function ConversationContextMenu({ personId, x, y, circles, userId, onClose }: {
   const removeFromCircle = useRemoveFromCircle(userId)
   const block = useBlockPerson(userId)
   const deselect = useInboxStore((s) => s.selectPerson)
+  const markUnread = useInboxStore((s) => s.markPersonUnread)
+  const markRead = useInboxStore((s) => s.markConversationRead)
+  const pinAction = useInboxStore((s) => s.pinPerson)
+
+  const personId = convo.person.id
+  const hasUnread = convo.unreadCount > 0 || convo.markedUnread
+  const isPinned = _.isString(convo.pinnedAt)
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -548,6 +638,41 @@ function ConversationContextMenu({ personId, x, y, circles, userId, onClose }: {
       className="fixed z-[400] bg-context-bg border border-border rounded-[6px] p-1 min-w-[180px] shadow-context"
       style={{ left: x, top: y }}
     >
+      <div
+        className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-sm cursor-pointer text-text-body"
+        onClick={() => {
+          if (_.isString(userId)) {
+            if (hasUnread) {
+              markUnread(userId, personId, false)
+              if (convo.unreadCount > 0) markRead(userId, personId)
+            } else {
+              markUnread(userId, personId, true)
+            }
+          }
+          onClose()
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--hover-accent-subtle)' }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+      >
+        <BellDot size={14} />
+        <span className="text-md">{hasUnread ? 'Mark as read' : 'Mark as unread'}</span>
+      </div>
+
+      <div
+        className="flex items-center gap-1.5 py-1.5 px-2.5 rounded-sm cursor-pointer text-text-body"
+        onClick={() => {
+          if (_.isString(userId)) pinAction(userId, personId, !isPinned)
+          onClose()
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--hover-accent-subtle)' }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+      >
+        <Pin size={14} />
+        <span className="text-md">{isPinned ? 'Unpin' : 'Pin'}</span>
+      </div>
+
+      <div className="context-sep" />
+
       <p className="text-xs font-bold text-text-pending py-1 px-2 uppercase tracking-[.05em]">
         Circles
       </p>

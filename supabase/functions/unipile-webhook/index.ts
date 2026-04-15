@@ -60,12 +60,13 @@ interface UnipileWebhook {
 }
 
 function normalizeHandle(raw: string, channel: string): string {
+  const isLid = raw.includes("@lid");
   let h = raw
     .replace(/@s\.whatsapp\.net$/, "")
     .replace(/@lid$/, "")
     .replace(/@c\.us$/, "")
     .trim();
-  if (channel === "whatsapp" && /^\d+$/.test(h) && h.length <= 15) {
+  if (channel === "whatsapp" && !isLid && /^\d+$/.test(h) && h.length <= 15) {
     h = `+${h}`;
   }
   if (channel === "linkedin") {
@@ -218,8 +219,69 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       personId = result.personId;
       identityId = result.identityId;
     } else {
-      personId = threadLookup.person_id;
-      identityId = threadLookup.identity_id;
+      // Verify the cached person isn't the account owner (misattributed).
+      // If the identity handle matches the account owner's user_id or the
+      // sender's provider_id on an outbound message, re-resolve via chat_attendees.
+      let needsReResolve = false;
+      if (threadLookup.identity_id) {
+        const { data: cachedIdentity } = await supabase
+          .from("identities")
+          .select("handle")
+          .eq("id", threadLookup.identity_id)
+          .maybeSingle();
+        if (cachedIdentity) {
+          const cachedHandle = cachedIdentity.handle?.toLowerCase() ?? "";
+          const ownerUserId = (payload.account_info?.user_id ?? "").toLowerCase();
+          const senderPid = (payload.sender?.attendee_provider_id ?? "").toLowerCase();
+          // If cached handle matches the account owner or sender on outbound, it's wrong
+          if (
+            (ownerUserId && cachedHandle === ownerUserId) ||
+            (direction === "outbound" && senderPid && cachedHandle === senderPid)
+          ) {
+            needsReResolve = true;
+          }
+        }
+      }
+
+      if (needsReResolve) {
+        const attendees = await fetchChatAttendees(payload.chat_id);
+        const otherParty = attendees.find((a) => {
+          const self = typeof a.is_self === "boolean" ? a.is_self
+            : (typeof a.is_self === "number" ? a.is_self === 1 : false);
+          return !self;
+        });
+        if (otherParty) {
+          const otherHandle = otherParty.public_identifier
+            ?? otherParty.identifier
+            ?? otherParty.provider_id
+            ?? "";
+          const contactHandle = normalizeHandle(
+            otherHandle || chatInfo.attendee_provider_id || payload.chat_id,
+            channel
+          );
+          const contactName = otherParty.display_name ?? otherParty.name ?? chatInfo.name ?? contactHandle;
+          const result = await findOrCreatePerson(
+            userId, channel, contactHandle, contactName, payload.account_id, direction
+          );
+          personId = result.personId;
+          identityId = result.identityId;
+          // Re-assign existing messages in this thread to the correct person.
+          // Uses an RPC to bypass trg_prevent_person_id_change trigger.
+          await supabase.rpc("reassign_thread_person", {
+            p_user_id: userId,
+            p_thread_id: payload.chat_id,
+            p_from_person_id: threadLookup.person_id,
+            p_to_person_id: personId,
+            p_to_identity_id: identityId,
+          });
+        } else {
+          personId = threadLookup.person_id;
+          identityId = threadLookup.identity_id;
+        }
+      } else {
+        personId = threadLookup.person_id;
+        identityId = threadLookup.identity_id;
+      }
     }
     messageType = isGroup ? "group" : threadLookup.message_type;
   } else {
@@ -233,23 +295,49 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     if (isGroup) {
       contactHandle = chatInfo.provider_id ?? payload.chat_id;
       contactName = chatInfo.name ?? "Group Chat";
-    } else if (isSender) {
-      const recipient = payload.attendees?.find(
-        (a) => a.attendee_provider_id !== payload.sender?.attendee_provider_id
-      );
-      const recipientHandle = recipient?.attendee_provider_id
-        ?? chatInfo.attendee_provider_id
-        ?? payload.chat_id;
-      contactHandle = normalizeHandle(recipientHandle, channel);
-      contactName = recipient?.attendee_name ?? chatInfo.name ?? contactHandle;
     } else {
-      contactHandle = normalizeHandle(
-        payload.sender?.attendee_provider_id
-          ?? payload.sender?.attendee_id
-          ?? "unknown",
-        channel
-      );
-      contactName = payload.sender?.attendee_name ?? contactHandle;
+      // For DMs, always use chat_attendees with is_self=false as the
+      // authoritative source for the other party. The webhook payload's
+      // attendees and chatInfo.attendee_provider_id are unreliable —
+      // on Instagram, the sender's attendee_provider_id differs from
+      // account_info.user_id, causing the account owner to be treated
+      // as a contact.
+      const attendees = await fetchChatAttendees(payload.chat_id);
+      const otherParty = attendees.find((a) => {
+        const self = typeof a.is_self === "boolean" ? a.is_self
+          : (typeof a.is_self === "number" ? a.is_self === 1 : false);
+        return !self;
+      });
+
+      if (otherParty) {
+        const otherHandle = otherParty.public_identifier
+          ?? otherParty.identifier
+          ?? otherParty.provider_id
+          ?? "";
+        contactHandle = normalizeHandle(
+          otherHandle || chatInfo.attendee_provider_id || payload.chat_id,
+          channel
+        );
+        contactName = otherParty.display_name ?? otherParty.name ?? chatInfo.name ?? contactHandle;
+      } else if (isSender) {
+        // Fallback: no attendees returned, use webhook payload
+        const recipient = payload.attendees?.find(
+          (a) => a.attendee_provider_id !== payload.sender?.attendee_provider_id
+        );
+        const recipientHandle = recipient?.attendee_provider_id
+          ?? chatInfo.attendee_provider_id
+          ?? payload.chat_id;
+        contactHandle = normalizeHandle(recipientHandle, channel);
+        contactName = recipient?.attendee_name ?? chatInfo.name ?? contactHandle;
+      } else {
+        contactHandle = normalizeHandle(
+          payload.sender?.attendee_provider_id
+            ?? payload.sender?.attendee_id
+            ?? "unknown",
+          channel
+        );
+        contactName = payload.sender?.attendee_name ?? contactHandle;
+      }
     }
 
     const result = await findOrCreatePerson(
@@ -721,6 +809,24 @@ async function enrichAttachments(
   }
 
   return webhookAtts;
+}
+
+async function fetchChatAttendees(
+  chatId: string
+): Promise<Array<{ id?: string; identifier?: string; provider_id?: string; name?: string; display_name?: string; is_self?: boolean; picture_url?: string; public_identifier?: string }>> {
+  if (!UNIPILE_API_KEY) return [];
+  try {
+    const res = await fetch(
+      `${UNIPILE_API_URL}/api/v1/chat_attendees?chat_id=${chatId}`,
+      { headers: { "X-API-KEY": UNIPILE_API_KEY } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.items ?? [];
+  } catch (err) {
+    console.error("Failed to fetch chat attendees:", err);
+    return [];
+  }
 }
 
 async function fetchChatInfo(

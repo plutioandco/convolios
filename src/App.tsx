@@ -395,11 +395,15 @@ function Authenticated({ userId }: { userId: string }) {
 function InboxRoute({ userId, realtimeConnected }: { userId: string; realtimeConnected: boolean }) {
   const pid = useInboxStore((s) => s.selectedPersonId)
   const pick = useInboxStore((s) => s.selectPerson)
-  const { data: convos = [] } = useConversations(userId, realtimeConnected)
+  const { data: convos = [] } = useConversations(userId, realtimeConnected, 'approved')
+  const { data: pendingConvos = [] } = useConversations(userId, realtimeConnected, 'pending')
   const ch = useInboxStore((s) => s.activeChannel)
   const accounts = useAccountsStore((s) => s.accounts)
   const accountsLoading = useAccountsStore((s) => s.loading)
-  const selectedConvo = useMemo(() => convos.find((c) => c.person.id === pid), [convos, pid])
+  const selectedConvo = useMemo(() =>
+    convos.find((c) => c.person.id === pid) ?? pendingConvos.find((c) => c.person.id === pid),
+    [convos, pendingConvos, pid]
+  )
   const person = selectedConvo?.person
   const nav = useNavigate()
 
@@ -559,7 +563,7 @@ function SearchModal({ userId, onClose, onSelectPerson }: {
   const [activeIdx, setActiveIdx] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const rtConnected = useRealtimeConnected()
-  const { data: convos = [] } = useConversations(userId, rtConnected)
+  const { data: convos = [] } = useConversations(userId, rtConnected, 'approved')
 
   useEffect(() => { inputRef.current?.focus() }, [])
 

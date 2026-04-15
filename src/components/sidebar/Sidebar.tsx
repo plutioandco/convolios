@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { Settings, Plus, Pencil, Trash2, ShieldCheck, ShieldOff } from 'lucide-react'
+import { Settings, Plus, Pencil, Trash2, ShieldCheck, ShieldOff, Flag } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useInboxStore } from '../../stores/inboxStore'
 import { useAccountsStore } from '../../stores/accountsStore'
@@ -224,6 +224,11 @@ export function Sidebar() {
             </GuildBtn>
           )
         })}
+
+        <GuildBtn active={!onSettings && activeView === 'flagged'} bg="var(--color-warning)"
+          onClick={() => { setActiveView('flagged'); nav('/') }} label="Action Items">
+          <Flag size={18} color={activeView === 'flagged' && !onSettings ? 'var(--color-white)' : 'var(--color-text-body)'} />
+        </GuildBtn>
 
         <div className="sidebar-spacer" />
         <div className="sidebar-divider" />

@@ -81,6 +81,7 @@ export interface Message {
   unipile_account_id: string | null
   folder: string | null
   read_at: string | null
+  flagged_at: string | null
   _pending?: boolean
   _failed?: boolean
 }
@@ -111,6 +112,27 @@ export interface ConversationPreview {
   prevInboundBody: string | null
   prevInboundSender: string | null
   channels: string[]
+  markedUnread: boolean
+  pinnedAt: string | null
+}
+
+export interface FlaggedMessage {
+  messageId: string
+  personId: string
+  displayName: string
+  avatarUrl: string | null
+  channel: string
+  direction: string
+  bodyText: string | null
+  subject: string | null
+  bodyHtml: string | null
+  attachments: unknown[] | null
+  senderName: string | null
+  sentAt: string
+  flaggedAt: string
+  externalId: string | null
+  threadId: string | null
+  deleted: boolean | null
 }
 
 export interface Circle {

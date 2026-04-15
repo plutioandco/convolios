@@ -6,7 +6,7 @@ import {
   Link as LinkIcon, Music, FileText, Paperclip, MapPin,
   Phone, Video, MessageSquare, Users, CornerDownLeft, Smile,
   Pencil, X as XIcon, Play, Pause, Mic, Check, CheckCheck, Clock,
-  Download, ChevronDown, Link2, Upload,
+  Download, ChevronDown, Link2, Upload, Flag,
 } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -860,10 +860,11 @@ function Reactions({ reactions }: { reactions: { value?: string; emoji?: string;
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
 const REACTION_CHANNELS: Set<Channel> = new Set(['whatsapp', 'linkedin'])
 
-function MessageActions({ msg, onReply, onEdit }: {
+function MessageActions({ msg, onReply, onEdit, onFlag }: {
   msg: Message
   onReply: (msg: Message) => void
   onEdit?: (msg: Message) => void
+  onFlag?: (msg: Message) => void
 }) {
   const [showPicker, setShowPicker] = useState(false)
   const pickerRef = useRef<HTMLDivElement>(null)
@@ -903,6 +904,11 @@ function MessageActions({ msg, onReply, onEdit }: {
       {onEdit && (
         <button onClick={() => onEdit(msg)} title="Edit" className="msg-action-btn"><Pencil size={16} /></button>
       )}
+      {onFlag && !msg._pending && (
+        <button onClick={() => onFlag(msg)} title={_.isString(msg.flagged_at) ? 'Unflag' : 'Flag for action'} className="msg-action-btn">
+          <Flag size={16} fill={_.isString(msg.flagged_at) ? 'currentColor' : 'none'} />
+        </button>
+      )}
       {canReact && showPicker && (
         <div ref={pickerRef} onClick={(e) => e.stopPropagation()}
           className="absolute bottom-full right-0 mb-1 flex gap-0.5 p-1 rounded-card bg-surface-deep border border-border">
@@ -921,10 +927,13 @@ function MessageActions({ msg, onReply, onEdit }: {
 export function ThreadView() {
   const pid = useInboxStore((s) => s.selectedPersonId)
   const markRead = useInboxStore((s) => s.markConversationRead)
+  const clearUnread = useInboxStore((s) => s.markPersonUnread)
+  const flagMsg = useInboxStore((s) => s.flagMessage)
   const { user } = useAuth()
   const rtConnected = useRealtimeConnected()
-  const { data: convos = [] } = useConversations(user?.id, rtConnected)
-  const { data: thread = [], isLoading: threadLoading } = useThread(pid, user?.id, rtConnected)
+  const { data: convos = [] } = useConversations(user?.id, rtConnected, 'approved')
+  const { data: pendingConvos = [] } = useConversations(user?.id, rtConnected, 'pending')
+  const { data: thread = [], isLoading: threadLoading, hasMore, loadMore, isLoadingMore } = useThread(pid, user?.id, rtConnected)
   const [memberAvatars, setMemberAvatars] = useState<Record<string, string>>({})
   const [replyTo, setReplyTo] = useState<Message | null>(null)
   const [editingMsg, setEditingMsg] = useState<Message | null>(null)
@@ -990,6 +999,7 @@ export function ThreadView() {
   })
 
   const convo = convos.find((c) => c.person.id === pid)
+    ?? pendingConvos.find((c) => c.person.id === pid)
   const person = convo?.person
   const isGroup = thread.some((m) => m.message_type === 'group')
   const chatId = _.last(thread)?.thread_id
@@ -1015,7 +1025,10 @@ export function ThreadView() {
   useEffect(() => {
     if (!pid || !user?.id) return
     markRead(user.id, pid)
-  }, [pid, markRead, user?.id])
+    if (convo?.markedUnread) {
+      clearUnread(user.id, pid, false)
+    }
+  }, [pid, markRead, clearUnread, user?.id, convo?.markedUnread])
 
   const syncArgsRef = useRef<Record<string, unknown> | null>(null)
   useEffect(() => {
@@ -1095,6 +1108,11 @@ export function ThreadView() {
     setEditingMsg(null)
   }, [])
 
+  const handleFlag = useCallback((msg: Message) => {
+    if (!user?.id || !pid) return
+    flagMsg(user.id, pid, msg.id, !_.isString(msg.flagged_at))
+  }, [user?.id, pid, flagMsg])
+
   const handleEdit = useCallback((msg: Message) => {
     setEditingMsg(msg)
     setReplyTo(null)
@@ -1122,11 +1140,24 @@ export function ThreadView() {
   }, [pid])
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const sentinelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const el = scrollContainerRef.current
     if (el) el.scrollTop = 0
   }, [pid])
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current
+    const container = scrollContainerRef.current
+    if (!sentinel || !container || !hasMore) return
+    const io = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) loadMore() },
+      { root: container, rootMargin: '200px' },
+    )
+    io.observe(sentinel)
+    return () => io.disconnect()
+  }, [hasMore, loadMore])
 
   if (!pid) return <EmptyState />
 
@@ -1164,7 +1195,14 @@ export function ThreadView() {
       <div className="thread-scroller-wrap">
         <div ref={scrollContainerRef} className="thread-scroller chat-scroll">
         <div>
-          {person && (
+          {isLoadingMore && (
+            <div className="flex justify-center py-4">
+              <span className="text-sm text-text-muted">Loading older messages...</span>
+            </div>
+          )}
+          <div ref={sentinelRef} />
+
+          {person && !hasMore && (
             <div className="px-4 pt-4">
               <div className="pt-4 pb-3">
                 {isGroup
@@ -1264,8 +1302,8 @@ export function ThreadView() {
                   {editingMsg?.id === msg.id
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
                       : sameGroup
-                        ? <MsgCompact msg={msg} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />
-                        : <MsgFull msg={msg} person={person} memberAvatars={memberAvatars} isMe={isMe} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} />}
+                        ? <MsgCompact msg={msg} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} onFlag={handleFlag} />
+                        : <MsgFull msg={msg} person={person} memberAvatars={memberAvatars} isMe={isMe} onReply={handleReply} onEdit={isMe && msg.channel === 'whatsapp' ? handleEdit : undefined} onFlag={handleFlag} />}
                 </div>
               )
             })}
@@ -1546,13 +1584,14 @@ function EditInline({ msg, onSubmit, onCancel }: { msg: Message; onSubmit: (id: 
   )
 }
 
-function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
+function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit, onFlag }: {
   msg: Message
   person?: { id: string; display_name: string; avatar_url?: string | null } | null
   memberAvatars?: Record<string, string>
   isMe?: boolean
   onReply: (msg: Message) => void
   onEdit?: (msg: Message) => void
+  onFlag?: (msg: Message) => void
 }) {
   const out = isMe ?? msg.direction === 'outbound'
   const hasSender = _.isString(msg.sender_name) && msg.sender_name.trim() !== ''
@@ -1573,7 +1612,7 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
 
   return (
     <div className="msg-row msg-row--full">
-      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />
+      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} onFlag={onFlag} />
       {senderPic
         ? <img src={senderPic} alt="" className="msg-avatar" />
         : <div className={`${av} msg-avatar-initial`}>
@@ -1588,6 +1627,7 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
         <span className="msg-time">
           {formatTimestamp(msg.sent_at)}
         </span>
+        {_.isString(msg.flagged_at) && <Flag size={12} className="text-warning shrink-0" fill="currentColor" />}
       </div>
 
       <div style={S.msgBody}>
@@ -1599,14 +1639,15 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit }: {
   )
 }
 
-function MsgCompact({ msg, onReply, onEdit }: { msg: Message; onReply: (msg: Message) => void; onEdit?: (msg: Message) => void }) {
+function MsgCompact({ msg, onReply, onEdit, onFlag }: { msg: Message; onReply: (msg: Message) => void; onEdit?: (msg: Message) => void; onFlag?: (msg: Message) => void }) {
   const out = msg.direction === 'outbound'
   return (
     <div className="msg-compact msg-row msg-row--compact">
-      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} />
+      <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} onFlag={onFlag} />
       <span className="msg-compact-ts">
         {shortTime(msg.sent_at)}
       </span>
+      {_.isString(msg.flagged_at) && <Flag size={12} className="text-warning shrink-0" fill="currentColor" />}
 
       <div style={S.msgBody}>
         <span><MessageBody msg={msg} />{out && <DeliveryStatus msg={msg} />}</span>
@@ -1644,7 +1685,12 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const channelPickerRef = useRef<HTMLDivElement>(null)
   const { user } = useAuth()
+  const qc = useQueryClient()
   const cancelThread = useCancelThreadQueries(personId, user?.id)
+  const invalidateThread = useCallback(() => {
+    qc.invalidateQueries({ queryKey: ['thread', personId] })
+    qc.invalidateQueries({ queryKey: ['conversations', user?.id] })
+  }, [qc, personId, user?.id])
 
   const last = _.last(thread) ?? convoLastMessage
 
@@ -1795,12 +1841,13 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       delivered: false, edited: false, deleted: false, hidden: false,
       is_event: false, event_type: null, quoted_text: null, quoted_sender: null,
       provider_id: null, chat_provider_id: null, in_reply_to_message_id: null,
-      smtp_message_id: null, unipile_account_id: null, folder: null, read_at: null,
+      smtp_message_id: null, unipile_account_id: null, folder: null, read_at: null, flagged_at: null,
     })
     try {
       await invoke('send_voice_message', {
         chatId: resolvedChatId, voiceData: result.data, voiceMime: result.mime, ...meta,
       })
+      invalidateThread()
     } catch (e) {
       if (import.meta.env.DEV) console.error('Voice send failed:', e)
       markPendingFailed(personId, optId)
@@ -1848,6 +1895,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       unipile_account_id: null,
       folder: null,
       read_at: null,
+      flagged_at: null,
     }
     cancelThread()
     addPendingMessage(personId, optimistic)
@@ -1864,6 +1912,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
     ;(async () => {
       try {
         await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
+        invalidateThread()
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
         markPendingFailed(personId, optId)
@@ -1914,6 +1963,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       unipile_account_id: null,
       folder: null,
       read_at: null,
+      flagged_at: null,
     }
     cancelThread()
     addPendingMessage(personId, optimistic)
@@ -1947,6 +1997,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
         } else {
           await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         }
+        invalidateThread()
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
         markPendingFailed(personId, optId)

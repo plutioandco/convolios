@@ -1,5 +1,5 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useSyncExternalStore, useCallback, useEffect } from 'react'
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
+import { useSyncExternalStore, useCallback, useEffect, useMemo } from 'react'
 import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import type { Message } from '../types'
@@ -51,15 +51,34 @@ function isMatch(real: Message, opt: Message): boolean {
   return Math.abs(realT - optT) < 60_000
 }
 
+function dedup(raw: Message[]): Message[] {
+  const seenExtIds = new Set<string>()
+  const pass1 = raw.filter((m) => {
+    if (!_.isString(m.external_id)) return true
+    if (seenExtIds.has(m.external_id)) return false
+    seenExtIds.add(m.external_id)
+    return true
+  })
+
+  const seenContent = new Set<string>()
+  return pass1.filter((m) => {
+    if (_.isString(m.external_id)) return true
+    const key = `${m.direction}:${m.sent_at}:${m.body_text ?? ''}`
+    if (seenContent.has(key)) return false
+    seenContent.add(key)
+    return true
+  })
+}
+
 // ─── useThread ────────────────────────────────────────────────────────────────
 
 export function useThread(personId: string | null, userId?: string, realtimeConnected?: boolean) {
   const interval = realtimeConnected === false ? 8_000 : 30_000
   const pendingMsgs = usePendingMessages(personId)
 
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: ['thread', personId, userId],
-    queryFn: async (): Promise<Message[]> => {
+    queryFn: async ({ pageParam }): Promise<Message[]> => {
       let q = supabase
         .from('messages')
         .select('*')
@@ -71,34 +90,30 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
         q = q.eq('user_id', userId)
       }
 
+      if (_.isString(pageParam)) {
+        q = q.lt('sent_at', pageParam)
+      }
+
       const { data, error } = await q
       if (error) throw error
-
-      const raw = [...((data as Message[]) ?? [])].reverse()
-
-      const seenExtIds = new Set<string>()
-      const pass1 = raw.filter((m) => {
-        if (!_.isString(m.external_id)) return true
-        if (seenExtIds.has(m.external_id)) return false
-        seenExtIds.add(m.external_id)
-        return true
-      })
-
-      const seenContent = new Set<string>()
-      return pass1.filter((m) => {
-        if (_.isString(m.external_id)) return true
-        const key = `${m.direction}:${m.sent_at}:${m.body_text ?? ''}`
-        if (seenContent.has(key)) return false
-        seenContent.add(key)
-        return true
-      })
+      return (data as Message[]) ?? []
+    },
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => {
+      if (lastPage.length < PAGE_SIZE) return undefined
+      return lastPage[lastPage.length - 1]?.sent_at
     },
     enabled: _.isString(personId) && _.isString(userId),
     refetchInterval: interval,
     staleTime: 30_000,
   })
 
-  const realMessages = query.data ?? []
+  const realMessages = useMemo(() => {
+    if (!query.data?.pages) return []
+    const flat = query.data.pages.flatMap((page) => page)
+    const chronological = [...flat].reverse()
+    return dedup(chronological)
+  }, [query.data])
 
   useEffect(() => {
     if (!personId || pendingMsgs.length === 0 || realMessages.length === 0) return
@@ -118,8 +133,11 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
     : realMessages
 
   return {
-    ...query,
     data: merged,
+    isLoading: query.isLoading,
+    hasMore: query.hasNextPage ?? false,
+    loadMore: query.fetchNextPage,
+    isLoadingMore: query.isFetchingNextPage,
   }
 }
 

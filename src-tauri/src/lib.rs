@@ -64,7 +64,9 @@ pub fn run() {
       reconcile_chats,
       connect_x_account,
       connect_imessage,
-      read_dropped_files
+      read_dropped_files,
+      chat_action,
+      email_flag_action
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -721,6 +723,28 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       let msg_type = if is_group { "group" } else { "dm" };
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
+      // For DMs, fetch chat_attendees upfront — used for identity resolution AND avatar sync.
+      // For groups, this is fetched later for the attendee_map.
+      let dm_attendees: Vec<serde_json::Value> = if !is_group {
+        let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+        match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+          Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
+          }
+          _ => Vec::new(),
+        }
+      } else {
+        Vec::new()
+      };
+
+      let other_att = dm_attendees.iter().find(|a| {
+        let is_self = a.get("is_self")
+          .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+          .unwrap_or(false);
+        !is_self
+      });
+
       let sender_handle;
       let display_name;
       if is_group {
@@ -730,54 +754,50 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           channel
         );
       } else {
-        let sender_handle_raw = chat.get("attendee_public_identifier")
-          .and_then(|v| v.as_str())
-          .filter(|s| !s.is_empty() && !s.contains("@lid"))
-          .or_else(|| chat.get("attendee_provider_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty() && !s.contains("@lid")))
-          .or_else(|| chat.get("provider_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty()))
-          .unwrap_or(chat_id);
-        let mut resolved = normalize_handle(sender_handle_raw, channel);
-        let mut resolved_name = if !chat_name.is_empty() { chat_name.to_string() } else { resolved.clone() };
 
-        if channel == "email" {
-          let own_email = acc.email.as_deref().unwrap_or("").to_lowercase();
-          if !own_email.is_empty() && resolved == own_email {
-            let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
-            if let Ok(att_resp) = client.get(&att_url).header("X-API-KEY", &api_key).send().await {
-              if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
-                if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
-                  let other = items.iter().find(|a| {
-                    let is_self = a.get("is_self")
-                      .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
-                      .unwrap_or(false);
-                    !is_self
-                  });
-                  if let Some(other) = other {
-                    let other_id = other.get("identifier")
-                      .or_else(|| other.get("provider_id"))
-                      .and_then(|v| v.as_str())
-                      .unwrap_or("");
-                    if !other_id.is_empty() {
-                      resolved = normalize_handle(other_id, channel);
-                      let other_name = other.get("display_name")
-                        .or_else(|| other.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                      if !other_name.is_empty() {
-                        resolved_name = other_name.to_string();
-                      } else {
-                        resolved_name = resolved.clone();
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
+        let resolved;
+        let resolved_name;
+
+        if let Some(other) = other_att {
+          // Use the non-self attendee's identifier as the handle
+          let other_handle = other.get("public_identifier")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| other.get("identifier")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty()))
+            .or_else(|| other.get("provider_id")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty()))
+            .unwrap_or(chat_id);
+          resolved = normalize_handle(other_handle, channel);
+
+          let other_name = other.get("display_name")
+            .or_else(|| other.get("name"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+          resolved_name = if !other_name.is_empty() {
+            other_name.to_string()
+          } else if !chat_name.is_empty() {
+            chat_name.to_string()
+          } else {
+            resolved.clone()
+          };
+        } else {
+          // Fallback: chat_attendees unavailable, use chat object fields
+          let sender_handle_raw = chat.get("attendee_public_identifier")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && !s.contains("@lid"))
+            .or_else(|| chat.get("attendee_provider_id")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty() && !s.contains("@lid")))
+            .or_else(|| chat.get("provider_id")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty()))
+            .unwrap_or(chat_id);
+          resolved = normalize_handle(sender_handle_raw, channel);
+          resolved_name = if !chat_name.is_empty() { chat_name.to_string() } else { resolved.clone() };
         }
 
         sender_handle = resolved;
@@ -841,24 +861,20 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         };
 
         if needs_avatar {
-          let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
-          if let Ok(att_resp) = client.get(&att_url).header("X-API-KEY", &api_key).send().await {
-            if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
-              if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
-                for att in items {
-                  let is_self = att.get("is_self").and_then(|v| v.as_bool()).unwrap_or(false);
-                  if is_self { continue; }
-                  let att_id = att.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                  if att_id.is_empty() { continue; }
-                  let pic_url = att.get("picture_url").and_then(|v| v.as_str());
-                  upload_avatar(
-                    client, &api_key, &base, &supabase_url, &service_key,
-                    &person_id, att_id, pic_url,
-                  ).await;
-                  break;
-                }
-              }
-            }
+          // Reuse dm_attendees already fetched for identity resolution
+          for att in &dm_attendees {
+            let is_self = att.get("is_self")
+              .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+              .unwrap_or(false);
+            if is_self { continue; }
+            let att_id = att.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if att_id.is_empty() { continue; }
+            let pic_url = att.get("picture_url").and_then(|v| v.as_str());
+            upload_avatar(
+              client, &api_key, &base, &supabase_url, &service_key,
+              &person_id, att_id, pic_url,
+            ).await;
+            break;
           }
         }
       }
@@ -883,6 +899,33 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       } else {
         std::collections::HashMap::new()
       };
+
+      // Inbound pin sync: read pinned status from the external chat
+      if channel == "whatsapp" {
+        let is_pinned = chat.get("pinned")
+          .and_then(|v| v.as_bool())
+          .or_else(|| chat.get("is_pinned").and_then(|v| v.as_bool()))
+          .unwrap_or(false);
+        match client.post(format!("{supabase_url}/rest/v1/rpc/sync_person_pin"))
+          .header("apikey", &service_key)
+          .header("Authorization", format!("Bearer {service_key}"))
+          .header("Content-Type", "application/json")
+          .json(&serde_json::json!({
+            "p_user_id": user_id,
+            "p_person_id": person_id,
+            "p_pinned": is_pinned,
+          }))
+          .send().await
+        {
+          Ok(r) if !r.status().is_success() => {
+            dev_log!("[startup_sync] sync_person_pin failed: {}", r.status());
+          }
+          Err(e) => {
+            dev_log!("[startup_sync] sync_person_pin error: {e}");
+          }
+          _ => {}
+        }
+      }
 
       let msgs_url = match &msg_cutoff {
         Some(ts) => {
@@ -980,6 +1023,28 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
         }
 
+        // Inbound email flag sync: check if email is starred/flagged
+        if channel == "email" {
+          let is_starred = msg.get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r.contains("starred") || r.contains("flagged"))
+            .unwrap_or(false)
+            || msg.get("folders")
+              .and_then(|v| v.as_array())
+              .map(|arr| arr.iter().any(|f|
+                f.as_str().map(|s| s.eq_ignore_ascii_case("STARRED") || s.eq_ignore_ascii_case("FLAGGED")).unwrap_or(false)
+              ))
+              .unwrap_or(false);
+          row.as_object_mut().unwrap().insert(
+            "flagged_at".into(),
+            if is_starred {
+              serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+            } else {
+              serde_json::Value::Null
+            },
+          );
+        }
+
         let insert = client
           .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
           .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
@@ -1051,7 +1116,9 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
             if let Ok(att_body) = att_resp.json::<serde_json::Value>().await {
               if let Some(items) = att_body.get("items").and_then(|v| v.as_array()) {
                 for att in items {
-                  let is_self = att.get("is_self").and_then(|v| v.as_bool()).unwrap_or(false);
+                  let is_self = att.get("is_self")
+                    .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+                    .unwrap_or(false);
                   if is_self { continue; }
                   let att_id = att.get("id").and_then(|v| v.as_str()).unwrap_or("");
                   if att_id.is_empty() { continue; }
@@ -1070,9 +1137,27 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     }
   }
 
+  // Promote pending persons who have outbound messages (user engaged = approved).
+  // This catches persons created with wrong direction during sync/backfill.
+  let promote_resp = client
+    .post(format!("{supabase_url}/rest/v1/rpc/promote_engaged_persons"))
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({ "p_user_id": user_id }))
+    .send().await;
+  let promoted = match promote_resp {
+    Ok(r) if r.status().is_success() => {
+      r.json::<serde_json::Value>().await.ok()
+        .and_then(|v| v.as_i64()).unwrap_or(0) as u32
+    }
+    _ => 0,
+  };
+
   let mut result = format!("Synced {synced} accounts");
   if !to_remove.is_empty() { result.push_str(&format!(", cleaned {}", to_remove.len())); }
   if msgs_synced > 0 { result.push_str(&format!(", backfilled {msgs_synced} msgs (24h)")); }
+  if promoted > 0 { result.push_str(&format!(", promoted {promoted} contacts")); }
 
   emit("done", &result);
   dev_log!("[startup_sync] {result}");
@@ -1131,13 +1216,14 @@ fn map_unipile_status(raw: &str) -> &'static str {
 }
 
 fn normalize_handle(raw: &str, channel: &str) -> String {
+  let is_lid = raw.contains("@lid");
   let mut h = raw
     .replace("@s.whatsapp.net", "")
     .replace("@lid", "")
     .replace("@c.us", "")
     .trim()
     .to_string();
-  if channel == "whatsapp" && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() && h.len() <= 15 {
+  if channel == "whatsapp" && !is_lid && h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() && h.len() <= 15 {
     h = format!("+{h}");
   }
   if (channel == "imessage" || channel == "sms") && !h.is_empty() {
@@ -1192,8 +1278,8 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
       let msg_type = if is_group { "group" } else { "dm" };
 
-      let mut display_name: String;
-      let mut sender_handle: String;
+      let display_name: String;
+      let sender_handle: String;
       let mut dm_attendee_id: Option<String> = None;
       let mut dm_picture_url: Option<String> = None;
       let mut att_phone = String::new();
@@ -1245,9 +1331,9 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           .unwrap_or("")
           .to_string();
 
-        pub_id = chat
-          .get("attendee_public_identifier")
-          .and_then(|v| v.as_str())
+        pub_id = attendee_info
+          .and_then(|a| a.get("public_identifier").and_then(|v| v.as_str()))
+          .or_else(|| chat.get("attendee_public_identifier").and_then(|v| v.as_str()))
           .unwrap_or("")
           .to_string();
 
@@ -1263,42 +1349,38 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           "Unknown".to_string()
         };
 
-        sender_handle = chat
-          .get("attendee_public_identifier")
-          .and_then(|v| v.as_str())
-          .filter(|s| !s.is_empty() && !s.contains("@lid"))
-          .or_else(|| chat.get("attendee_provider_id")
+        // Use the non-self attendee's identifier as the handle (authoritative).
+        // Previously this used chat object fields which could contain the account
+        // owner's ID on Instagram and other channels. The email-specific
+        // self-detection workaround is no longer needed since we use chat_attendees
+        // for all channels now.
+        if let Some(other) = other_attendee {
+          let other_handle = other.get("public_identifier")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty() && !s.contains("@lid")))
-          .or_else(|| chat.get("provider_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty()))
-          .unwrap_or(chat_id)
-          .to_string();
-        sender_handle = normalize_handle(&sender_handle, channel);
-
-        if channel == "email" {
-          let own_email = acc.email.as_deref().unwrap_or("").to_lowercase();
-          if !own_email.is_empty() && sender_handle == own_email {
-            if let Some(other) = other_attendee {
-              let other_id = other.get("identifier")
-                .or_else(|| other.get("provider_id"))
+            .filter(|s| !s.is_empty())
+            .or_else(|| other.get("identifier")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty()))
+            .or_else(|| other.get("provider_id")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty()))
+            .unwrap_or(chat_id);
+          sender_handle = normalize_handle(other_handle, channel);
+        } else {
+          // Fallback: no attendees, use chat object fields
+          sender_handle = normalize_handle(
+            chat.get("attendee_public_identifier")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty() && !s.contains("@lid"))
+              .or_else(|| chat.get("attendee_provider_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-              if !other_id.is_empty() {
-                sender_handle = normalize_handle(other_id, channel);
-                let other_name = other.get("display_name")
-                  .or_else(|| other.get("name"))
-                  .and_then(|v| v.as_str())
-                  .unwrap_or("");
-                if !other_name.is_empty() {
-                  display_name = other_name.to_string();
-                } else {
-                  display_name = sender_handle.clone();
-                }
-              }
-            }
-          }
+                .filter(|s| !s.is_empty() && !s.contains("@lid")))
+              .or_else(|| chat.get("provider_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty()))
+              .unwrap_or(chat_id),
+            channel
+          );
         }
       }
 
@@ -1866,6 +1948,124 @@ async fn log_send_audit(
     .header("Prefer", "return=minimal")
     .body(row.to_string())
     .send().await;
+}
+
+#[tauri::command]
+async fn chat_action(
+  user_id: String,
+  person_id: String,
+  action: String,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  dev_log!("[chat_action] person={person_id} action={action}");
+  let (api_key, base) = unipile_config()?;
+  let supabase_url =
+    std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
+    .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+  let client = &state.http;
+
+  let threads_resp = client
+    .post(format!(
+      "{supabase_url}/rest/v1/rpc/get_person_threads"
+    ))
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({
+      "p_user_id": user_id,
+      "p_person_id": person_id
+    }))
+    .send().await
+    .map_err(|e| format!("chat_action: fetch threads failed: {e}"))?;
+
+  if !threads_resp.status().is_success() {
+    let status = threads_resp.status();
+    let text = threads_resp.text().await.unwrap_or_default();
+    return Err(format!("chat_action: get_person_threads {status}: {text}"));
+  }
+
+  let threads: Vec<serde_json::Value> = threads_resp.json().await.unwrap_or_default();
+
+  let mut synced = 0u32;
+  for thread in &threads {
+    let thread_id = thread.get("thread_id").and_then(|v| v.as_str()).unwrap_or("");
+    let channel = thread.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+    if thread_id.is_empty() { continue; }
+
+    let (unipile_action, unipile_value) = match (action.as_str(), channel) {
+      ("pin", "whatsapp") => ("setPinnedStatus", serde_json::Value::Bool(true)),
+      ("unpin", "whatsapp") => ("setPinnedStatus", serde_json::Value::Bool(false)),
+      ("mark_unread", "whatsapp") | ("mark_unread", "linkedin") =>
+        ("setReadStatus", serde_json::Value::Bool(false)),
+      ("mark_read", "whatsapp") | ("mark_read", "linkedin") =>
+        ("setReadStatus", serde_json::Value::Bool(true)),
+      _ => continue,
+    };
+
+    let url = format!("{base}/api/v1/chats/{thread_id}");
+    let body = serde_json::json!({ "action": unipile_action, "value": unipile_value });
+
+    match client.patch(&url)
+      .header("X-API-KEY", &api_key)
+      .header("Content-Type", "application/json")
+      .json(&body)
+      .send().await
+    {
+      Ok(r) if r.status().is_success() => { synced += 1; }
+      Ok(r) => {
+        let status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        dev_log!("[chat_action] Unipile {channel} {unipile_action} failed: {status} {text}");
+      }
+      Err(e) => {
+        dev_log!("[chat_action] Unipile {channel} request error: {e}");
+      }
+    }
+  }
+
+  dev_log!("[chat_action] synced {synced}/{} threads", threads.len());
+  Ok(format!("{synced}"))
+}
+
+#[tauri::command]
+async fn email_flag_action(
+  email_external_id: String,
+  flagged: bool,
+  state: State<'_, AppState>,
+) -> Result<String, String> {
+  dev_log!("[email_flag_action] email={email_external_id} flagged={flagged}");
+  let (api_key, base) = unipile_config()?;
+  let client = &state.http;
+
+  let url = format!("{base}/api/v1/emails/{email_external_id}");
+  let body = if flagged {
+    serde_json::json!({ "folders": ["STARRED"] })
+  } else {
+    serde_json::json!({ "folders": [] })
+  };
+
+  match client.put(&url)
+    .header("X-API-KEY", &api_key)
+    .header("Content-Type", "application/json")
+    .json(&body)
+    .send().await
+  {
+    Ok(r) if r.status().is_success() => {
+      dev_log!("[email_flag_action] OK for {email_external_id}");
+      Ok("ok".to_string())
+    }
+    Ok(r) => {
+      let status = r.status();
+      let text = r.text().await.unwrap_or_default();
+      dev_log!("[email_flag_action] failed: {status} {text}");
+      Err(format!("email_flag_action: {status}"))
+    }
+    Err(e) => {
+      dev_log!("[email_flag_action] request error: {e}");
+      Err(format!("email_flag_action: {e}"))
+    }
+  }
 }
 
 #[tauri::command]

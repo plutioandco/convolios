@@ -1,14 +1,6 @@
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-      },
-    });
-  }
+import { encryptJson } from "../_shared/crypto.ts";
 
+Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
@@ -87,6 +79,10 @@ Deno.serve(async (req: Request) => {
       "https://api.twitter.com/2/users/me?user.fields=name,username,profile_image_url",
       { headers: { Authorization: `Bearer ${accessToken}` } },
     );
+    if (!meResp.ok) {
+      console.error("[x-callback] /2/users/me failed:", meResp.status);
+      return errorPage("Failed to fetch your X profile. Please try again.");
+    }
     const meBody = await meResp.json();
     const xData = meBody.data ?? {};
     const xUserId = xData.id ?? "";
@@ -94,6 +90,17 @@ Deno.serve(async (req: Request) => {
     const username = xData.username ?? null;
 
     const now = new Date().toISOString();
+    let connectionParams: unknown = {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      x_user_id: xUserId,
+    };
+    try {
+      connectionParams = { encrypted: await encryptJson(connectionParams) };
+    } catch (e) {
+      console.error("[x-callback] encryption unavailable, storing plaintext:", e);
+    }
+
     const accountRow = {
       user_id,
       provider: "x",
@@ -103,11 +110,7 @@ Deno.serve(async (req: Request) => {
       display_name: displayName,
       username,
       provider_type: "X",
-      connection_params: {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        x_user_id: xUserId,
-      },
+      connection_params: connectionParams,
       last_synced_at: now,
       updated_at: now,
     };

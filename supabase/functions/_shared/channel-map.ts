@@ -1,0 +1,16 @@
+export const CHANNEL_MAP: Record<string, string> = {
+  LINKEDIN: "linkedin",
+  WHATSAPP: "whatsapp",
+  INSTAGRAM: "instagram",
+  TELEGRAM: "telegram",
+  MAIL: "email",
+  GMAIL: "email",
+  GOOGLE: "email",
+  GOOGLE_OAUTH: "email",
+  OUTLOOK: "email",
+  MICROSOFT: "email",
+  IMAP: "email",
+  MOBILE: "sms",
+  SMS: "sms",
+  RCS: "sms",
+};

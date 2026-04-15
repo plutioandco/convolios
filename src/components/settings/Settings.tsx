@@ -242,6 +242,16 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
 
   useEffect(() => {
     if (st !== 'waiting') return
+    const timeout = setTimeout(() => {
+      setSt('err')
+      setErrMsg('Connection timed out. Please try again.')
+      timerRef.current = setTimeout(() => setSt('idle'), 6_000)
+    }, 120_000)
+    return () => clearTimeout(timeout)
+  }, [st])
+
+  useEffect(() => {
+    if (st !== 'waiting') return
     const current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     if (current > countBefore.current) {
       setSt('syncing')

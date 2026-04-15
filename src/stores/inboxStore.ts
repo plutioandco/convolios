@@ -4,7 +4,8 @@ import { invoke } from '@tauri-apps/api/core'
 import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
-import type { ConversationPreview } from '../types'
+import type { InfiniteData } from '@tanstack/react-query'
+import type { ConversationPreview, Message } from '../types'
 import type { Channel, TriageLevel } from '../types'
 
 interface InboxState {
@@ -125,17 +126,22 @@ export const useInboxStore = create<InboxState>((set) => ({
   flagMessage: async (userId: string, personId: string, messageId: string, flagged: boolean) => {
     let emailExternalId: string | null = null
 
-    queryClient.setQueriesData<import('../types').Message[]>(
+    queryClient.setQueriesData<InfiniteData<Message[]>>(
       { queryKey: ['thread', personId, userId] },
       (old) => {
         if (!old) return old
-        return old.map((m) => {
-          if (m.id === messageId) {
-            if (m.channel === 'email' && _.isString(m.external_id)) emailExternalId = m.external_id
-            return { ...m, flagged_at: flagged ? new Date().toISOString() : null }
-          }
-          return m
-        })
+        return {
+          ...old,
+          pages: old.pages.map((page) =>
+            page.map((m) => {
+              if (m.id === messageId) {
+                if (m.channel === 'email' && _.isString(m.external_id)) emailExternalId = m.external_id
+                return { ...m, flagged_at: flagged ? new Date().toISOString() : null }
+              }
+              return m
+            })
+          ),
+        }
       }
     )
 

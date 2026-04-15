@@ -1,6 +1,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
 import fuzz from "fuzzball";
 import { doubleMetaphone } from "https://esm.sh/double-metaphone@2";
+import { appCorsHeaders, jsonResponse } from "../_shared/cors.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -200,41 +201,26 @@ function clusterPairs(pairs: Pair[]): Map<string, Set<string>> {
   return clusters;
 }
 
-// ---------------------------------------------------------------------------
-// CORS helpers (consistent with other edge functions)
-// ---------------------------------------------------------------------------
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers":
-      "authorization, x-client-info, apikey, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
-}
-
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders(), "Content-Type": "application/json" },
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 Deno.serve(async (req: Request) => {
+  const origin = req.headers.get("origin");
+  const cors = appCorsHeaders(origin);
+
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders() });
+    return new Response("ok", { headers: cors });
   }
   if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed" }, 405);
+    return jsonResponse({ error: "Method not allowed" }, 405, cors);
   }
 
   // Authenticate via JWT
   const authHeader = req.headers.get("authorization") ?? "";
   const token = authHeader.replace(/^Bearer\s+/i, "");
   if (!token) {
-    return jsonResponse({ error: "Missing authorization header" }, 401);
+    return jsonResponse({ error: "Missing authorization header" }, 401, cors);
   }
 
   const {
@@ -242,7 +228,7 @@ Deno.serve(async (req: Request) => {
     error: authError,
   } = await supabase.auth.getUser(token);
   if (authError || !user) {
-    return jsonResponse({ error: "Unauthorized" }, 401);
+    return jsonResponse({ error: "Unauthorized" }, 401, cors);
   }
   const userId = user.id;
 
@@ -257,41 +243,43 @@ Deno.serve(async (req: Request) => {
 
     // Fetch identities for all those persons
     const personIds = (persons ?? []).map((p: { id: string }) => p.id);
-    if (personIds.length === 0) return jsonResponse([]);
+    if (personIds.length === 0) return jsonResponse([], 200, cors);
 
-    const { data: identities, error: iErr } = await supabase
-      .from("identities")
-      .select("person_id, channel")
-      .in("person_id", personIds);
-    if (iErr) throw iErr;
+    const [identitiesResult, groupResult, msgCountResult, dismissedResult] =
+      await Promise.all([
+        supabase
+          .from("identities")
+          .select("person_id, channel")
+          .in("person_id", personIds),
+        supabase
+          .from("messages")
+          .select("person_id")
+          .eq("user_id", userId)
+          .eq("message_type", "group")
+          .not("person_id", "is", null),
+        supabase
+          .rpc("get_person_message_counts", { p_user_id: userId })
+          .select("*"),
+        supabase
+          .from("merge_dismissed")
+          .select("person_a, person_b")
+          .eq("user_id", userId),
+      ]);
 
-    // Identify group persons (have group-type messages)
-    const { data: groupRows } = await supabase
-      .from("messages")
-      .select("person_id")
-      .eq("user_id", userId)
-      .eq("message_type", "group")
-      .not("person_id", "is", null);
+    if (identitiesResult.error) throw identitiesResult.error;
+    const identities = identitiesResult.data;
+
     const groupPersonIds = new Set(
-      (groupRows ?? []).map((r: { person_id: string }) => r.person_id)
+      (groupResult.data ?? []).map((r: { person_id: string }) => r.person_id)
     );
 
-    // Fetch message counts per person for keep-person selection
-    const { data: msgCountRows } = await supabase
-      .rpc("get_person_message_counts", { p_user_id: userId })
-      .select("*");
     const msgCounts = new Map<string, number>();
-    for (const r of msgCountRows ?? []) {
+    for (const r of msgCountResult.data ?? []) {
       msgCounts.set(r.person_id, r.msg_count);
     }
 
-    // Fetch dismissed pairs
-    const { data: dismissedRows } = await supabase
-      .from("merge_dismissed")
-      .select("person_a, person_b")
-      .eq("user_id", userId);
     const dismissed = new Set(
-      (dismissedRows ?? []).map(
+      (dismissedResult.data ?? []).map(
         (d: { person_a: string; person_b: string }) => `${d.person_a}|${d.person_b}`
       )
     );
@@ -355,7 +343,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    if (qualifyingPairs.length === 0) return jsonResponse([]);
+    if (qualifyingPairs.length === 0) return jsonResponse([], 200, cors);
 
     // Cluster pairs
     const clusters = clusterPairs(qualifyingPairs);
@@ -409,12 +397,13 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    return jsonResponse(result);
+    return jsonResponse(result, 200, cors);
   } catch (err) {
     console.error("merge-suggestions error:", err);
     return jsonResponse(
       { error: err instanceof Error ? err.message : "Internal error" },
-      500
+      500,
+      cors,
     );
   }
 });

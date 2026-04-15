@@ -1,4 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
+import { jsonResponse } from "../_shared/cors.ts";
+import { CHANNEL_MAP } from "../_shared/channel-map.ts";
+import { verifyWebhookSecret } from "../_shared/auth.ts";
+import { validateWebhookBase, validateMessageEvent, validateEmailEvent } from "../_shared/validate.ts";
+import { initLogger, log } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -11,23 +16,6 @@ const UNIPILE_API_KEY = Deno.env.get("UNIPILE_API_KEY") ?? "";
 const UNIPILE_API_URL = Deno.env.get("UNIPILE_API_URL") ?? "";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-const CHANNEL_MAP: Record<string, string> = {
-  LINKEDIN: "linkedin",
-  WHATSAPP: "whatsapp",
-  INSTAGRAM: "instagram",
-  TELEGRAM: "telegram",
-  MAIL: "email",
-  GMAIL: "email",
-  GOOGLE: "email",
-  GOOGLE_OAUTH: "email",
-  OUTLOOK: "email",
-  MICROSOFT: "email",
-  IMAP: "email",
-  MOBILE: "sms",
-  SMS: "sms",
-  RCS: "sms",
-};
 
 interface UnipileWebhook {
   account_id: string;
@@ -88,13 +76,11 @@ function resolveAccount(accountId: string) {
     .eq("account_id", accountId)
     .eq("provider", "unipile")
     .limit(1)
-    .single();
+    .maybeSingle();
 }
 
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders() });
-  }
+  initLogger("unipile-webhook");
 
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
@@ -108,15 +94,34 @@ Deno.serve(async (req: Request) => {
     req.headers.get("x-webhook-secret") ??
     req.headers.get("Unipile-Auth") ??
     "";
-  if (authHeader !== WEBHOOK_SECRET) {
-    console.error("Webhook auth failed");
+  if (!await verifyWebhookSecret(authHeader, WEBHOOK_SECRET)) {
+    log.error("Webhook auth failed");
     return new Response("Unauthorized", { status: 401 });
   }
 
+  let payload: Record<string, unknown>;
   try {
-    const payload = await req.json();
-    const event = payload.event as string;
+    payload = await req.json();
+  } catch {
+    return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+  }
 
+  const baseCheck = validateWebhookBase(payload);
+  if (!baseCheck.valid) {
+    return jsonResponse({ ok: false, error: baseCheck.error }, 400);
+  }
+
+  const event = payload.event as string;
+
+  if (event === "message_received") {
+    const check = validateMessageEvent(payload);
+    if (!check.valid) return jsonResponse({ ok: false, error: check.error }, 400);
+  } else if (event === "mail_received" || event === "mail_sent") {
+    const check = validateEmailEvent(payload);
+    if (!check.valid) return jsonResponse({ ok: false, error: check.error }, 400);
+  }
+
+  try {
     switch (event) {
       case "message_received":
         return await handleMessageReceived(payload);
@@ -146,11 +151,11 @@ Deno.serve(async (req: Request) => {
       case "credentials":
         return await handleAccountStatus(payload);
       default:
-        console.warn("Unhandled webhook event:", event);
+        log.warn("Unhandled webhook event", { event });
         return jsonResponse({ ok: true, skipped: event });
     }
   } catch (err) {
-    console.error("Webhook handler error:", err);
+    log.error("Webhook handler error", { error: String(err) });
     return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 });
@@ -193,7 +198,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
 
   const account = accountResult.data;
   if (!account) {
-    console.error("No connected account found for", payload.account_id);
+    log.error("No connected account found", { account_id: payload.account_id });
     return jsonResponse({ ok: false, error: "unknown_account" }, 400);
   }
 
@@ -449,18 +454,20 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       chat_provider_id: fullMsg?.chat_provider_id ?? null,
       folder: chatInfo.folder ?? null,
     },
-    { onConflict: "external_id", ignoreDuplicates: false }
+    { onConflict: "user_id,external_id", ignoreDuplicates: false }
   );
 
   if (msgError) {
-    console.error("Insert message error:", msgError);
+    log.error("Insert message error", { error: msgError.message });
     return jsonResponse({ ok: false, error: msgError.message }, 500);
   }
 
   const response = jsonResponse({ ok: true, direction, channel, person_id: personId });
 
   if (GEMINI_API_KEY && direction === "inbound" && payload.message) {
-    triageMessage(payload.message_id, payload.message).catch(() => {});
+    triageMessage(payload.message_id, payload.message).catch((err) => {
+      log.error("Triage failed", { message_id: payload.message_id, error: String(err) });
+    });
   }
 
   return response;
@@ -492,7 +499,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
       { headers: { "X-API-KEY": UNIPILE_API_KEY } }
     );
     if (!res.ok) {
-      console.error("Email fetch failed:", res.status);
+      log.error("Email fetch failed", { status: res.status });
       return jsonResponse({ ok: false, error: `email_fetch_${res.status}` }, 502);
     }
 
@@ -522,14 +529,15 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
         ...(em.to_attendees ?? []).slice(1),
         ...(em.cc_attendees ?? []),
         ...(em.bcc_attendees ?? []),
-      ];
-      for (const r of allRecipients) {
-        const addr = r?.identifier?.toLowerCase();
-        if (addr && addr !== otherAddr) {
-          findOrCreatePerson(userId, "email", addr, r?.display_name ?? addr, accountId, "outbound")
-            .catch(() => {});
-        }
-      }
+      ].slice(0, 50);
+      await Promise.allSettled(
+        allRecipients.map((r) => {
+          const addr = r?.identifier?.toLowerCase();
+          if (!addr || addr === otherAddr) return Promise.resolve();
+          return findOrCreatePerson(userId, "email", addr, r?.display_name ?? addr, accountId, "outbound")
+            .catch((err) => { log.warn("Email recipient creation failed", { addr, error: String(err) }); });
+        })
+      );
     }
 
     const folders = Array.isArray(em.folders) ? em.folders : [];
@@ -559,11 +567,11 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
         seen: em.read_date ? true : false,
         read_at: em.read_date ?? null,
       },
-      { onConflict: "external_id", ignoreDuplicates: false }
+      { onConflict: "user_id,external_id", ignoreDuplicates: false }
     );
 
     if (msgError) {
-      console.error("Email insert error:", msgError);
+      log.error("Email insert error", { error: msgError.message });
       return jsonResponse({ ok: false, error: msgError.message }, 500);
     }
 
@@ -573,7 +581,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
 
     return jsonResponse({ ok: true, direction, channel: "email", person_id: personId });
   } catch (err) {
-    console.error("Email handler error:", err);
+    log.error("Email handler error", { error: String(err) });
     return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 }
@@ -594,11 +602,18 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
     .from("messages")
     .select("reactions")
     .eq("external_id", messageId)
-    .single();
+    .maybeSingle();
 
   if (!existing) return jsonResponse({ ok: true, skipped: "message_not_found" });
 
   const reactions = Array.isArray(existing.reactions) ? [...existing.reactions] : [];
+  const isDuplicate = reactions.some(
+    (r: { value?: string; sender_id?: string }) =>
+      r.value === reactionEmoji && r.sender_id === senderId,
+  );
+  if (isDuplicate) {
+    return jsonResponse({ ok: true, skipped: "duplicate_reaction" });
+  }
   reactions.push({
     value: reactionEmoji,
     sender_id: senderId,
@@ -610,7 +625,7 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
     .eq("external_id", messageId);
 
   if (error) {
-    console.error("Reaction update error:", error);
+    log.error("Reaction update error", { error: error.message });
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
@@ -677,7 +692,7 @@ async function handleMessageEdited(payload: Record<string, unknown>): Promise<Re
     .eq("external_id", messageId);
 
   if (error) {
-    console.error("Edit update error:", error);
+    log.error("Edit update error", { error: error.message });
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
@@ -690,11 +705,11 @@ async function handleMessageDeleted(payload: Record<string, unknown>): Promise<R
 
   const { error } = await supabase
     .from("messages")
-    .delete()
+    .update({ deleted: true, deleted_at: new Date().toISOString() })
     .eq("external_id", messageId);
 
   if (error) {
-    console.error("Message hard-delete error:", error);
+    log.error("Message soft-delete error", { error: error.message });
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
@@ -752,7 +767,7 @@ async function handleAccountStatus(payload: Record<string, unknown>): Promise<Re
     .eq("provider", "unipile");
 
   if (error) {
-    console.error("Account status update error:", error);
+    log.error("Account status update error", { error: error.message });
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
@@ -805,7 +820,7 @@ async function enrichAttachments(
       return fullAtts;
     }
   } catch (err) {
-    console.error("Failed to enrich attachments:", err);
+    log.error("Failed to enrich attachments", { error: String(err) });
   }
 
   return webhookAtts;
@@ -824,7 +839,7 @@ async function fetchChatAttendees(
     const data = await res.json();
     return data.items ?? [];
   } catch (err) {
-    console.error("Failed to fetch chat attendees:", err);
+    log.error("Failed to fetch chat attendees", { error: String(err) });
     return [];
   }
 }
@@ -848,7 +863,7 @@ async function fetchChatInfo(
       attendee_provider_id: data.attendee_provider_id ?? undefined,
     };
   } catch (err) {
-    console.error("Failed to fetch chat info:", err);
+    log.error("Failed to fetch chat info", { error: String(err) });
     return {};
   }
 }
@@ -886,7 +901,7 @@ async function findOrCreatePerson(
     .eq("handle", normalizedHandle)
     .eq("user_id", userId)
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (existingIdentity) {
     if (displayName && displayName !== "Unknown" && displayName !== "unknown") {
@@ -917,7 +932,7 @@ async function findOrCreatePerson(
     .in("handle", rawVariants)
     .eq("user_id", userId)
     .limit(1)
-    .single();
+    .maybeSingle();
 
   if (variantIdentity) {
     if (displayName && displayName !== "Unknown" && displayName !== "unknown") {
@@ -969,7 +984,7 @@ async function findOrCreatePerson(
       .eq("handle", normalizedHandle)
       .eq("user_id", userId)
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (raceIdentity) {
       // Clean up the orphaned person we just created
@@ -1013,7 +1028,7 @@ Category:`;
     );
 
     if (!res.ok) {
-      console.error("Gemini triage error:", res.status, await res.text());
+      log.error("Gemini triage error", { status: res.status });
       return;
     }
 
@@ -1030,21 +1045,7 @@ Category:`;
       .update({ triage })
       .eq("external_id", messageId);
   } catch (err) {
-    console.error("Triage failed (non-blocking):", err);
+    log.error("Triage failed", { error: String(err) });
   }
 }
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, unipile-auth",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
-}
-
-function jsonResponse(body: Record<string, unknown>, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders(), "Content-Type": "application/json" },
-  });
-}

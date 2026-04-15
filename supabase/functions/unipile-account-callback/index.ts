@@ -1,4 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
+import { jsonResponse } from "../_shared/cors.ts";
+import { CHANNEL_MAP } from "../_shared/channel-map.ts";
+import { verifyWebhookSecret } from "../_shared/auth.ts";
+import { validateAccountCallbackPayload } from "../_shared/validate.ts";
+import { initLogger, log } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -11,24 +16,8 @@ const CALLBACK_SECRET = Deno.env.get("UNIPILE_CALLBACK_SECRET") ?? "";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const CHANNEL_MAP: Record<string, string> = {
-  LINKEDIN: "linkedin",
-  WHATSAPP: "whatsapp",
-  INSTAGRAM: "instagram",
-  TELEGRAM: "telegram",
-  MAIL: "email",
-  GMAIL: "email",
-  GOOGLE: "email",
-  GOOGLE_OAUTH: "email",
-  OUTLOOK: "email",
-  MICROSOFT: "email",
-  IMAP: "email",
-};
-
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders() });
-  }
+  initLogger("unipile-account-callback");
 
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
@@ -40,19 +29,25 @@ Deno.serve(async (req: Request) => {
     }
 
     const authHeader = req.headers.get("x-callback-secret") ?? "";
-    if (authHeader !== CALLBACK_SECRET) {
+    if (!await verifyWebhookSecret(authHeader, CALLBACK_SECRET)) {
       return jsonResponse({ ok: false, error: "unauthorized" }, 401);
     }
 
-    const payload = await req.json();
+    let payload: Record<string, unknown>;
+    try {
+      payload = await req.json();
+    } catch {
+      return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+    }
+
+    const validation = validateAccountCallbackPayload(payload);
+    if (!validation.valid) {
+      return jsonResponse({ ok: false, error: validation.error }, 400);
+    }
 
     const status = payload.status;
-    const accountId = payload.account_id;
-    const userId = payload.name;
-
-    if (!accountId || !userId) {
-      return jsonResponse({ ok: false, error: "missing account_id or name" }, 400);
-    }
+    const accountId = payload.account_id as string;
+    const userId = payload.name as string;
 
     if (status !== "CREATION_SUCCESS" && status !== "RECONNECTED") {
       return jsonResponse({ ok: true, skipped: status });
@@ -90,7 +85,7 @@ Deno.serve(async (req: Request) => {
           else if (accType === "INSTAGRAM" || accType === "TELEGRAM") username = cp?.im?.username ?? null;
         }
       } catch (err) {
-        console.error("Failed to fetch account type from Unipile:", err);
+        log.error("Failed to fetch account type from Unipile", { error: String(err) });
       }
     }
 
@@ -121,30 +116,15 @@ Deno.serve(async (req: Request) => {
         .insert(row);
 
       if (insertError) {
-        console.error("Insert account error:", insertError);
+        log.error("Insert account error", { error: insertError.message });
         return jsonResponse({ ok: false, error: insertError.message }, 500);
       }
     }
 
     return jsonResponse({ ok: true, account_id: accountId, channel });
   } catch (err) {
-    console.error("Account callback error:", err);
+    log.error("Account callback error", { error: String(err) });
     return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
 });
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers":
-      "authorization, x-client-info, apikey, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
-}
-
-function jsonResponse(body: Record<string, unknown>, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders(), "Content-Type": "application/json" },
-  });
-}

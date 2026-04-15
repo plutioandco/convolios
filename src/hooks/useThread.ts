@@ -38,6 +38,13 @@ export function removePending(personId: string, optId: string) {
   notify()
 }
 
+export function patchPendingExternalId(personId: string, optId: string, externalId: string) {
+  const list = pending.get(personId)
+  if (!list) return
+  pending.set(personId, list.map((m) => m.id === optId ? { ...m, external_id: externalId } : m))
+  notify()
+}
+
 function usePendingMessages(personId: string | null): Message[] {
   const store = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   return personId ? store.get(personId) ?? [] : []
@@ -45,6 +52,9 @@ function usePendingMessages(personId: string | null): Message[] {
 
 function isMatch(real: Message, opt: Message): boolean {
   if (real.direction !== 'outbound') return false
+  if (_.isString(real.external_id) && _.isString(opt.external_id)) {
+    return real.external_id === opt.external_id
+  }
   if ((real.body_text ?? '').trim() !== (opt.body_text ?? '').trim()) return false
   const realT = new Date(real.sent_at).getTime()
   const optT = new Date(opt.sent_at).getTime()

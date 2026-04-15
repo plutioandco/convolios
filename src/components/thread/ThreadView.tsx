@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
-import { useThread, addPendingMessage, markPendingFailed, removePending, useCancelThreadQueries } from '../../hooks/useThread'
+import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { supabase } from '../../lib/supabase'
 import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
@@ -1288,12 +1288,12 @@ export function ThreadView() {
               const prevIsMe = prev ? isMine(prev, mySenderNames) : false
               const msgIsGroup = msg.message_type === 'group'
               const prevIsGroup = prev?.message_type === 'group'
-              const sameGroup = !showDivider && prev && !isSystemEvent(prev) &&
-                isMe === prevIsMe &&
+              const sameSender = prev && (msgIsGroup
+                ? (isMe && prevIsMe) ||
+                  (_.isString(prev.sender_name) && prev.sender_name === msg.sender_name)
+                : isMe === prevIsMe)
+              const sameGroup = !showDivider && sameSender && !isSystemEvent(prev) && !isReactionMsg(prev) &&
                 msgIsGroup === prevIsGroup &&
-                (msgIsGroup
-                  ? (_.isString(prev.sender_name) && prev.sender_name === msg.sender_name)
-                  : prev.person_id === msg.person_id) &&
                 (new Date(msg.sent_at).getTime() - new Date(prev.sent_at).getTime() <= 420_000)
 
               return (
@@ -1984,18 +1984,21 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
     ;(async () => {
       try {
         if (filesToSend.length > 0) {
-          for (const f of filesToSend) {
-            await invoke<string>('send_attachment', {
+          for (let i = 0; i < filesToSend.length; i++) {
+            const f = filesToSend[i]
+            const extId = await invoke<string>('send_attachment', {
               chatId: resolvedChatId,
-              text: body || null,
+              text: i === 0 ? (body || null) : null,
               fileName: f.name,
               fileData: f.data,
               mimeType: f.mime,
               ...meta,
             })
+            if (i === 0 && extId) patchPendingExternalId(personId, optId, extId)
           }
         } else {
-          await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
+          const extId = await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
+          if (extId) patchPendingExternalId(personId, optId, extId)
         }
         invalidateThread()
       } catch (e) {

@@ -38,6 +38,7 @@ jobs:
           rm certificate.p12
 
       - name: Build Tauri app
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -56,3 +57,51 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+      - name: Generate and upload latest.json if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          # Check if latest.json already exists in the release
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q "latest.json"; then
+            echo "latest.json already uploaded by tauri-action, skipping."
+            exit 0
+          fi
+
+          echo "latest.json not found — generating manually."
+
+          # Find the sig file and tar.gz
+          SIG_FILE=$(find src-tauri/target/release/bundle -name "*.app.tar.gz.sig" | head -1)
+          TAR_FILE=$(find src-tauri/target/release/bundle -name "*.app.tar.gz" | head -1)
+
+          if [ -z "$SIG_FILE" ] || [ -z "$TAR_FILE" ]; then
+            echo "ERROR: Could not find .sig or .tar.gz file"
+            find src-tauri/target/release/bundle -type f -name "*.sig" -o -name "*.tar.gz" | sort
+            exit 1
+          fi
+
+          SIGNATURE=$(cat "$SIG_FILE")
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/$(basename "$TAR_FILE")"
+
+          cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "notes": "See the assets for download links.",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${SIGNATURE}",
+                "url": "${DOWNLOAD_URL}"
+              }
+            }
+          }
+          EOF
+
+          # Also upload the sig file
+          gh release upload "$TAG" "$SIG_FILE" --clobber || true
+          gh release upload "$TAG" latest.json --clobber
+          echo "Uploaded latest.json and sig file to release."

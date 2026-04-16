@@ -459,7 +459,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
 
   if (msgError) {
     log.error("Insert message error", { error: msgError.message });
-    return jsonResponse({ ok: false, error: msgError.message }, 500);
+    return jsonResponse({ ok: false, error: "insert_failed" }, 500);
   }
 
   const response = jsonResponse({ ok: true, direction, channel, person_id: personId });
@@ -576,7 +576,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
 
     if (msgError) {
       log.error("Email insert error", { error: msgError.message });
-      return jsonResponse({ ok: false, error: msgError.message }, 500);
+      return jsonResponse({ ok: false, error: "insert_failed" }, 500);
     }
 
     if (GEMINI_API_KEY && direction === "inbound" && em.subject) {
@@ -630,7 +630,7 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
 
   if (error) {
     log.error("Reaction update error", { error: error.message });
-    return jsonResponse({ ok: false, error: error.message }, 500);
+    return jsonResponse({ ok: false, error: "reaction_update_failed" }, 500);
   }
 
   return jsonResponse({ ok: true, event: "reaction" });
@@ -697,7 +697,7 @@ async function handleMessageEdited(payload: Record<string, unknown>): Promise<Re
 
   if (error) {
     log.error("Edit update error", { error: error.message });
-    return jsonResponse({ ok: false, error: error.message }, 500);
+    return jsonResponse({ ok: false, error: "edit_update_failed" }, 500);
   }
 
   return jsonResponse({ ok: true, event: "edited" });
@@ -714,7 +714,7 @@ async function handleMessageDeleted(payload: Record<string, unknown>): Promise<R
 
   if (error) {
     log.error("Message soft-delete error", { error: error.message });
-    return jsonResponse({ ok: false, error: error.message }, 500);
+    return jsonResponse({ ok: false, error: "delete_update_failed" }, 500);
   }
 
   return jsonResponse({ ok: true, event: "deleted" });
@@ -798,7 +798,7 @@ async function handleAccountStatus(payload: Record<string, unknown>): Promise<Re
 
   if (error) {
     log.error("Account status update error", { error: error.message });
-    return jsonResponse({ ok: false, error: error.message }, 500);
+    return jsonResponse({ ok: false, error: "status_update_failed" }, 500);
   }
 
   return jsonResponse({ ok: true, event, status });

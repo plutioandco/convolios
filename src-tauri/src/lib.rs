@@ -2530,27 +2530,29 @@ async fn refresh_and_store_x_token(
   new_params["refresh_token"] = serde_json::Value::String(new_refresh.to_string());
 
   let store_params = match encrypt_x_params(&new_params) {
-    Ok(p) => p,
+    Ok(p) => Some(p),
     Err(e) => {
-      dev_log!("[x-refresh] encrypt failed, storing plaintext: {e}");
-      new_params
+      dev_log!("[x-refresh] encrypt failed, skipping token persist: {e}");
+      None
     }
   };
 
   let update_url = format!(
     "{sb_url}/rest/v1/connected_accounts?user_id=eq.{user_id}&channel=eq.x&account_id=eq.{account_id}"
   );
-  let _ = client
-    .patch(&update_url)
-    .header("apikey", sb_key)
-    .header("Authorization", format!("Bearer {sb_key}"))
-    .header("Content-Type", "application/json")
-    .json(&serde_json::json!({
-      "connection_params": store_params,
-      "updated_at": chrono::Utc::now().to_rfc3339(),
-    }))
-    .send()
-    .await;
+  if let Some(store_params) = store_params.as_ref() {
+    let _ = client
+      .patch(&update_url)
+      .header("apikey", sb_key)
+      .header("Authorization", format!("Bearer {sb_key}"))
+      .header("Content-Type", "application/json")
+      .json(&serde_json::json!({
+        "connection_params": store_params,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+      }))
+      .send()
+      .await;
+  }
 
   Ok((new_access.to_string(), account_id.to_string()))
 }
@@ -3341,7 +3343,25 @@ async fn fetch_attachment(message_id: String, attachment_id: String, channel: Op
     .unwrap_or("application/octet-stream")
     .to_string();
 
+  if let Some(len) = response.content_length() {
+    if len > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+      return Err(format!(
+        "Attachment is {:.1}MB — exceeds {}MB limit",
+        len as f64 / (1024.0 * 1024.0),
+        MAX_ATTACHMENT_DOWNLOAD_BYTES / (1024 * 1024)
+      ));
+    }
+  }
+
   let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
+
+  if bytes.len() as u64 > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+    return Err(format!(
+      "Attachment is {:.1}MB — exceeds {}MB limit",
+      bytes.len() as f64 / (1024.0 * 1024.0),
+      MAX_ATTACHMENT_DOWNLOAD_BYTES / (1024 * 1024)
+    ));
+  }
 
   if bytes.is_empty() {
     return Ok(String::new());
@@ -3357,6 +3377,8 @@ async fn fetch_attachment(message_id: String, attachment_id: String, channel: Op
   let b64 = base64_encode(&bytes);
   Ok(format!("data:{content_type};base64,{b64}"))
 }
+
+const MAX_ATTACHMENT_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 #[tauri::command]
 async fn open_attachment(message_id: String, attachment_id: String, channel: Option<String>, filename: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
@@ -3420,6 +3442,7 @@ async fn open_attachment(message_id: String, attachment_id: String, channel: Opt
 #[tauri::command]
 async fn fetch_chat_avatars(
   chat_id: String,
+  user_id: String,
   state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
   let (api_key, base) = unipile_config()?;
@@ -3428,6 +3451,7 @@ async fn fetch_chat_avatars(
   let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
     .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
   let client = &state.http;
+  let user_scope = urlencoding::encode(&user_id);
 
   let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
   let resp = client.get(&att_url).header("X-API-KEY", &api_key).send().await
@@ -3460,7 +3484,7 @@ async fn fetch_chat_avatars(
     if !att_provider_id.is_empty() || !att_pub_id.is_empty() {
       let handle_to_find = if !att_pub_id.is_empty() { att_pub_id } else { att_provider_id };
       let identity_url = format!(
-        "{supabase_url}/rest/v1/identities?handle=eq.{}&select=person_id",
+        "{supabase_url}/rest/v1/identities?handle=eq.{}&user_id=eq.{user_scope}&select=person_id",
         urlencoding::encode(handle_to_find)
       );
       if let Some(pid) = client.get(&identity_url)
@@ -3476,7 +3500,7 @@ async fn fetch_chat_avatars(
             .and_then(|v| v.as_str())
           {
             let purl = format!(
-              "{supabase_url}/rest/v1/persons?id=eq.{pid_str}&select=id,avatar_url,avatar_stale"
+              "{supabase_url}/rest/v1/persons?id=eq.{pid_str}&user_id=eq.{user_scope}&select=id,avatar_url,avatar_stale"
             );
             if let Some(pr) = client.get(&purl)
               .header("apikey", &service_key)
@@ -3494,7 +3518,7 @@ async fn fetch_chat_avatars(
 
     if person_data.is_none() {
       let person_url = format!(
-        "{supabase_url}/rest/v1/persons?display_name=eq.{}&select=id,avatar_url,avatar_stale",
+        "{supabase_url}/rest/v1/persons?display_name=eq.{}&user_id=eq.{user_scope}&select=id,avatar_url,avatar_stale",
         urlencoding::encode(&att_name)
       );
       if let Some(r) = client.get(&person_url)
@@ -3794,10 +3818,23 @@ fn base64_encode(data: &[u8]) -> String {
   String::from_utf8(buf).unwrap()
 }
 
+const MAX_DROPPED_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
 #[tauri::command]
 async fn read_dropped_files(paths: Vec<String>) -> Result<Vec<serde_json::Value>, String> {
     let mut results = Vec::new();
     for p in &paths {
+        let meta = std::fs::metadata(p).map_err(|e| format!("Stat {p}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("Not a regular file: {p}"));
+        }
+        if meta.len() > MAX_DROPPED_FILE_BYTES {
+            return Err(format!(
+                "{p} is {:.1}MB — attachments are limited to {}MB.",
+                meta.len() as f64 / (1024.0 * 1024.0),
+                MAX_DROPPED_FILE_BYTES / (1024 * 1024)
+            ));
+        }
         let data = std::fs::read(p).map_err(|e| format!("Read {p}: {e}"))?;
         let name = std::path::Path::new(p)
             .file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();

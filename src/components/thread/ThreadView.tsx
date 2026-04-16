@@ -25,6 +25,7 @@ import type { Message, Channel, Identity } from '../../types'
 
 const URL_SPLIT_RE = /(https?:\/\/[^\s<>]+)/g
 const URL_TEST_RE = /^https?:\/\//
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 
 function RichText({ text }: { text: string }) {
   const parts = text.split(URL_SPLIT_RE)
@@ -607,7 +608,7 @@ function sanitizeEmailHtml(html: string): string {
   const doc = new DOMParser().parseFromString(html, 'text/html')
 
   doc.querySelectorAll(
-    'script, style, meta[http-equiv], base, object, embed, applet, form, link[rel="stylesheet"]'
+    'script, style, meta[http-equiv], base, object, embed, applet, form, iframe, frame, frameset, link, svg, math, portal'
   ).forEach((el) => el.remove())
 
   const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT)
@@ -638,9 +639,12 @@ function sanitizeEmailHtml(html: string): string {
     const remove: string[] = []
     for (const attr of el.attributes) {
       if (attr.name.startsWith('on')) { remove.push(attr.name); continue }
-      if ((attr.name === 'href' || attr.name === 'src' || attr.name === 'action') &&
-          attr.value.trim().toLowerCase().startsWith('javascript:')) {
-        remove.push(attr.name)
+      if (attr.name === 'srcdoc' || attr.name === 'formaction') { remove.push(attr.name); continue }
+      if (attr.name === 'href' || attr.name === 'src' || attr.name === 'action' || attr.name === 'xlink:href') {
+        const v = attr.value.replace(/[\u0000-\u001F\u007F]/g, '').trim().toLowerCase()
+        if (v.startsWith('javascript:') || v.startsWith('vbscript:') || v.startsWith('data:text/html') || v.startsWith('data:application/')) {
+          remove.push(attr.name)
+        }
       }
     }
     remove.forEach((n) => el.removeAttribute(n))
@@ -1094,8 +1098,8 @@ export function ThreadView() {
             map[p.display_name] = p.avatar_url
           }
         }
-        if (chatId && isGroup) {
-          invoke<Record<string, string>>('fetch_chat_avatars', { chatId })
+        if (chatId && isGroup && user?.id) {
+          invoke<Record<string, string>>('fetch_chat_avatars', { chatId, userId: user.id })
             .then((apiMap) => {
               if (!cancelled) setMemberAvatars({ ...apiMap, ...map })
             })
@@ -1695,6 +1699,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
 }) {
   const [text, setText] = useState('')
   const [files, setFiles] = useState<{ name: string; data: string; mime: string; preview: string }[]>([])
+  const [sendError, setSendError] = useState<string | null>(null)
 
   useEffect(() => {
     if (pendingDropFiles?.length) {
@@ -1762,6 +1767,10 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const addFiles = (fileList: FileList | null) => {
     if (!fileList) return
     Array.from(fileList).forEach((f) => {
+      if (f.size > MAX_ATTACHMENT_BYTES) {
+        setSendError(`${f.name} is ${Math.round(f.size / (1024 * 1024))}MB — attachments are limited to ${MAX_ATTACHMENT_BYTES / (1024 * 1024)}MB.`)
+        return
+      }
       const reader = new FileReader()
       reader.onload = () => {
         const result = reader.result as string
@@ -1997,6 +2006,13 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
               }} className="failed-msg-retry">Retry</button>
             </div>
           ))}
+        </div>
+      )}
+
+      {sendError && (
+        <div className="failed-msg-row mb-1.5">
+          <span className="failed-msg-text">{sendError}</span>
+          <button onClick={() => setSendError(null)} className="failed-msg-retry">Dismiss</button>
         </div>
       )}
 

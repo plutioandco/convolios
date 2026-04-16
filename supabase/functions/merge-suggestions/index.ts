@@ -330,7 +330,7 @@ Deno.serve(async (req: Request) => {
         const hi = a.id < b.id ? b.id : a.id;
         if (dismissed.has(`${lo}|${hi}`)) continue;
 
-        const { score, method } = scorePair(a.name, b.name);
+        const { score } = scorePair(a.name, b.name);
         if (score < 75) continue;
 
         qualifyingPairs.push({

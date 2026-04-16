@@ -117,7 +117,7 @@ Deno.serve(async (req: Request) => {
 
       if (insertError) {
         log.error("Insert account error", { error: insertError.message });
-        return jsonResponse({ ok: false, error: insertError.message }, 500);
+        return jsonResponse({ ok: false, error: "insert_account_failed" }, 500);
       }
     }
 

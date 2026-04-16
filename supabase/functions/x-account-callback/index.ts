@@ -95,11 +95,12 @@ Deno.serve(async (req: Request) => {
       refresh_token: refreshToken,
       x_user_id: xUserId,
     };
-    let connectionParams: unknown = plainParams;
+    let connectionParams: unknown;
     try {
       connectionParams = { encrypted: await encryptJson(plainParams) };
-    } catch {
-      // TOKEN_ENCRYPTION_KEY not configured — store plaintext (backward compat)
+    } catch (err) {
+      console.error("[x-account-callback] TOKEN_ENCRYPTION_KEY unavailable — refusing to store plaintext tokens", { error: String(err) });
+      return errorPage("Server is not configured to securely store account credentials. Please contact support.");
     }
 
     const accountRow = {

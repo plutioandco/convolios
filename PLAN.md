@@ -1,15 +1,17 @@
 # Convolios — Master Plan
-_Last updated: April 6, 2026_
+_Last updated: April 16, 2026_
 
 **The Single Source of Truth for Every Conversation.**
 
 Convolios merges fragmented communication channels into one AI-enriched inbox, organized by Person, not by App.
 
+For the current implementation reference (commands, hooks, schema, migration history) see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ---
 
 ## Vision
 
-A founder/operator opens Convolios in the morning. Every conversation — WhatsApp, LinkedIn, email, Instagram, Telegram, X, Slack, ClickUp — is in one timeline. AI has already triaged noise, surfaced what's urgent, and drafted replies matching their voice. Before a meeting, they get a Context Brief summarizing the entire relationship history across channels. They reply from one compose window; Convolios routes it to the right channel.
+A founder/operator opens Convolios in the morning. Every conversation — WhatsApp, LinkedIn, email, Instagram, Telegram, X, iMessage — is in one timeline. AI has already triaged noise, surfaced what's urgent, and drafted replies matching their voice. Before a meeting, they get a Context Brief summarizing the entire relationship history across channels. They reply from one compose window; Convolios routes it to the right channel.
 
 ---
 
@@ -21,38 +23,31 @@ Solo founders, single-person companies, high-level operators managing relationsh
 
 ## Channel Support
 
-### Phase 1 — Unipile (managed API, white-labeled)
-| Channel | Method | Status |
-|---------|--------|--------|
-| WhatsApp (personal + business) | Unipile — QR code pairing | ✅ |
-| LinkedIn DMs | Unipile — hosted auth | ✅ |
-| Instagram DMs | Unipile — hosted auth | ✅ |
-| Telegram | Unipile — hosted auth | ✅ |
-| Gmail | Unipile — OAuth | ✅ |
-| Outlook | Unipile — OAuth | ✅ |
-| IMAP (any email) | Unipile — credentials | ✅ |
-
-### Phase 2 — Direct integrations (our own code)
-| Channel | Method | License | Complexity |
-|---------|--------|---------|------------|
-| Twitter/X DMs | Official X API v2 — OAuth 2.0 | Official ($100/mo) | Medium |
-| Slack | Official Slack Bolt SDK — OAuth | MIT ✅ | Easy |
-| ClickUp Chat | Official ClickUp API — OAuth | Official | Easy |
-| Google Chat | Official Google API — OAuth | Official | Easy |
-
-### Phase 3 — Power features (later)
+### Shipped
 | Channel | Method | Notes |
 |---------|--------|-------|
-| Discord | User token API (discord.js, Apache license) | Against Discord ToS, medium ban risk |
-| Signal | Linked device protocol | Complex encryption |
-| iMessage | BlueBubbles (user runs own Mac server) | Optional, Mac users only |
+| WhatsApp (personal + business) | Unipile — QR code pairing | Inbound + outbound |
+| LinkedIn DMs | Unipile — hosted auth | Inbound + outbound |
+| Instagram DMs | Unipile — hosted auth | Inbound + outbound |
+| Telegram | Unipile — hosted auth | Inbound + outbound |
+| Gmail / Outlook / IMAP | Unipile — OAuth or credentials | Inbound + outbound; STARRED/FLAGGED sync |
+| Twitter/X DMs | Official X API v2 — OAuth 2.0 PKCE, AES-GCM-encrypted token storage | Inbound + outbound; Message Requests flow |
+| iMessage (macOS) | BlueBubbles bridge (user runs their own) | Inbound + outbound |
+
+### Exploring
+| Channel | Method | Notes |
+|---------|--------|-------|
+| Slack | Official Slack Bolt SDK — OAuth | Not started |
+| ClickUp Chat | Official ClickUp API — OAuth | Not started |
+| Google Chat | Official Google API — OAuth | Not started |
 
 ### Not supported (and why)
 | Channel | Why |
 |---------|-----|
 | Facebook Messenger (personal) | No official API, unofficial breaks constantly |
 | SMS (existing inbox) | Can't read existing phone SMS via API |
-| iMessage (hosted) | Apple blocks all third-party access |
+| Discord | Against ToS to use user tokens; bot accounts don't receive DMs |
+| Signal | Complex, moves slowly, small overlap with target audience |
 
 ---
 
@@ -60,18 +55,17 @@ Solo founders, single-person companies, high-level operators managing relationsh
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| **Desktop shell** | Tauri 2 (Rust) | Native, fast, low RAM. Scaffold with `tauri-ui` (MIT) |
-| **Frontend** | React 19 + TypeScript + Tailwind | Dark mode, financial terminal aesthetic |
-| **UI components** | shadcn/ui + chatscope/chat-ui-kit-react (MIT) | shadcn for general UI, chatscope for chat-specific components |
-| **State** | Zustand | Lightweight, fits Tauri |
-| **Auth** | Clerk | Convolios account login |
+| **Desktop shell** | Tauri 2 (Rust) | Native, fast, low RAM |
+| **Frontend** | React 19 + TypeScript + Tailwind v4 | Dark mode, financial terminal aesthetic |
+| **UI components** | Custom components + `lucide-react` icons | No external UI kit; design tokens in `src/index.css @theme` |
+| **State** | Zustand for UI state, TanStack Query for server state | Lightweight, fits Tauri |
+| **Auth** | Supabase Auth (magic-link OTP) | One vendor for DB + auth; deep link callback via `convolios://auth` |
 | **Database** | Supabase (Postgres + pgvector) | Messages, persons, embeddings |
 | **Messaging API** | Unipile (managed) | Core channels |
 | **X DMs** | Official X API v2 | $100/mo flat |
-| **Slack** | @slack/bolt (MIT) | Official SDK |
-| **ClickUp** | ClickUp API | Official |
-| **AI / LLM** | Gemini 2.5 Pro | Triage, summaries, reply drafting |
-| **Embeddings** | Gemini Embedding 2 (3072-dim) | Semantic search via pgvector |
+| **iMessage** | BlueBubbles (user-run bridge) | No API; user's own Mac |
+| **AI / LLM** | Gemini 2.5 Flash (triage), Gemini 2.5 Pro (reasoning) | Triage, summaries, reply drafting |
+| **Embeddings** | Gemini Embedding 2 (3072-dim → `vector(2000)` truncated) | Semantic search via pgvector |
 
 ---
 
@@ -81,169 +75,91 @@ Solo founders, single-person companies, high-level operators managing relationsh
 ┌──────────────────────────────────────────────────┐
 │               TAURI DESKTOP APP                   │
 │                                                   │
-│  React Frontend (dark mode, terminal aesthetic)   │
-│  ├── Inbox (unified timeline)                     │
-│  ├── Person view (all channels, one person)       │
-│  ├── Compose (omni-channel reply)                 │
-│  ├── Search (semantic, natural language)           │
-│  ├── Settings (connect accounts)                  │
-│  └── Context Brief (pre-meeting AI summary)       │
+│  React 19 Frontend (dark mode, terminal aesthetic)│
+│  ├── Inbox (unified timeline, screener, flagged)  │
+│  ├── Thread view (per-person, per-channel filter) │
+│  ├── Compose (omni-channel reply, drag-drop)      │
+│  ├── Circles (tag persons, colored avatar rings)  │
+│  ├── Settings (connections, merges, preferences)  │
+│  └── Search (planned — semantic)                  │
 │                                                   │
 │  Rust Backend (Tauri IPC)                         │
-│  └── Local cache, offline support, file handling  │
+│  ├── Unipile REST (chats, messages, attachments)  │
+│  ├── X API v2 (DMs, PKCE, encrypted tokens)       │
+│  ├── BlueBubbles (iMessage via local bridge)      │
+│  ├── Supabase REST (service role, local env only) │
+│  └── Drag-drop file reader, attachment cache      │
 └──────────────────────┬────────────────────────────┘
                        │
         ┌──────────────┼──────────────────┐
         ▼              ▼                  ▼
 ┌──────────────┐ ┌──────────┐ ┌────────────────┐
-│   Unipile    │ │ X API v2 │ │  Slack/ClickUp │
-│  (managed)   │ │ (direct) │ │   (direct)     │
-│              │ │          │ │                │
-│ WhatsApp     │ │ DMs      │ │ Messages       │
-│ LinkedIn     │ │          │ │                │
-│ Instagram    │ │          │ │                │
-│ Telegram     │ │          │ │                │
-│ Email        │ │          │ │                │
-└──────┬───────┘ └────┬─────┘ └───────┬────────┘
-       │              │               │
-       └──────────────┼───────────────┘
-                      ▼
-            ┌──────────────────┐
-            │     SUPABASE     │
-            │                  │
-            │  Edge Functions  │ ← webhook processors
-            │  Postgres        │ ← persons, messages, identities
-            │  pgvector        │ ← embeddings for semantic search
-            │                  │
-            └────────┬─────────┘
-                     │
-                     ▼
-            ┌──────────────────┐
-            │    GEMINI AI     │
-            │                  │
-            │  Triage          │ ← noise vs human vs urgent
-            │  Embeddings      │ ← semantic search vectors
-            │  Context Brief   │ ← pre-meeting summaries
-            │  Reply Draft     │ ← match user's voice/tone
-            └──────────────────┘
+│   Unipile    │ │ X API v2 │ │   Supabase     │
+│  (managed)   │ │ (direct) │ │  Edge + Postgres│
+│              │ │          │ │  + pg_cron      │
+│ WhatsApp     │ │ DMs      │ │  + Realtime     │
+│ LinkedIn     │ │          │ │                 │
+│ Instagram    │ │          │ └─────┬──────────┘
+│ Telegram     │ │          │       │
+│ Email (IMAP) │ │          │       ▼
+└──────┬───────┘ └────┬─────┘ ┌────────────────┐
+       │              │       │   Gemini 2.5   │
+       │              │       │                │
+       └──────────────┴──────▶│  Triage +       │
+                              │  summaries +    │
+                              │  (future)       │
+                              │  reply drafting │
+                              └─────────────────┘
 ```
 
 ---
 
 ## Data Model
 
-### `persons` — one row per human relationship
-```sql
-CREATE TABLE persons (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id TEXT NOT NULL,              -- Convolios user (Clerk ID)
-  display_name TEXT NOT NULL,
-  avatar_url TEXT,
-  notes TEXT,
-  ai_summary TEXT,                    -- cached context brief
-  ai_summary_updated_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-```
+High-level shape. Authoritative definitions are in [`supabase/migrations/`](supabase/migrations/).
 
-### `identities` — links a person to their channel handles
-```sql
-CREATE TABLE identities (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  person_id UUID REFERENCES persons(id) ON DELETE CASCADE,
-  channel TEXT NOT NULL,              -- 'whatsapp', 'linkedin', 'gmail', 'x', 'slack', 'clickup'
-  handle TEXT NOT NULL,               -- email, phone, username, account ID
-  display_name TEXT,                  -- name as shown on that channel
-  unipile_account_id TEXT,            -- for Unipile-managed channels
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMPTZ DEFAULT now(),
-  UNIQUE(channel, handle)
-);
-```
-
-### `messages` — every message, normalized
-```sql
-CREATE TABLE messages (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id TEXT NOT NULL,
-  person_id UUID REFERENCES persons(id),
-  identity_id UUID REFERENCES identities(id),
-  external_id TEXT UNIQUE,            -- dedup key (unipile_message_id, x_dm_id, etc.)
-  channel TEXT NOT NULL,
-  direction TEXT NOT NULL,            -- 'inbound' | 'outbound'
-  message_type TEXT DEFAULT 'dm',     -- 'dm' | 'group' | 'channel'
-  subject TEXT,
-  body_text TEXT,
-  body_html TEXT,
-  attachments JSONB DEFAULT '[]',
-  thread_id TEXT,
-  sent_at TIMESTAMPTZ NOT NULL,
-  synced_at TIMESTAMPTZ DEFAULT now(),
-  triage TEXT DEFAULT 'unclassified', -- 'urgent' | 'human' | 'newsletter' | 'notification' | 'noise'
-  embedding vector(3072),
-  CONSTRAINT messages_user_person_idx UNIQUE (user_id, external_id)
-);
-
--- Indexes
-CREATE INDEX messages_person_idx ON messages(person_id, sent_at DESC);
-CREATE INDEX messages_user_triage_idx ON messages(user_id, triage, sent_at DESC);
-CREATE INDEX messages_embedding_idx ON messages
-  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
-```
-
-### `connected_accounts` — user's connected channels
-```sql
-CREATE TABLE connected_accounts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id TEXT NOT NULL,
-  provider TEXT NOT NULL,             -- 'unipile', 'x', 'slack', 'clickup', 'google_chat'
-  channel TEXT NOT NULL,              -- 'whatsapp', 'linkedin', etc.
-  account_id TEXT,                    -- provider's account ID
-  status TEXT DEFAULT 'active',       -- 'active' | 'disconnected' | 'expired'
-  credentials JSONB DEFAULT '{}',     -- encrypted tokens (never raw in DB — use Supabase vault)
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-```
+- **`persons`** — one row per human relationship. `status` is `pending` (screener) / `approved` / `blocked`.
+- **`identities`** — channel handles linked to a person. Unique on `(user_id, channel, handle)` (migration 041).
+- **`messages`** — normalized message stream. Unique on `(user_id, external_id)` (migration 050). Includes `triage`, `seen` / `read_at`, `flagged_at`, `deleted` / `deleted_at`, `hidden`, `reactions`, `folder`, `embedding vector(2000)`.
+- **`connected_accounts`** — one row per channel connection. X tokens stored AES-GCM-encrypted.
+- **`circles` + `circle_members`** — user-defined groupings surfaced as colored avatar rings.
+- **`send_audit_log`** — every outbound send.
+- **`merge_log` + `merge_dismissed`** — person-merge history.
+- **`x_oauth_state`** — PKCE state; auto-cleaned every 15 minutes via pg_cron (migration 052).
+- **`deletion_log`** — person deletion audit.
 
 ---
 
 ## AI Features — Build Order
 
-### 1. Triage (ship first — highest impact)
-Classify every inbound message:
-- `urgent` — needs reply now (client asking something, deadline, money)
-- `human` — real person, real conversation, but not urgent
-- `newsletter` — mass email, marketing
-- `notification` — automated system message (receipts, alerts)
-- `noise` — spam, irrelevant
+### 1. Triage (shipped)
+Classify every inbound message into `urgent | human | newsletter | notification | noise | unclassified`. Gemini 2.5 Flash, fire-and-forget from the webhook (non-blocking). Default inbox view filters by triage level.
 
-Use Gemini 2.5 Pro with a classification prompt. Batch process on ingest. Non-blocking — if AI is slow, message still shows, just unclassified.
-
-### 2. Semantic Search
+### 2. Semantic Search (planned)
 User asks: "what did Leo say about the contract?"
 - Embed query with Gemini Embedding 2
 - Cosine similarity search on pgvector
 - Return top-K messages
-- Gemini synthesizes a natural language answer from results
+- Gemini 2.5 Pro synthesizes a natural language answer from results
 
-### 3. Context Brief
+The `messages.embedding` column and the `hnsw` index exist; the pipeline that populates them isn't built yet.
+
+### 3. Context Brief (planned)
 Before a meeting with a person:
-- Fetch all messages for that person (last 30 days full, older → embedding search)
+- Fetch recent messages for that person (last 30 days full, older → embedding search)
 - Gemini summarizes: recent topics, pending action items, relationship tone
-- Cache for 1 hour per person
+- Cache in `persons.ai_summary`
 
-### 4. Reply Drafting
+### 4. Reply Drafting (planned)
 - User clicks reply → Gemini drafts based on conversation context + user's past replies
 - Learns user's voice/tone over time
 - **User always confirms before sending** (never auto-send — ban risk)
 
-### 5. Entity Resolution (AI-assisted)
-- Exact match on phone/email → auto-merge
-- Name similarity + same company → suggest merge, user confirms
-- Over time: AI confidence increases as more signals arrive
-- User can always manually merge/split
+### 5. Entity Resolution (shipped, AI-assisted)
+- Exact match on phone/email → auto-merge during webhook ingest (`findOrCreatePerson`)
+- Name similarity + shared channel → `merge-suggestions` edge function surfaces candidates
+- User confirms in Settings → Merge Suggestions
+- Manual merge/split + undo always available via `merge_persons` / `undo_merge` RPCs
 
 ---
 
@@ -251,52 +167,33 @@ Before a meeting with a person:
 
 ### WhatsApp Ban Risk
 Unipile uses WhatsApp Web protocol (unofficial). Meta's ToS prohibits third-party clients.
-- **Reality:** Beeper ran 200k+ users for 3 years, zero permanent bans
-- **Mitigation:** Never auto-send. Never bulk message. Never message people who haven't messaged first. AI drafts only, human confirms.
-- **Worst case:** If Meta cracks down, Unipile handles reconnection. User's WhatsApp account is NOT at risk for passive reading + manual replies.
+- **Reality:** Beeper ran 200k+ users for years with minimal bans
+- **Mitigation:** Never auto-send. Never bulk message. Never message people who haven't messaged first. AI drafts only, human confirms
+- **Worst case:** Meta cracks down; Unipile handles reconnection. Passive reading + manual replies are the lowest-risk shape
 
 ### Unipile Dependency
-Single vendor for 7 channels.
-- **Mitigation:** Abstract Unipile behind a `ChannelProvider` interface. If Unipile dies, swap to direct integrations. Data model is provider-agnostic.
+Single vendor for 5 channels.
+- **Mitigation:** Shape of the Rust backend is provider-agnostic (HTTP + Postgres). A `ChannelProvider` abstraction could be added if we ever swap. Not implemented today — Unipile is hardcoded
 
 ### Embedding Costs
 ~$0.50/user/month at 1,000 messages/month.
-- **Mitigation:** Only embed non-noise messages (post-triage). Batch embed. Cache search results. Consider half-precision vectors at scale.
+- **Mitigation:** Only embed non-noise messages (post-triage). Batch embed. Cache search results
 
 ### pgvector at Scale
-Works well to ~1M vectors. 10k users × 1k messages = 10M vectors.
-- **Mitigation:** Partition messages table by user_id from day one. Each user's vectors stay in their own partition.
+Works well to ~1M vectors per index. At 10k users × 1k messages = 10M vectors we'll need partitioning.
+- **Mitigation:** Partition `messages` by `user_id` when scale requires it. Today's single-user shape is fine
 
 ### X API Rate Limits
 10k reads/month on Basic ($100/mo).
-- **Mitigation:** Cache aggressively. Only poll when app is active. At growth: upgrade to usage-based pricing.
+- **Mitigation:** Cache aggressively. Only poll when app is active. Upgrade to usage-based pricing at growth
 
 ### Token Expiry / Disconnects
 OAuth tokens expire. WhatsApp QR sessions drop.
-- **Mitigation:** Unipile handles reconnection prompts. For X/Slack/ClickUp: refresh tokens automatically. Show reconnect banner in UI when status = disconnected.
+- **Mitigation:** X refresh is automatic (Rust `x_refresh_access_token`). For Unipile channels, `connected_accounts.status` flips to `credentials` / `disconnected` / `error` and the Settings UI shows a reconnect banner
 
----
-
-## Open Source Tools We'll Use
-
-| Tool | Purpose | License |
-|------|---------|---------|
-| `tauri-ui` (agmmnn) | Tauri 2 + React + shadcn scaffold | MIT ✅ |
-| `chatscope/chat-ui-kit-react` | Chat UI components (message list, conversation list, avatars) | MIT ✅ |
-| `shadcn/ui` | General UI components | MIT ✅ |
-| `@slack/bolt` | Slack integration SDK | MIT ✅ |
-| `discord.js` | Discord integration (Phase 3) | Apache-2.0 ✅ |
-| `unipile-node-sdk` | Unipile API client | Commercial |
-
-### Study / Reference (don't use code directly)
-| Project | What to learn | License |
-|---------|---------------|---------|
-| **Chatwoot** (MIT, 22k⭐) | Polymorphic channel architecture, webhook processors, message normalization for 13+ channels | MIT ✅ |
-| **Ferdium** (Apache, 7k⭐) | Service "recipes" — per-platform config patterns | Apache ✅ |
-| **mautrix bridges** (AGPL) | How WhatsApp/Discord/Signal/Instagram protocols actually work | Study only ❌ |
-| **Inbox Zero** (AGPL) | AI email triage prompts, classification categories | Study only ❌ |
-| **jenish0908/unified-inbox** | Working Unipile → unified UI patterns, webhook handlers | Study only ⚠️ |
-| **splink** (MIT) | Entity resolution algorithm — probabilistic matching | MIT ✅ |
+### OAuth Token Storage
+X tokens in the DB could be leaked if the service-role key ever escaped.
+- **Mitigation:** Tokens are AES-GCM-encrypted with `TOKEN_ENCRYPTION_KEY` before being written to `connection_params`. Both the edge function callback and the Rust refresh path refuse to persist plaintext if the key is missing
 
 ---
 
@@ -304,60 +201,43 @@ OAuth tokens expire. WhatsApp QR sessions drop.
 
 | Service | Cost/month | Notes |
 |---------|-----------|-------|
-| Unipile | €49 minimum | Covers all Phase 1 channels |
-| X API | $100 | Basic tier, all users |
-| Gemini API | ~$0.50/user | Embeddings + triage + summaries |
-| Supabase | $0–25 | Free tier → Pro at 3rd project |
-| Clerk | $0 | Free under 10k MAU |
-| Slack API | $0 | Free |
-| ClickUp API | $0 | Free |
-| **Total** | **~$160/mo flat** | Before paying users |
+| Unipile | €49 minimum | Covers WhatsApp / LinkedIn / IG / Telegram / Email |
+| X API | $100 | Basic tier, flat |
+| Gemini API | ~$0.50/user | Triage now; embeddings + summaries once built |
+| Supabase | $0–25 | Free tier → Pro when needed |
+| **Total** | **~$150/mo flat** | Before paying users |
 
-Break-even at $20/mo subscription: **8 paying users**.
+Break-even at a $20/mo subscription: **~8 paying users**.
 
 ---
 
-## Build Order
+## Roadmap
 
-### Phase 1 — Foundation (Week 1-2)
-1. Scaffold Tauri app with `tauri-ui`
-2. Supabase project + schema migration (all tables above)
-3. Enable pgvector extension
-4. Clerk app for auth
-5. Push to `github.com/plutioandco/convolios`
-6. 1Password vault: Unipile key, X API key, Gemini key, Clerk keys
+### Shipped
+- Tauri 2 shell, React 19 frontend, Supabase backend
+- All Unipile channels (WhatsApp, LinkedIn, IG, Telegram, Email)
+- X DMs via official API with encrypted token storage
+- iMessage via BlueBubbles
+- Entity resolution (automatic + merge suggestions + manual merge/split with undo)
+- Screener (`pending` / `approved` / `blocked`) with auto-promotion on outbound
+- Circles (colored avatar rings, sidebar filter)
+- Flagging (`flagged_at` with provider-side STARRED/FLAGGED sync for email)
+- Pinning + marked-unread reminders
+- Read-status sync (toggleable in Preferences)
+- AI triage on ingest
+- Realtime with heartbeat, reconnect-on-stale, and fallback polling
+- Security: email XSS sanitizer, AES-GCM X tokens, attachment size caps, tenant-scoped service-role queries, webhook-secret constant-time compare
 
-### Phase 2 — Message Ingestion (Week 3-4)
-1. Sign up Unipile → connect test WhatsApp + Gmail
-2. Build webhook processor Edge Function (Unipile → Supabase)
-3. Build X API DM poller
-4. Normalize all messages into `messages` table
-5. Auto-create `persons` and `identities` from incoming messages
+### Next
+- Semantic search pipeline (embed on ingest, query UI)
+- Context Brief (per-person summary)
+- Reply drafting
+- Windows / Linux builds (currently macOS-first — signed via Developer ID)
 
-### Phase 3 — Core UI (Week 5-7)
-1. Inbox view — unified timeline, sorted by sent_at, channel badges
-2. Person view — all messages for one person across channels
-3. Conversation list — sidebar with recent conversations
-4. Compose window — select channel, type, send via Unipile/X API
-5. Settings — connect accounts (Unipile hosted auth, X OAuth)
-
-### Phase 4 — AI Layer (Week 8-10)
-1. Triage — classify on ingest, filter inbox by triage level
-2. Semantic search — embed messages, pgvector search, Gemini answer
-3. Context Brief — on-demand per-person summary
-4. Reply drafting — AI suggests, user confirms
-
-### Phase 5 — More Channels (Week 11-12)
-1. Slack via @slack/bolt
-2. ClickUp Chat via ClickUp API
-3. Google Chat via Google API
-
-### Phase 6 — Entity Resolution + Polish (Week 13+)
-1. AI-suggested person merges
-2. Manual merge/split UI
-3. Offline mode (local cache)
-4. Auto-updater
-5. Windows + Linux builds
+### Later
+- Slack / Google Chat / ClickUp via their official APIs
+- Auto-updater
+- Offline mode improvements
 
 ---
 
@@ -366,7 +246,6 @@ Break-even at $20/mo subscription: **8 paying users**.
 - Web version
 - Facebook Messenger personal
 - SMS (existing phone inbox)
-- iMessage
-- Discord
+- Discord / Signal
 - Auto-send anything
 - Team/collaborative features

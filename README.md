@@ -2,285 +2,222 @@
 
 **The Single Source of Truth for Every Conversation.**
 
-Convolios merges fragmented communication channels (Email, Instagram, WhatsApp, LinkedIn) into a singular, AI-enriched "Full Picture" inbox, organized by **Person**, not by App.
+Convolios merges fragmented communication channels (WhatsApp, LinkedIn, Instagram, Telegram, Gmail/Outlook/IMAP, X DMs, iMessage) into a single, AI-enriched inbox organized by **Person**, not by app.
+
+This repository contains the Tauri 2 desktop shell, the React 19 frontend, the Supabase schema and edge functions, and the documentation needed to build and run it.
 
 ---
 
-## The Problem
+## Problem
 
-Founders and high-level operators are "app-switching" to maintain single relationships.
+Operators manage individual relationships across many apps. A contract lands in Gmail, the follow-up lands in LinkedIn, a question arrives on WhatsApp. The full context of a relationship lives only in someone's head.
 
-- **Identity Fragmentation**: A client sends a contract via Gmail, a follow-up via Instagram DM, and a quick question via WhatsApp.
-- **Context Loss**: Searching for a specific detail requires checking four different search bars.
-- **Mental Overload**: The "Full Picture" of a relationship lives only in the founder's head, not in their tools.
-
-## The Solution
-
-Convolios is a "Stateful" inbox that builds a living database of human relationships.
-
-- **Entity Resolution**: AI automatically links a contact's various handles (e.g., `leo@plutio.com` + `@leobassam` IG) into one Human Thread.
-- **The "Full Picture" Box**: A chronological timeline of every interaction across all channels in one scrolling feed.
-- **Omni-Channel Reply**: A single compose window that intelligently routes your reply to the most effective channel.
+Convolios unifies those channels by person. One row in `persons` per human; many rows in `identities` linking them to their channel handles; one normalized stream in `messages`. You search, reply, and triage from one place.
 
 ---
 
-## Key Features
+## Feature overview
 
-### Semantic "Full Picture" Search
-
-Instead of keyword matching, users can ask: *"What was the feedback on the last design draft?"* The AI retrieves the answer from a WhatsApp voice note and the attached PDF from a Gmail thread.
-
-### Relationship Intelligence
-
-Before a meeting, Convolios provides a "Context Brief" — summarizing recent DMs, emails, and social mentions across all platforms to give you a 360-degree view.
-
-### The "Deep Work" Filter
-
-AI-driven triage that separates "Human-to-Human" high-value messages from newsletters, marketing blasts, and social noise.
+- **Unified inbox** — all channels in one timeline, per-person threading.
+- **Entity resolution** — automatic and manual merging of identities into a single person.
+- **Circles** — lightweight tagging of people (Work / Family / Investors / …) surfaced as colored rings on avatars.
+- **Screener** — new contacts land in a pending queue; approved contacts enter the main inbox.
+- **AI triage** — Gemini classifies inbound messages as `urgent | human | newsletter | notification | noise | unclassified`.
+- **Flagging / starred emails** — mark important messages; star status is synced with the provider for Gmail and Outlook (folder = `STARRED` / `FLAGGED`).
+- **Read-status sync** — opening or replying to a conversation can mark it read on WhatsApp and LinkedIn (toggleable in Preferences).
+- **Realtime + fallback polling** — Supabase Realtime drives live updates; an 8-second polling loop kicks in if the socket dies, with a 2-minute heartbeat that forces a reconnect if no events arrive.
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Component | Technology | Purpose |
-|---|---|---|
-| Desktop Shell | Tauri 2 (Rust + React) | High-performance, low-RAM desktop app |
-| Frontend | React 18+ / TypeScript / TailwindCSS | Dark-mode-first UI with "financial terminal" aesthetic |
-| State Management | Zustand | Lightweight, fits Tauri's philosophy |
-| Unified Comms API | Unipile (`unipile-node-sdk`) | Single API for Gmail, Outlook, WhatsApp, Instagram, LinkedIn |
-| Database | Supabase (PostgreSQL + pgvector) | Messages, contacts, and vector embeddings |
-| AI / LLM | Gemini 2.5 Pro | Reasoning, classification, summarization |
-| Embeddings | Gemini Embedding 2 (3072-dim) | Semantic search over message history |
-
-### Why Unipile as the Single API?
-
-The original design called for Unipile (messaging) + Nylas (email). After evaluation, Unipile alone covers all channels:
-
-- Full email history with no 90-day limit (unlike Nylas)
-- One SDK, one schema, one webhook system
-- Lower cost (~€5/connected account/month, €49/month minimum)
-- Simpler Entity Resolution when all data comes from one normalized source
+| Layer | Technology |
+|---|---|
+| Desktop shell | Tauri 2 (Rust + Wry WebView) |
+| Frontend | React 19 + TypeScript 5.9, Tailwind v4 (CSS-in-`@theme` tokens), Zustand for UI state, TanStack Query for server state |
+| Auth | Supabase Auth (email + OAuth, deep-link callback on `convolios://auth`) |
+| Database | Supabase Postgres (+ pgvector for semantic search) |
+| Realtime | Supabase Realtime (Postgres changes on `messages` filtered by `user_id`) |
+| Messaging (WhatsApp / LinkedIn / Instagram / Telegram / Email) | Unipile REST API |
+| X / Twitter DMs | Official X API v2 via our own OAuth 2.0 PKCE flow |
+| iMessage | BlueBubbles (user runs their own local bridge) |
+| AI / LLM | Gemini 2.5 Flash for triage, Gemini 2.5 Pro for reasoning and summaries |
+| Embeddings | Gemini Embedding 2 (3072-dim) → pgvector HNSW index |
 
 ---
 
-## Architecture
+## High-level architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Tauri Desktop App                     │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │              React Frontend (Dark Mode)            │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌───────────────────┐  │  │
-│  │  │  Unified  │ │  Person  │ │   Omni-Channel    │  │  │
-│  │  │  Inbox    │ │  Thread  │ │   Compose Window  │  │  │
-│  │  └──────────┘ └──────────┘ └───────────────────┘  │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌───────────────────┐  │  │
-│  │  │ Semantic  │ │ Context  │ │   Deep Work       │  │  │
-│  │  │ Search    │ │ Brief    │ │   Filter          │  │  │
-│  │  └──────────┘ └──────────┘ └───────────────────┘  │  │
-│  └───────────────────────────────────────────────────┘  │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │              Rust Backend (Tauri IPC)              │  │
-│  └───────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-     ┌──────────────┐ ┌────────┐ ┌──────────────┐
-     │   Unipile    │ │Supabase│ │  Gemini 2.5  │
-     │  (All Comms) │ │+pgvec  │ │  + Embed 2   │
-     └──────────────┘ └────────┘ └──────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     Tauri Desktop App                     │
+│  React frontend ── useAuth (Supabase) ── TanStack Query   │
+│      │                                                    │
+│      ▼ Tauri IPC                                          │
+│  Rust backend (reqwest, tokio)                            │
+│      ├── Unipile REST                                     │
+│      ├── X API v2 (OAuth PKCE, AES-GCM-encrypted tokens)  │
+│      ├── BlueBubbles (iMessage)                           │
+│      └── Supabase REST (service role from local env)      │
+└──────────────────────────────────────────────────────────┘
+                 ▲                    ▲
+                 │ webhooks           │ realtime
+                 │                    │
+        ┌────────┴────────┐   ┌───────┴─────────┐
+        │ Supabase Edge   │   │ Supabase        │
+        │ Functions       │──▶│ Postgres        │
+        │  - unipile-     │   │  + pgvector     │
+        │    webhook      │   │  + pg_cron      │
+        │  - *-callback   │   │                 │
+        │  - merge-       │   └───────┬─────────┘
+        │    suggestions  │           │
+        └────────┬────────┘           │
+                 │                    ▼
+                 ▼            ┌────────────────┐
+        ┌────────────────┐    │ Gemini 2.5     │
+        │ Gemini triage  │    │ (triage,       │
+        │ on inbound msg │    │  summaries)    │
+        └────────────────┘    └────────────────┘
 ```
+
+Detailed component/hook/edge-function reference lives in [ARCHITECTURE.md](ARCHITECTURE.md). Product vision and channel roadmap live in [PLAN.md](PLAN.md).
 
 ---
 
-## Data Schema
+## Data model (current)
 
-### `persons` — The unified human identity
+The authoritative definitions live in [`supabase/migrations/`](supabase/migrations/). The abridged view:
 
-Every contact is resolved into a single person, regardless of how many channels they use.
+**`persons`** — one row per human relationship. Columns include `id`, `user_id`, `display_name`, `avatar_url` / `avatar_stale` / `avatar_refreshed_at`, `status` (`pending` | `approved` | `blocked`), `notes`, `ai_summary`, `pinned_at`, `marked_unread`.
 
-```sql
-CREATE TABLE persons (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  display_name TEXT NOT NULL,
-  avatar_url TEXT,
-  notes TEXT,
-  ai_summary TEXT,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-```
+**`identities`** — links a person to a channel handle. Columns include `id`, `person_id`, `user_id`, `channel`, `handle`, `display_name`, `unipile_account_id`, `metadata`, plus a normalized-handle uniqueness constraint on `(user_id, channel, handle)`.
 
-### `identities` — Links a person to their channel handles
+**`messages`** — every message across every channel, normalized. Columns include `id`, `user_id`, `person_id`, `identity_id`, `external_id`, `channel`, `direction`, `message_type`, `subject`, `body_text`, `body_html`, `attachments` (JSONB), `thread_id`, `sent_at`, `synced_at`, `triage`, `seen` / `delivered` / `read_at`, `edited`, `deleted` / `deleted_at`, `hidden`, `is_event` / `event_type`, `quoted_text` / `quoted_sender`, `reactions` (JSONB), `folder`, `flagged_at`, `provider_id`, `chat_provider_id`, `in_reply_to_message_id`, `smtp_message_id`, `unipile_account_id`, `embedding vector(2000)`. Uniqueness is `(user_id, external_id)` (migration 050); legacy global unique was dropped.
 
-```sql
-CREATE TABLE identities (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  person_id UUID REFERENCES persons(id) ON DELETE CASCADE,
-  channel TEXT NOT NULL,          -- 'gmail', 'instagram', 'whatsapp', 'linkedin'
-  handle TEXT NOT NULL,           -- 'leo@plutio.com', '@leobassam', '+1234567890'
-  unipile_account_id TEXT,
-  metadata JSONB DEFAULT '{}',
-  verified BOOLEAN DEFAULT false,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  UNIQUE(channel, handle)
-);
-```
+**`connected_accounts`** — one row per channel connection per user. Columns include `user_id`, `provider` (`unipile` | `x` | `imessage`), `channel`, `account_id`, `status`, `display_name` / `username` / `email` / `phone` / `avatar_url` / `provider_type`, `connection_params` (JSONB; AES-GCM-encrypted for X), `last_synced_at`.
 
-### `messages` — Every message across all channels, normalized
+**`circles` and `circle_members`** — user-defined groupings of persons with a color and sort order.
 
-```sql
-CREATE TABLE messages (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  person_id UUID REFERENCES persons(id),
-  identity_id UUID REFERENCES identities(id),
-  unipile_message_id TEXT UNIQUE,
-  channel TEXT NOT NULL,
-  direction TEXT NOT NULL,        -- 'inbound' | 'outbound'
-  subject TEXT,
-  body_text TEXT,
-  body_html TEXT,
-  attachments JSONB DEFAULT '[]',
-  thread_id TEXT,
-  sent_at TIMESTAMPTZ NOT NULL,
-  synced_at TIMESTAMPTZ DEFAULT now(),
-  is_noise BOOLEAN DEFAULT false,
-  embedding vector(3072)          -- Gemini Embedding 2 output
-);
+**`send_audit_log`** — every outbound send (text / attachment / reaction / edit) for forensic replay.
 
-CREATE INDEX messages_person_idx ON messages(person_id, sent_at DESC);
-CREATE INDEX messages_channel_idx ON messages(channel, sent_at DESC);
-CREATE INDEX messages_embedding_idx ON messages
-  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
-```
+**`merge_log` + `merge_dismissed`** — record of manual/automatic person merges and dismissed suggestions.
 
-### `conversations` — Grouped threads per person
+**`x_oauth_state`** — PKCE state for the X OAuth flow. Rows older than 1 hour are purged every 15 minutes by a `pg_cron` job (migration 052).
 
-```sql
-CREATE TABLE conversations (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  person_id UUID REFERENCES persons(id) ON DELETE CASCADE,
-  channel TEXT NOT NULL,
-  unipile_thread_id TEXT,
-  subject TEXT,
-  last_message_at TIMESTAMPTZ,
-  message_count INT DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-```
+**`deletion_log`** — audit of person deletions for manual recovery.
+
+The conversation list you see in the UI is computed on the fly by the `get_conversations` RPC (migration 050) — there is no `conversations` table.
 
 ---
 
-## Feature Implementation
-
-### Entity Resolution (Person Linking)
-
-When a new message arrives via Unipile webhook:
-1. Extract sender identity (email, IG handle, phone, LinkedIn URL)
-2. Check `identities` table for existing match
-3. If no match, use Gemini 2.5 to suggest possible person matches (name similarity, shared context)
-4. Create or link to a `persons` record
-5. User can manually merge/split persons from the UI
-
-### "Full Picture" Timeline
-
-A single chronological feed per person mixing emails, DMs, and messages. Each message shows a channel badge (Gmail, WhatsApp, Instagram, LinkedIn).
-
-### Semantic Search
-
-1. On message ingest, generate embedding via Gemini Embedding 2 (3072 dimensions)
-2. Store in `messages.embedding` column
-3. User's natural language question is embedded, then cosine similarity search via pgvector
-4. Gemini 2.5 synthesizes the top-K results into a natural language answer
-
-### Omni-Channel Reply
-
-Compose window detects the person's available channels from `identities`. User picks channel (or AI suggests the most effective one based on recency/response patterns). Sends via Unipile SDK.
-
-### "Deep Work" Filter (AI Triage)
-
-On ingest, Gemini 2.5 classifies each message: `human_conversation | newsletter | marketing | notification | noise`. Sets `messages.is_noise` flag. Default inbox view filters to `is_noise = false`.
-
-### Context Brief
-
-Before a meeting, queries all messages for a person from the last 30 days. Passes to Gemini 2.5 for summarization highlighting action items, pending decisions, and tone. Cached in `persons.ai_summary`.
-
----
-
-## Project Structure
+## Repository layout
 
 ```
 convolios/
-  src-tauri/              # Rust backend (Tauri 2)
-    src/
-      main.rs
-      lib.rs
-    Cargo.toml
-    tauri.conf.json
-  src/                    # React frontend
-    assets/
-    components/
-      inbox/              # Inbox list, message cards
-      person/             # Person thread, timeline
-      compose/            # Omni-channel compose window
-      search/             # Semantic search bar + results
-      sidebar/            # Navigation, channel filters
-      common/             # Shared UI components
-    hooks/                # Custom React hooks
-    stores/               # Zustand stores
-    services/             # API clients (Unipile, Supabase, Gemini)
-    types/                # TypeScript types
-    utils/                # Helpers, formatters
-    App.tsx
-    main.tsx
-  supabase/
-    migrations/           # SQL migration files
-    functions/            # Supabase Edge Functions (webhook handlers, AI)
-  package.json
-  tailwind.config.ts
-  tsconfig.json
+├── src/                         # React 19 frontend
+│   ├── App.tsx                  # root, auth gate, skeleton, query persistence
+│   ├── components/
+│   │   ├── inbox/               # InboxList, conversation rows
+│   │   ├── thread/              # ThreadView, ComposeBox, Email render (shadow DOM)
+│   │   ├── sidebar/             # channels + circles nav
+│   │   ├── settings/            # connections, circles, merge suggestions, preferences
+│   │   └── icons/               # ChannelLogo
+│   ├── hooks/                   # useConversations, useThread, useRealtimeMessages, useCircles, useMergeSuggestions, useFlaggedMessages
+│   ├── stores/                  # inboxStore, accountsStore, preferencesStore (Tauri-persisted)
+│   ├── lib/                     # auth, supabase client, queryClient
+│   ├── utils/                   # channel labels, colors, time formatting
+│   └── types/                   # barrel of TS interfaces matching DB columns
+│
+├── src-tauri/                   # Rust backend (Tauri 2)
+│   ├── src/
+│   │   ├── main.rs              # entrypoint
+│   │   └── lib.rs               # all #[tauri::command] handlers
+│   ├── permissions/             # capabilities and command allow-lists
+│   ├── tauri.conf.json
+│   └── Cargo.toml
+│
+├── supabase/
+│   ├── migrations/              # numbered SQL migrations (001 → 052)
+│   └── functions/               # Deno edge functions
+│       ├── _shared/             # cors, auth, crypto, channel-map, logging, validate
+│       ├── unipile-webhook/
+│       ├── unipile-account-callback/
+│       ├── x-account-callback/
+│       └── merge-suggestions/
+│
+├── public/                      # static assets (favicon)
+├── ARCHITECTURE.md              # implementation reference
+├── PLAN.md                      # product strategy & roadmap
+└── README.md                    # this file
 ```
 
----
-
-## MVP Milestones
-
-1. **Scaffold** — Tauri 2 + React + TypeScript + TailwindCSS + Zustand
-2. **Database** — Supabase project, migrations for all 4 core tables + pgvector
-3. **Unipile Integration** — Account connection flow, message sync, webhook handler
-4. **Entity Resolution** — Identity linking, person creation, merge UI
-5. **Inbox UI** — Unified inbox view, person thread timeline, channel badges
-6. **Compose** — Omni-channel reply window routing to correct channel
-7. **Semantic Search** — Embedding pipeline + pgvector search + Gemini answer synthesis
-8. **AI Triage** — Deep Work filter (noise classification on ingest)
-9. **Context Brief** — Pre-meeting relationship summary panel
-
----
-
-## Target Market
-
-- **Primary**: Solo-founders and "single-person" companies
-- **Secondary**: High-level creators and talent managers who manage high-volume DMs and high-stakes email contracts simultaneously
-
-## Branding
-
-- **Name**: Convolios (The Conversation Operating System)
-- **Tone**: Human, professional, and "no-BS"
-- **Aesthetic**: Clean, high-contrast, dark mode by default — less "social app", more "financial terminal" for conversations
 ---
 
 ## Setup
 
-```bash
-npm install
+### Prerequisites
+
+- **Node.js 20+**
+- **Rust stable** (via rustup) with the target for your OS (`aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`)
+- **Tauri prerequisites** — see <https://tauri.app/start/prerequisites/> (Xcode CLT on macOS, WebView2 on Windows, libwebkit2gtk on Linux)
+- A Supabase project with the migrations in [`supabase/migrations/`](supabase/migrations/) applied
+- A Unipile account and API key
+- X API v2 credentials (for X DMs) and a Gemini API key (for triage)
+
+### Environment
+
+Copy `.env.example` to `.env.local` and fill in the values:
+
+```ini
+# Client
+VITE_SUPABASE_URL=
+VITE_SUPABASE_ANON_KEY=
+
+# Server / Rust (never prefixed with VITE_)
+SUPABASE_SERVICE_ROLE_KEY=
+UNIPILE_API_KEY=
+UNIPILE_API_URL=
+UNIPILE_WEBHOOK_SECRET=
+X_API_CLIENT_ID=
+X_API_CLIENT_SECRET=
+GEMINI_API_KEY=
+# 32 bytes, base64-encoded. Required — app refuses to store X tokens plaintext.
+TOKEN_ENCRYPTION_KEY=
 ```
 
-## Scripts
+`.env.local` is git-ignored. The Rust backend loads it at startup via `dotenvy` from the project root.
 
-- `npm run build` — compile TypeScript to `dist/`
-- `npm run dev` — watch and recompile
-- `npm start` — run `dist/index.js`
-- `npm run typecheck` — type-check without emitting
-- `npm run clean` — remove `dist/`
+### Install and run
 
+```bash
+npm install            # Frontend + Tauri CLI
+npm run tauri dev      # Dev: spawns Vite on 1420, Tauri shell on top
+npm run build          # TypeScript + Vite production build of the web assets
+npm run tauri build    # Full packaged installer (signed on macOS)
+npm run lint           # ESLint across src/
+```
+
+Edge functions deploy via the Supabase CLI:
+
+```bash
+supabase functions deploy unipile-webhook
+supabase functions deploy unipile-account-callback
+supabase functions deploy x-account-callback
+supabase functions deploy merge-suggestions
+```
+
+---
+
+## Security notes
+
+- **X OAuth tokens are AES-GCM-encrypted** using `TOKEN_ENCRYPTION_KEY` before they're written to `connected_accounts.connection_params`. Both the edge function callback and the Rust token-refresh path refuse to persist plaintext if the key is missing.
+- **Email HTML** is sanitized (scripts, iframes, svg, math, form, link, base, object, embed, applet, portal, srcdoc, formaction, and dangerous URL protocols including `javascript:`, `vbscript:`, `data:text/html`) before being rendered in a shadow-DOM sandbox.
+- **Webhook secrets** are compared in constant time via a double-HMAC pattern (see [`supabase/functions/_shared/auth.ts`](supabase/functions/_shared/auth.ts)).
+- **Attachment size limits**: uploads and drag-drop capped at 100 MB; downloads capped at 200 MB.
+- **Tenant scoping**: every service-role Rust query filters on `user_id`. `fetch_chat_avatars` takes `user_id` as a parameter and scopes all three lookups to that user.
+
+---
+
+## License
+
+Proprietary. All rights reserved.

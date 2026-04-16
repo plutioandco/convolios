@@ -1,5 +1,5 @@
 # Convolios — Architecture Reference
-_Last updated: April 11, 2026_
+_Last updated: April 16, 2026_
 
 This document describes the actual implementation as it exists today. For the vision, roadmap, and build progress, see [PLAN.md](PLAN.md).
 
@@ -142,10 +142,15 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `add_reaction` | Add emoji reaction to a message via Unipile |
 | `edit_message` | Edit a sent message (WhatsApp) via Unipile |
 | `fetch_attachment` | Download attachment binary from Unipile, return as base64 (with disk cache) |
-| `fetch_chat_avatars` | Fetch group chat avatars from Unipile, store in `persons.avatar_url` |
+| `fetch_chat_avatars` | Fetch group chat avatars from Unipile for a given chat, scoped to `user_id` to prevent cross-tenant lookup |
 | `reconcile_chats` | Reconcile stale chat/thread IDs after chat resolution |
 | `connect_x_account` | Initiate X OAuth 2.0 PKCE flow, store state, return auth URL |
 | `connect_imessage` | Verify chat.db access, create connected_account for macOS Messages |
+| `read_dropped_files` | Read drag-dropped attachments from disk. Rejects non-files and anything > 100 MB |
+| `chat_action` | Per-chat actions: `mark_read` / `mark_unread` / `pin` / `unpin`, routed to Unipile when the channel supports it |
+| `email_flag_action` | Toggle STARRED/FLAGGED folder on an email via Unipile |
+| `sync_email_flags` | Reconcile `messages.flagged_at` against the STARRED folder on each email account; called on window focus |
+| `open_attachment` | Open a cached attachment with the OS default handler; writes to `std::env::temp_dir()/convolios-attachments/` |
 
 ### Key Helper Functions
 
@@ -216,8 +221,7 @@ App
     │   └── VCards (contact cards)
     └── ComposeBox
         ├── Text input (Enter to send, Shift+Enter for newline)
-        ├── File attachment (click or drag & drop)
-        ├── Voice note recording
+        ├── File attachment (click or drag & drop, 100 MB cap)
         └── Reply-to context bar
 ```
 
@@ -226,16 +230,20 @@ App
 | Hook | File | Purpose |
 |------|------|---------|
 | `useConversations` | `src/hooks/useConversations.ts` | Fetches conversation list via `get_conversations` RPC (server-side DISTINCT ON + persons JOIN). Calls `get_prev_inbound_batch` RPC for outbound conversation previews. Unread count comes from real `read_at`-based count. |
-| `useThread` | `src/hooks/useThread.ts` | Fetches all messages for a person, ordered by `sent_at`. Includes `useAddOptimisticMessage` for instant UI updates on send. |
-| `useRealtimeMessages` | `src/hooks/useRealtimeMessages.ts` | Subscribes to Supabase Realtime for `messages` INSERT/UPDATE events. Robust retry with exponential backoff, heartbeat check, and fallback polling. |
-| `useAuth` | `src/lib/auth.ts` | Manages Supabase Auth state. Handles deep link callbacks (`convolios://auth`). |
+| `useThread` | `src/hooks/useThread.ts` | Fetches all messages for a person, ordered by `sent_at`. Pending-message store (`addPendingMessage`, `markPendingFailed`, `removePending`, `patchPendingExternalId`) lets compose show optimistic sends and reconcile when realtime arrives. |
+| `useRealtimeMessages` | `src/hooks/useRealtimeMessages.ts` | Subscribes to Supabase Realtime for `messages` INSERT/UPDATE events. Robust retry with exponential backoff, 2-minute heartbeat that forces a reconnect, and 8-second fallback polling. Reconnect is driven by a `reconnectKey` state bump rather than poking `supabase.realtime.connect()` directly. Also calls `sync_email_flags` on window focus. |
+| `useCircles` | `src/hooks/useCircles.ts` | CRUD for circles (`useCreateCircle`, `useUpdateCircle`, `useDeleteCircle`) with optimistic cache updates. Also owns `useAddToCircle` / `useRemoveFromCircle`, `useApprovePerson` / `useBlockPerson` for screener actions, and `usePersonCircleColors` which returns a `Map<personId, string[]>` for the avatar color rings. |
+| `useFlaggedMessages` | `src/hooks/useFlaggedMessages.ts` | Calls `get_flagged_messages` RPC for the Flagged view. |
+| `useMergeSuggestions` | `src/hooks/useMergeSuggestions.ts` | Wraps the `merge-suggestions` edge function and the `merge_persons` / `undo_merge` RPCs. |
+| `useAuth` | `src/lib/auth.ts` | Manages Supabase Auth state. Caches the last user id in `localStorage` for instant cold-start render, then revalidates via `getSession()`. Handles deep link callbacks (`convolios://auth`). |
 
 ### Stores (Zustand)
 
 | Store | File | State |
 |-------|------|-------|
-| `inboxStore` | `src/stores/inboxStore.ts` | `selectedPersonId`, `activeChannel`, `triageFilter`, `searchQuery`. Includes `markConversationRead` action (calls Supabase RPC). Persisted via `@tauri-store/zustand`. |
+| `inboxStore` | `src/stores/inboxStore.ts` | `selectedPersonId`, `focusMessageId` (for flagged-message scroll-to-highlight), `activeChannel`, `activeView` (`inbox` / `screener` / `blocked` / `flagged`), `activeCircleId`, `readFilter`. Actions: `selectPerson`, `markConversationRead` (fires `chat_action` when read-sync preference is on), `markPersonUnread`, `pinPerson`, `flagMessage`. Persisted via `@tauri-store/zustand`. |
 | `accountsStore` | `src/stores/accountsStore.ts` | `accounts[]`, `loading`, `error`. Fetches from Supabase, subscribes to Realtime for status changes, includes polling fallback. |
+| `preferencesStore` | `src/stores/preferencesStore.ts` | User preferences (e.g. `syncReadStatus`). Persisted via `@tauri-store/zustand`. |
 
 ### Utility Functions (`src/utils/index.ts`)
 
@@ -313,7 +321,7 @@ Query cache is persisted to LocalStorage via `persistQueryClient`.
 | metadata | JSONB | |
 | created_at | TIMESTAMPTZ | |
 
-**Constraint:** `UNIQUE(channel, handle)` — this is **global** across all users (known issue, should be per-user).
+**Constraint:** `UNIQUE(user_id, channel, handle)` (migration 041). The original global `UNIQUE(channel, handle)` was replaced.
 
 **Index:** `identities_user_channel_handle_idx ON (user_id, channel, handle)` (added in 007).
 
@@ -560,11 +568,27 @@ Handles the X/Twitter OAuth 2.0 PKCE callback.
 2. Look up `code_verifier` from `x_oauth_state` table using `state`
 3. Exchange authorization code for access/refresh tokens via `POST https://api.x.com/2/oauth2/token`
 4. Fetch user profile from `GET https://api.x.com/2/users/me`
-5. Upsert `connected_account` with X credentials
-6. Clean up `x_oauth_state` row
-7. Show success page with `window.close()` to dismiss browser tab
+5. Encrypt the token bundle with AES-GCM via `_shared/crypto.ts` (`TOKEN_ENCRYPTION_KEY` env var required — callback fails loudly if it's missing rather than silently persisting plaintext)
+6. Upsert `connected_account` with `connection_params = { encrypted: <base64> }`
+7. Clean up `x_oauth_state` row (and `pg_cron` sweeps stragglers every 15 minutes — migration 052)
+8. Show success page with `window.close()` to dismiss browser tab
 
 **Security:** `escapeHtml()` applied to all user-controlled text in HTML responses.
+
+### `merge-suggestions/index.ts`
+
+Returns ranked merge candidates (same display_name across channels, fuzzy name matches, shared phone/email identity enrichment) for the Settings → Merge Suggestions tab. Validates the caller's JWT and scopes every query to the authenticated `user_id`.
+
+### `_shared/`
+
+| File | Purpose |
+|------|---------|
+| `cors.ts` | `webhookHeaders()` (no CORS — server-to-server) and `appCorsHeaders(origin)` (validates against `ALLOWED_ORIGINS`). `jsonResponse()` helper. |
+| `auth.ts` | `verifyWebhookSecret(header, secret)` — constant-time compare via double-HMAC with a single random key. |
+| `crypto.ts` | `encryptJson()` / `decryptJson()` using AES-GCM + `TOKEN_ENCRYPTION_KEY`. |
+| `channel-map.ts` | Single source of truth for mapping Unipile account types to our `Channel` (14 entries including MOBILE/SMS/RCS). |
+| `logging.ts` | Structured JSON logger. |
+| `validate.ts` | Zod schemas for each webhook payload shape. |
 
 ---
 
@@ -662,6 +686,8 @@ Supabase Realtime ──► React Frontend
 6. `supabase.auth.setSession({ access_token, refresh_token })` establishes session
 7. `onAuthStateChange` fires → app re-renders with user context
 
+**Cold-start cache:** `useAuth` persists the last authenticated user id in `localStorage` under `convolios-last-user-id`. On app launch, the cached id is used to render the authenticated shell immediately (no splash flicker); `supabase.auth.getSession()` runs in parallel and overwrites state with the real user or clears it if the session is gone. The cache is updated on every `onAuthStateChange` and cleared on `signOut`.
+
 **Note:** The original plan called for Clerk auth. This was changed to Supabase Auth to reduce vendor dependencies. The `persons.user_id` column stores the Supabase Auth UUID (cast to text).
 
 ---
@@ -728,6 +754,24 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 | 032 | `032_backfill_read_at.sql` | One-time fix: mark all historical inbound messages as read. |
 | 033 | `033_exclude_groups_from_merge.sql` | Exclude group chats from merge candidate pairs. |
 | 034 | `034_message_routing_safeguards.sql` | **Safety triggers**: DM thread→person ownership enforcement, immutable thread_id/person_id on messages, send audit log table. Rewrites `merge_persons` and `undo_merge` to bypass triggers. |
+| 035 | `035_fix_undo_merge.sql` | Fix `undo_merge` to bypass the 034 safeguard triggers (they blocked `person_id` updates) and add perf indexes for the merge workflow. |
+| 036 | `036_fix_merge_persons.sql` | Restore full `merge_persons` logic (dismissed entries, message reassignment) under the 034 trigger regime. |
+| 037 | `037_improve_merge_quality.sql` | Exclude self-identities, pinned pairs, and low-signal candidates from merge suggestions. |
+| 038 | `038_cleanup_ghost_persons.sql` | One-time cleanup: reassign messages of identity-less "ghost" persons to the right person via shared `thread_id`. |
+| 039 | `039_screener_default_pending.sql` | Default new persons to `pending` unless explicitly `outbound`, so inbound-only contacts always enter the screener. |
+| 040 | `040_normalize_whatsapp_handles.sql` | Normalize WhatsApp `+`-prefix handles and merge resulting duplicates. |
+| 041 | `041_fix_identity_unique_and_x_handles.sql` | Scope the `identities` uniqueness to `(user_id, channel, handle)` (previously global) and normalize X handles. |
+| 042 | `042_unread_pin.sql` | Add `marked_unread` reminder flag and `pinned_at` to persons. Updated `get_conversations` to expose both. |
+| 043 | `043_fix_lid_handles_and_merge.sql` | Fix WhatsApp LID-format handles that were incorrectly `+`-prefixed; merge resulting duplicates. |
+| 044 | `044_message_flagging.sql` | Per-message flagging (`flagged_at`) + `get_flagged_messages` RPC. |
+| 045 | `045_fix_self_identity_persons.sql` | Bug fix: multiple code paths were resolving "the other party" to the account owner's own identity. Adds `reassign_thread_person` helper. |
+| 046 | `046_harden_new_rpcs.sql` | Add `auth.uid()` checks and `REVOKE` grants on the 044/045 RPCs. |
+| 047 | `047_fix_instagram_self_persons.sql` | Fix self-identity detection on Instagram after the 045 rework. |
+| 048 | `048_x_requests_to_pending.sql` | Retroactively move inbound-only X contacts (Message Requests) into the screener. |
+| 049 | `049_promote_engaged_persons.sql` | Auto-promote pending persons once the user has actually replied to them. |
+| 050 | `050_schema_hardening.sql` | Phase-3 hardening: user-scoped `messages.external_id` uniqueness, `auth.uid()` guards on all read RPCs, CHECK constraints on `direction`/`triage`/`status`, partial index on active messages, `notes` length cap. |
+| 051 | `051_oauth_state_cleanup.sql` | `cleanup_expired_oauth_state()` function that purges `x_oauth_state` rows older than 1 hour. |
+| 052 | `052_schedule_oauth_state_cleanup.sql` | Wire the 051 function to `pg_cron` on a 15-minute schedule. |
 
 ---
 
@@ -743,8 +787,6 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 
 ### Non-issues (previously flagged, now clarified)
 
-4. **`identities` UNIQUE constraint is global** — `UNIQUE(channel, handle)` without `user_id`. This is fine for a single-user app — no cross-user collisions possible.
+4. **Service role key on disk** — The user's own machine accessing their own data. Acceptable for a single-user desktop app. Not baked into the binary — loaded from `.env.local` at runtime via dotenvy.
 
-5. **Service role key on disk** — The user's own machine accessing their own data. Acceptable for a single-user desktop app.
-
-6. **No message partitioning** — Irrelevant for single-user. One user's data is effectively one partition.
+5. **No message partitioning** — Irrelevant for single-user. One user's data is effectively one partition.

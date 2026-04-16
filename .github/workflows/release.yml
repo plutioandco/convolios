@@ -38,7 +38,6 @@ jobs:
           rm certificate.p12
 
       - name: Build Tauri app
-        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,50 +57,55 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
 
-      - name: Generate and upload latest.json if missing
+      - name: Ensure latest.json exists
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
 
-          # Check if latest.json already exists in the release
-          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q "latest.json"; then
-            echo "latest.json already uploaded by tauri-action, skipping."
+          # Check if latest.json already uploaded
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q "^latest.json$"; then
+            echo "latest.json already exists. Done."
             exit 0
           fi
 
-          echo "latest.json not found — generating manually."
+          echo "latest.json missing — generating manually."
 
-          # Find the sig file and tar.gz
-          SIG_FILE=$(find src-tauri/target/release/bundle -name "*.app.tar.gz.sig" | head -1)
-          TAR_FILE=$(find src-tauri/target/release/bundle -name "*.app.tar.gz" | head -1)
-
-          if [ -z "$SIG_FILE" ] || [ -z "$TAR_FILE" ]; then
-            echo "ERROR: Could not find .sig or .tar.gz file"
-            find src-tauri/target/release/bundle -type f -name "*.sig" -o -name "*.tar.gz" | sort
+          # Download the tar.gz from the release
+          TAR_NAME=$(gh release view "$TAG" --json assets --jq '.assets[].name' | grep '\.app\.tar\.gz$')
+          if [ -z "$TAR_NAME" ]; then
+            echo "ERROR: No .app.tar.gz found in release assets"
             exit 1
           fi
+          gh release download "$TAG" --pattern "$TAR_NAME" --dir /tmp
 
-          SIGNATURE=$(cat "$SIG_FILE")
+          # Sign using tauri CLI (uses TAURI_SIGNING_PRIVATE_KEY env var)
+          npx tauri signer sign "/tmp/$TAR_NAME" --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          SIGNATURE=$(cat "/tmp/${TAR_NAME}.sig")
+
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/$(basename "$TAR_FILE")"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${TAR_NAME}"
 
-          cat > latest.json <<EOF
-          {
-            "version": "${VERSION}",
-            "notes": "See the assets for download links.",
-            "pub_date": "${PUB_DATE}",
-            "platforms": {
-              "darwin-aarch64": {
-                "signature": "${SIGNATURE}",
-                "url": "${DOWNLOAD_URL}"
+          # Generate latest.json
+          node -e "
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/latest.json', JSON.stringify({
+              version: '${VERSION}',
+              notes: 'See the assets for download links.',
+              pub_date: '${PUB_DATE}',
+              platforms: {
+                'darwin-aarch64': {
+                  signature: fs.readFileSync('/tmp/${TAR_NAME}.sig', 'utf8').trim(),
+                  url: '${DOWNLOAD_URL}'
+                }
               }
-            }
-          }
-          EOF
+            }, null, 2));
+          "
 
-          # Also upload the sig file
-          gh release upload "$TAG" "$SIG_FILE" --clobber || true
-          gh release upload "$TAG" latest.json --clobber
-          echo "Uploaded latest.json and sig file to release."
+          gh release upload "$TAG" "/tmp/${TAR_NAME}.sig" --clobber || true
+          gh release upload "$TAG" /tmp/latest.json --clobber
+          echo "Uploaded latest.json to release."
+          cat /tmp/latest.json

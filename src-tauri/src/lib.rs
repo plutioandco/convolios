@@ -601,6 +601,66 @@ async fn disconnect_account(
   Ok(format!("Disconnected: purged {} persons", purged_persons.len()))
 }
 
+async fn ensure_webhooks(client: &reqwest::Client) -> Result<u32, String> {
+  let (api_key, base) = unipile_config()?;
+  let webhook_url = format!(
+    "{}/functions/v1/unipile-webhook",
+    std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set")?
+  );
+  let webhook_secret = std::env::var("UNIPILE_WEBHOOK_SECRET").unwrap_or_default();
+
+  let list_resp = client
+    .get(format!("{base}/api/v1/webhooks?limit=250"))
+    .header("X-API-KEY", &api_key)
+    .send().await
+    .map_err(|e| format!("webhook list: {e}"))?;
+
+  let existing: Vec<serde_json::Value> = if list_resp.status().is_success() {
+    let body: serde_json::Value = list_resp.json().await.unwrap_or_default();
+    body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
+  } else {
+    Vec::new()
+  };
+
+  let registered_sources: std::collections::HashSet<String> = existing.iter()
+    .filter(|w| {
+      w.get("request_url").and_then(|v| v.as_str()).unwrap_or("") == webhook_url
+    })
+    .filter_map(|w| w.get("source").and_then(|v| v.as_str()).map(String::from))
+    .collect();
+
+  let headers = if webhook_secret.is_empty() {
+    serde_json::json!([{"key": "Content-Type", "value": "application/json"}])
+  } else {
+    serde_json::json!([{"key": "x-webhook-secret", "value": webhook_secret}])
+  };
+
+  let sources = vec![
+    ("messaging", serde_json::json!(["message_received", "message_reaction", "message_read", "message_edited", "message_deleted", "message_delivered"])),
+    ("email", serde_json::json!(["mail_received", "mail_sent", "mail_moved"])),
+    ("account_status", serde_json::json!(["creation_success", "creation_fail", "reconnected", "error", "credentials"])),
+  ];
+
+  let mut created = 0u32;
+  for (source, events) in &sources {
+    if registered_sources.contains(*source) { continue; }
+    let body = serde_json::json!({
+      "request_url": webhook_url,
+      "source": source,
+      "events": events,
+      "name": format!("Convolios {}", source),
+      "headers": headers,
+    });
+    let resp = client.post(format!("{base}/api/v1/webhooks"))
+      .header("X-API-KEY", &api_key)
+      .header("Content-Type", "application/json")
+      .json(&body)
+      .send().await;
+    if let Ok(r) = resp { if r.status().is_success() { created += 1; } }
+  }
+  Ok(created)
+}
+
 #[tauri::command]
 async fn startup_sync(user_id: String, state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<String, String> {
   if state.syncing.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -629,6 +689,13 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     Ok(a) => a,
     Err(e) => { dev_log!("[startup_sync] account fetch failed: {e}"); return Ok(format!("Skipped: {e}")); }
   };
+
+  emit("syncing", "Ensuring webhooks…");
+  match ensure_webhooks(client).await {
+    Ok(n) if n > 0 => dev_log!("[startup_sync] registered {n} missing webhooks"),
+    Err(e) => dev_log!("[startup_sync] webhook check failed: {e}"),
+    _ => {}
+  }
 
   emit("syncing", &format!("Found {} accounts, checking recent activity...", accounts.len()));
 
@@ -664,7 +731,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     if let Ok(r) = resp { if r.status().is_success() || r.status().as_u16() == 409 { synced += 1; } }
   }
 
-  let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
+  let cutoff = (chrono::Utc::now() - chrono::Duration::hours(72))
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
@@ -692,7 +759,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     emit("syncing", &format!("Checking {} ({}/{})", acc.name, acc_idx + 1, active_accounts.len()));
 
     let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
-    let chats = match fetch_paginated(client, &chats_url, &api_key, 5).await {
+    let chats = match fetch_paginated(client, &chats_url, &api_key, 10).await {
       Ok(c) => c,
       Err(_) => continue,
     };
@@ -1158,7 +1225,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
 
   let mut result = format!("Synced {synced} accounts");
   if !to_remove.is_empty() { result.push_str(&format!(", cleaned {}", to_remove.len())); }
-  if msgs_synced > 0 { result.push_str(&format!(", backfilled {msgs_synced} msgs (24h)")); }
+  if msgs_synced > 0 { result.push_str(&format!(", backfilled {msgs_synced} msgs (72h)")); }
   if promoted > 0 { result.push_str(&format!(", promoted {promoted} contacts")); }
 
   emit("done", &result);

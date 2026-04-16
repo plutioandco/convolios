@@ -79,6 +79,25 @@ fn load_root_env() {
   let root = Path::new(manifest_dir).join("..");
   let _ = dotenvy::from_path(root.join(".env.local"));
   let _ = dotenvy::from_path(root.join(".env"));
+
+  // Production fallback: use values baked in at compile time (from CI env).
+  // In dev, .env.local is loaded above and takes priority.
+  set_if_missing("VITE_SUPABASE_URL", option_env!("VITE_SUPABASE_URL"));
+  set_if_missing("SUPABASE_SERVICE_ROLE_KEY", option_env!("SUPABASE_SERVICE_ROLE_KEY"));
+  set_if_missing("UNIPILE_API_KEY", option_env!("UNIPILE_API_KEY"));
+  set_if_missing("UNIPILE_API_URL", option_env!("UNIPILE_API_URL"));
+  set_if_missing("UNIPILE_WEBHOOK_SECRET", option_env!("UNIPILE_WEBHOOK_SECRET"));
+  set_if_missing("GEMINI_API_KEY", option_env!("GEMINI_API_KEY"));
+  set_if_missing("X_API_CLIENT_ID", option_env!("X_API_CLIENT_ID"));
+  set_if_missing("X_API_CLIENT_SECRET", option_env!("X_API_CLIENT_SECRET"));
+}
+
+fn set_if_missing(key: &str, compile_time: Option<&str>) {
+  if std::env::var(key).is_err() {
+    if let Some(val) = compile_time {
+      unsafe { std::env::set_var(key, val); }
+    }
+  }
 }
 
 fn unipile_config() -> Result<(String, String), String> {

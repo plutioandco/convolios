@@ -14,6 +14,7 @@ import { useInboxStore, useSyncStore, useFilterStore } from './stores/inboxStore
 import { useRealtimeMessages } from './hooks/useRealtimeMessages'
 import { useConversations } from './hooks/useConversations'
 import { useAuth, signOut } from './lib/auth'
+import { useUpdater } from './hooks/useUpdater'
 import { supabase } from './lib/supabase'
 import { queryClient } from './lib/queryClient'
 import { useAccountsStore } from './stores/accountsStore'
@@ -98,6 +99,23 @@ class SectionErrorBoundary extends Component<{ children: ReactNode; name: string
   }
 }
 
+function UpdateBanner() {
+  const { updateAvailable, updating, version, installUpdate } = useUpdater()
+  if (!updateAvailable) return null
+  return (
+    <div className="flex items-center justify-between px-4 py-2 bg-blue-600 text-white text-sm">
+      <span>Update {version} available</span>
+      <button
+        onClick={installUpdate}
+        disabled={updating}
+        className="px-3 py-1 bg-white text-blue-600 rounded text-xs font-medium hover:bg-blue-50 disabled:opacity-50"
+      >
+        {updating ? 'Updating...' : 'Restart & Update'}
+      </button>
+    </div>
+  )
+}
+
 function App() {
   const { user, loading } = useAuth()
 
@@ -114,6 +132,7 @@ function App() {
         },
       },
     }}>
+      <UpdateBanner />
       <div className="flex w-full h-screen overflow-hidden bg-surface-deep">
         {user ? <Authenticated userId={user.id} /> : loading ? <AppShellSkeleton /> : <SignInScreen />}
       </div>

@@ -873,10 +873,22 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         display_name = resolved_name;
       }
 
+      // For new conversations, pre-fetch messages to determine direction before creating person.
+      // Reused later to avoid a redundant API call.
+      let pre_fetched_msgs: Option<Vec<serde_json::Value>> = if msg_cutoff.is_none() && !is_group {
+        let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=50");
+        fetch_paginated(client, &msgs_url, &api_key, 3).await.ok()
+      } else {
+        None
+      };
+
       let direction_param = if is_group {
         Some("outbound")
       } else if msg_cutoff.is_none() {
-        Some("inbound")
+        let has_outbound = pre_fetched_msgs.as_ref().map_or(false, |msgs| {
+          msgs.iter().any(|m| m.get("is_sender").map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1)).unwrap_or(false))
+        });
+        Some(if has_outbound { "outbound" } else { "inbound" })
       } else {
         None
       };
@@ -908,6 +920,40 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         }
         _ => continue,
       };
+
+      // Reconcile: if this thread already has messages under a different person,
+      // reassign them. Happens when WhatsApp returns an internal LID on first sync
+      // and the real phone number on a subsequent sync.
+      if !is_group {
+        let thread_check_url = format!(
+          "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&thread_id=eq.{chat_id}&select=person_id&limit=1"
+        );
+        if let Ok(r) = client.get(&thread_check_url)
+          .header("apikey", &service_key)
+          .header("Authorization", format!("Bearer {service_key}"))
+          .send().await
+        {
+          if let Ok(rows) = r.json::<Vec<serde_json::Value>>().await {
+            if let Some(existing_pid) = rows.first().and_then(|r| r.get("person_id").and_then(|v| v.as_str())) {
+              if existing_pid != person_id {
+                dev_log!("[startup_sync] thread {chat_id}: reassigning from {existing_pid} → {person_id}");
+                let _ = client.post(format!("{supabase_url}/rest/v1/rpc/reassign_thread_person"))
+                  .header("apikey", &service_key)
+                  .header("Authorization", format!("Bearer {service_key}"))
+                  .header("Content-Type", "application/json")
+                  .json(&serde_json::json!({
+                    "p_user_id": user_id,
+                    "p_thread_id": chat_id,
+                    "p_from_person_id": existing_pid,
+                    "p_to_person_id": person_id,
+                    "p_to_identity_id": identity_id,
+                  }))
+                  .send().await;
+              }
+            }
+          }
+        }
+      }
 
       // For DMs, upload avatar if person has no avatar or avatar is stale
       if !is_group {
@@ -996,16 +1042,21 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         }
       }
 
-      let msgs_url = match &msg_cutoff {
-        Some(ts) => {
-          dev_log!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
-          format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}")
+      let messages = if let Some(m) = pre_fetched_msgs {
+        if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id} (pre-fetched)", m.len()); }
+        m
+      } else {
+        let msgs_url = match &msg_cutoff {
+          Some(ts) => {
+            dev_log!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
+            format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}")
+          }
+          None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
+        };
+        match fetch_paginated(client, &msgs_url, &api_key, 3).await {
+          Ok(m) => { if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
+          Err(e) => { dev_log!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
         }
-        None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
-      };
-      let messages = match fetch_paginated(client, &msgs_url, &api_key, 3).await {
-        Ok(m) => { if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
-        Err(e) => { dev_log!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
       };
 
       for msg in &messages {

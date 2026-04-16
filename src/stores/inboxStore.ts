@@ -7,9 +7,11 @@ import { queryClient } from '../lib/queryClient'
 import type { InfiniteData } from '@tanstack/react-query'
 import type { ConversationPreview, Message } from '../types'
 import type { Channel, TriageLevel } from '../types'
+import { usePreferencesStore } from './preferencesStore'
 
 interface InboxState {
   selectedPersonId: string | null
+  focusMessageId: string | null
   activeChannel: Channel | 'all'
   activeView: 'inbox' | 'screener' | 'blocked' | 'flagged'
   activeCircleId: string | null
@@ -19,7 +21,7 @@ interface InboxState {
   setActiveView: (view: InboxState['activeView']) => void
   setActiveCircleId: (circleId: string | null) => void
   setReadFilter: (filter: InboxState['readFilter']) => void
-  selectPerson: (personId: string | null) => void
+  selectPerson: (personId: string | null, focusMessageId?: string) => void
   markConversationRead: (userId: string, personId: string) => Promise<void>
   markPersonUnread: (userId: string, personId: string, unread: boolean) => Promise<void>
   pinPerson: (userId: string, personId: string, pinned: boolean) => Promise<void>
@@ -28,6 +30,7 @@ interface InboxState {
 
 export const useInboxStore = create<InboxState>((set) => ({
   selectedPersonId: null,
+  focusMessageId: null,
   activeChannel: 'all',
   activeView: 'inbox',
   activeCircleId: null,
@@ -38,7 +41,7 @@ export const useInboxStore = create<InboxState>((set) => ({
   setActiveCircleId: (activeCircleId) => set({ activeCircleId, activeView: 'inbox', activeChannel: 'all' }),
   setReadFilter: (readFilter) => set({ readFilter }),
 
-  selectPerson: (personId) => set({ selectedPersonId: personId }),
+  selectPerson: (personId, focusMessageId) => set({ selectedPersonId: personId, focusMessageId: focusMessageId ?? null }),
 
   markConversationRead: async (userId: string, personId: string) => {
     queryClient.setQueriesData<ConversationPreview[]>(
@@ -60,6 +63,15 @@ export const useInboxStore = create<InboxState>((set) => ({
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
     }
     queryClient.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
+
+    if (usePreferencesStore.getState().syncReadStatus) {
+      invoke('chat_action', {
+        userId, personId,
+        action: 'mark_read',
+      }).catch((e) => {
+        if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e)
+      })
+    }
   },
 
   markPersonUnread: async (userId: string, personId: string, unread: boolean) => {

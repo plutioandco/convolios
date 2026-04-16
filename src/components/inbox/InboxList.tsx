@@ -6,9 +6,9 @@ import { useAccountsStore } from '../../stores/accountsStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
 import { useFlaggedMessages } from '../../hooks/useFlaggedMessages'
-import { useCircles, useApprovePerson, useBlockPerson, useAddToCircle, useRemoveFromCircle } from '../../hooks/useCircles'
+import { useCircles, useApprovePerson, useBlockPerson, useAddToCircle, useRemoveFromCircle, usePersonCircleColors } from '../../hooks/useCircles'
 import { Check, CheckCheck, Users, X, ChevronRight, ShieldOff, Pin, BellDot, Flag } from 'lucide-react'
-import { channelColor, channelLabel, relativeTime, initials, avatarCls, cleanPreviewText, accountDisplayLabel } from '../../utils'
+import { channelColor, channelLabel, relativeTime, initials, avatarCls, cleanPreviewText, accountDisplayLabel, circleGradient } from '../../utils'
 import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
 import type { ConversationPreview, FlaggedMessage } from '../../types'
 
@@ -49,6 +49,7 @@ export function InboxList() {
   const rtConnected = useRealtimeConnected()
   const ch = useInboxStore((s) => s.activeChannel)
   const sel = useInboxStore((s) => s.selectedPersonId)
+  const focusMsg = useInboxStore((s) => s.focusMessageId)
   const pick = useInboxStore((s) => s.selectPerson)
   const activeView = useInboxStore((s) => s.activeView)
   const activeCircleId = useInboxStore((s) => s.activeCircleId)
@@ -59,9 +60,9 @@ export function InboxList() {
   const [query, setQuery] = useState('')
 
   const { data: circles = [] } = useCircles(user?.id)
-  const activeCircleName = activeCircleId
-    ? (circles.find((c) => c.id === activeCircleId)?.name ?? 'Circle')
-    : null
+  const { data: circleColors } = usePersonCircleColors(user?.id)
+  const activeCircle = activeCircleId ? circles.find((c) => c.id === activeCircleId) : null
+  const activeCircleName = activeCircle?.name ?? (activeCircleId ? 'Circle' : null)
 
   const [showAddPeople, setShowAddPeople] = useState(false)
   const [rowContextMenu, setRowContextMenu] = useState<{ convo: ConversationPreview; x: number; y: number } | null>(null)
@@ -174,7 +175,7 @@ export function InboxList() {
             {flaggedAll.filter((f) =>
               !query || f.displayName.toLowerCase().includes(query.toLowerCase())
             ).map((f) => (
-              <FlaggedRow key={f.messageId} f={f} active={sel === f.personId} onSelect={pick} />
+              <FlaggedRow key={f.messageId} f={f} active={focusMsg === f.messageId} onSelect={(personId, messageId) => pick(personId, messageId)} circleColors={circleColors} />
             ))}
           </>
         ) : showBlocked ? (
@@ -224,7 +225,7 @@ export function InboxList() {
 
             {pinned.map((c) => (
               <ConversationRow key={c.person.id} c={c} active={sel === c.person.id} onSelect={pick}
-                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} />
+                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} circleColors={circleColors} activeCircleColor={activeCircle?.color} />
             ))}
 
             {pinned.length > 0 && unpinned.length > 0 && (
@@ -233,7 +234,7 @@ export function InboxList() {
 
             {unpinned.map((c) => (
               <ConversationRow key={c.person.id} c={c} active={sel === c.person.id} onSelect={pick}
-                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} />
+                  onContextMenu={(convo, x, y) => setRowContextMenu({ convo, x, y })} circleColors={circleColors} activeCircleColor={activeCircle?.color} />
             ))}
           </>
         )}
@@ -346,10 +347,12 @@ function ChannelBadges({ channels }: { channels: string[] }) {
   )
 }
 
-function ConversationRow({ c, active, onSelect, onContextMenu }: {
+function ConversationRow({ c, active, onSelect, onContextMenu, circleColors, activeCircleColor }: {
   c: ConversationPreview; active: boolean
   onSelect: (id: string) => void
   onContextMenu: (convo: ConversationPreview, x: number, y: number) => void
+  circleColors?: Map<string, string[]>
+  activeCircleColor?: string
 }) {
   const isGroup = c.lastMessage.message_type === 'group'
   const clr = channelColor(c.lastMessage.channel)
@@ -360,6 +363,8 @@ function ConversationRow({ c, active, onSelect, onContextMenu }: {
   const senderPrefix = isGroup && _.isString(c.lastMessage.sender_name)
     ? `${c.lastMessage.sender_name.split(' ')[0]}: `
     : ''
+  const personColors = _.isString(activeCircleColor) ? [activeCircleColor] : (circleColors?.get(c.person.id) ?? [])
+  const gradient = circleGradient(personColors)
 
   return (
     <div
@@ -368,7 +373,10 @@ function ConversationRow({ c, active, onSelect, onContextMenu }: {
       className="conv-row"
       data-active={active}
     >
-      <div className="relative w-[42px] h-[42px] shrink-0">
+      <div
+        className={`relative w-[42px] h-[42px] shrink-0${gradient ? ` circle-ring${isGroup ? ' circle-ring--square' : ''}` : ''}`}
+        style={gradient ? { '--circle-gradient': gradient } as React.CSSProperties : undefined}
+      >
         {c.person.avatar_url
           ? <img src={c.person.avatar_url} alt="" className="w-[42px] h-[42px] rounded-full object-cover" />
           : <div className={`avatar avatar--2xl ${avatarCls(c.person.id)} ${isGroup ? 'rounded-[10px]' : ''}`}>
@@ -556,8 +564,9 @@ function BlockedRow({ c, userId }: { c: ConversationPreview; userId?: string }) 
   )
 }
 
-function FlaggedRow({ f, active, onSelect }: {
-  f: FlaggedMessage; active: boolean; onSelect: (id: string) => void
+function FlaggedRow({ f, active, onSelect, circleColors }: {
+  f: FlaggedMessage; active: boolean; onSelect: (personId: string, messageId: string) => void
+  circleColors?: Map<string, string[]>
 }) {
   const clr = channelColor(f.channel)
   const body = _.isString(f.subject) && f.subject.trim()
@@ -565,14 +574,19 @@ function FlaggedRow({ f, active, onSelect }: {
     : _.isString(f.bodyText)
       ? cleanPreviewText(f.bodyText).slice(0, 60)
       : 'Flagged message'
+  const personColors = circleColors?.get(f.personId) ?? []
+  const gradient = circleGradient(personColors)
 
   return (
     <div
-      onClick={() => onSelect(f.personId)}
+      onClick={() => onSelect(f.personId, f.messageId)}
       className="conv-row"
       data-active={active}
     >
-      <div className="relative w-[42px] h-[42px] shrink-0">
+      <div
+        className={`relative w-[42px] h-[42px] shrink-0${gradient ? ' circle-ring' : ''}`}
+        style={gradient ? { '--circle-gradient': gradient } as React.CSSProperties : undefined}
+      >
         {f.avatarUrl
           ? <img src={f.avatarUrl} alt="" className="w-[42px] h-[42px] rounded-full object-cover" />
           : <div className={`avatar avatar--2xl ${avatarCls(f.personId)}`}>

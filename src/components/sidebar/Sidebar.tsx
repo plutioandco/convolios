@@ -258,6 +258,21 @@ export function Sidebar() {
             return (
               <>
                 <p className="sidebar-context-title">{circle.name}</p>
+                <div className="sidebar-color-row px-2 py-1 mb-0">
+                  {CIRCLE_COLORS.map((col) => (
+                    <div
+                      key={col}
+                      onClick={() => {
+                        updateCircle.mutate({ id: circle.id, color: col })
+                        setContextMenu(null)
+                      }}
+                      className="sidebar-color-swatch"
+                      data-selected={circle.color === col ? 'true' : 'false'}
+                      style={{ background: col }}
+                    />
+                  ))}
+                </div>
+                <div className="sidebar-context-sep" />
                 <ContextItem icon={<Pencil size={14} />} label="Rename"
                   onClick={() => {
                     setRenamingId(circle.id)

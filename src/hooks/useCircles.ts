@@ -42,7 +42,45 @@ export function useUpdateCircle(userId: string | undefined) {
       const { error } = await supabase.from('circles').update(updates).eq('id', id)
       if (error) throw error
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['circles', userId] }),
+    onMutate: async ({ id, ...updates }) => {
+      await qc.cancelQueries({ queryKey: ['circles', userId] })
+      await qc.cancelQueries({ queryKey: ['person-circle-colors', userId] })
+
+      const prevCircles = qc.getQueryData<Circle[]>(['circles', userId])
+      const prevColors = qc.getQueryData<Map<string, string[]>>(['person-circle-colors', userId])
+
+      if (prevCircles) {
+        qc.setQueryData<Circle[]>(['circles', userId],
+          prevCircles.map((c) => c.id === id ? { ...c, ...updates } : c)
+        )
+      }
+
+      if (_.isString(updates.color) && prevCircles && prevColors) {
+        const oldColor = prevCircles.find((c) => c.id === id)?.color
+        if (_.isString(oldColor) && oldColor !== updates.color) {
+          const newMap = new Map(prevColors)
+          for (const [personId, colors] of newMap) {
+            const idx = colors.indexOf(oldColor)
+            if (idx !== -1) {
+              const updated = [...colors]
+              updated[idx] = updates.color
+              newMap.set(personId, updated)
+            }
+          }
+          qc.setQueryData(['person-circle-colors', userId], newMap)
+        }
+      }
+
+      return { prevCircles, prevColors }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.prevCircles) qc.setQueryData(['circles', userId], context.prevCircles)
+      if (context?.prevColors) qc.setQueryData(['person-circle-colors', userId], context.prevColors)
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['circles', userId] })
+      qc.invalidateQueries({ queryKey: ['person-circle-colors', userId] })
+    },
   })
 }
 
@@ -53,7 +91,10 @@ export function useDeleteCircle(userId: string | undefined) {
       const { error } = await supabase.from('circles').delete().eq('id', id)
       if (error) throw error
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['circles', userId] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['circles', userId] })
+      qc.invalidateQueries({ queryKey: ['person-circle-colors', userId] })
+    },
   })
 }
 
@@ -69,6 +110,7 @@ export function useAddToCircle(userId: string | undefined) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['circles', userId] })
       qc.invalidateQueries({ queryKey: ['conversations'] })
+      qc.invalidateQueries({ queryKey: ['person-circle-colors', userId] })
     },
   })
 }
@@ -87,6 +129,7 @@ export function useRemoveFromCircle(userId: string | undefined) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['circles', userId] })
       qc.invalidateQueries({ queryKey: ['conversations'] })
+      qc.invalidateQueries({ queryKey: ['person-circle-colors', userId] })
     },
   })
 }
@@ -152,6 +195,49 @@ export function useBlockPerson(userId: string | undefined) {
       qc.invalidateQueries({ queryKey: ['blocked-count', userId] })
       qc.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
     },
+  })
+}
+
+export function usePersonCircleColors(userId: string | undefined) {
+  return useQuery({
+    queryKey: ['person-circle-colors', userId],
+    queryFn: async () => {
+      const { data: circles, error: cErr } = await supabase
+        .from('circles')
+        .select('id, color, sort_order')
+        .eq('user_id', userId!)
+        .order('sort_order')
+      if (cErr) throw cErr
+
+      const circleIds = (circles ?? []).map((c) => c.id)
+      if (!circleIds.length) return new Map<string, string[]>()
+
+      const { data: members, error: mErr } = await supabase
+        .from('circle_members')
+        .select('circle_id, person_id')
+        .in('circle_id', circleIds)
+      if (mErr) throw mErr
+
+      const membersByCircle = new Map<string, string[]>()
+      for (const m of members ?? []) {
+        const list = membersByCircle.get(m.circle_id)
+        if (list) list.push(m.person_id)
+        else membersByCircle.set(m.circle_id, [m.person_id])
+      }
+
+      const map = new Map<string, string[]>()
+      for (const circle of circles!) {
+        const personIds = membersByCircle.get(circle.id) ?? []
+        for (const personId of personIds) {
+          const existing = map.get(personId)
+          if (existing) existing.push(circle.color)
+          else map.set(personId, [circle.color])
+        }
+      }
+      return map
+    },
+    enabled: _.isString(userId),
+    staleTime: 60_000,
   })
 }
 

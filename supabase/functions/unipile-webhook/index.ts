@@ -542,6 +542,9 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
 
     const folders = Array.isArray(em.folders) ? em.folders : [];
     const folder = folders[0] ?? null;
+    const isStarred = folders.some((f: string) =>
+      f.toUpperCase() === "STARRED" || f.toUpperCase() === "FLAGGED"
+    );
 
     const { error: msgError } = await supabase.from("messages").upsert(
       {
@@ -566,6 +569,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
         folder,
         seen: em.read_date ? true : false,
         read_at: em.read_date ?? null,
+        flagged_at: isStarred ? new Date().toISOString() : null,
       },
       { onConflict: "user_id,external_id", ignoreDuplicates: false }
     );
@@ -733,10 +737,36 @@ async function handleMailMoved(payload: Record<string, unknown>): Promise<Respon
   if (!emailId) return jsonResponse({ ok: true, skipped: "no_email_id" });
 
   const folder = (payload.folder ?? payload.destination ?? "") as string;
-  if (folder) {
+  const update: Record<string, unknown> = {};
+  if (folder) update.folder = folder;
+
+  if (UNIPILE_API_KEY && UNIPILE_API_URL) {
+    try {
+      const res = await fetch(
+        `${UNIPILE_API_URL}/api/v1/emails/${emailId}`,
+        { headers: { "X-API-KEY": UNIPILE_API_KEY } }
+      );
+      if (res.ok) {
+        const em = await res.json();
+        const folders = Array.isArray(em.folders) ? em.folders : [];
+        const isStarred = folders.some((f: string) =>
+          f.toUpperCase() === "STARRED" || f.toUpperCase() === "FLAGGED"
+        );
+        update.flagged_at = isStarred ? new Date().toISOString() : null;
+
+        if (!folder && folders.length > 0) {
+          update.folder = folders[0];
+        }
+      }
+    } catch (err) {
+      log.warn("mail_moved: email fetch failed", { emailId, error: String(err) });
+    }
+  }
+
+  if (Object.keys(update).length > 0) {
     await supabase
       .from("messages")
-      .update({ folder })
+      .update(update)
       .eq("external_id", emailId);
   }
 

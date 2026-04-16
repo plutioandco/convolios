@@ -8,6 +8,7 @@ import { useSyncStore } from '../../stores/inboxStore'
 import { queryClient } from '../../lib/queryClient'
 import { useCircles, useCreateCircle, useUpdateCircle, useDeleteCircle } from '../../hooks/useCircles'
 import { useDismissMerge, useMergeLog, useUndoMerge, useMergeClusters, useMergeCluster, useFuzzyMergeSuggestions } from '../../hooks/useMergeSuggestions'
+import { usePreferencesStore } from '../../stores/preferencesStore'
 import { channelLabel, channelColor, relativeTime, initials, avatarCls } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
 import type { ConnectedAccount, MergeCluster } from '../../types'
@@ -37,7 +38,7 @@ export function Settings() {
   const [pullMsg, setPullMsg] = useState('')
   const [disconnecting, setDisconnecting] = useState<string | null>(null)
   const [disconnectErr, setDisconnectErr] = useState('')
-  const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges'>('connections')
+  const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges' | 'preferences'>('connections')
 
   const refresh = useCallback(() => {
     if (user?.id) fetchAccounts(user.id)
@@ -100,6 +101,7 @@ export function Settings() {
           <NavItem active={activeTab === 'circles'} onClick={() => setActiveTab('circles')}>Circles</NavItem>
           <NavItem active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>Merge Suggestions</NavItem>
           <NavItem active={activeTab === 'merges'} onClick={() => setActiveTab('merges')}>Merge History</NavItem>
+          <NavItem active={activeTab === 'preferences'} onClick={() => setActiveTab('preferences')}>Preferences</NavItem>
         </div>
       </div>
 
@@ -167,6 +169,7 @@ export function Settings() {
         {activeTab === 'circles' && <CircleManagement userId={user?.id} />}
         {activeTab === 'suggestions' && <MergeSuggestionsView userId={user?.id} />}
         {activeTab === 'merges' && <MergeHistory userId={user?.id} />}
+        {activeTab === 'preferences' && <PreferencesSection />}
       </div>
     </div>
   )
@@ -949,3 +952,76 @@ function MergeHistory({ userId }: { userId?: string }) {
     </>
   )
 }
+
+function PreferencesSection() {
+  const syncReadStatus = usePreferencesStore((s) => s.syncReadStatus)
+  const setSyncReadStatus = usePreferencesStore((s) => s.setSyncReadStatus)
+
+  const pillCls = (active: boolean) =>
+    `text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${active ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`
+
+  return (
+    <>
+      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Preferences</h2>
+
+      <div className="settings-card">
+        <div className="settings-card-body">
+          <p className="settings-card-name">Sync read status</p>
+          <p className="settings-card-desc">
+            When enabled, opening a conversation or sending a reply marks it as read on the original platform.
+          </p>
+        </div>
+        <div className="flex gap-2 items-center">
+          <button onClick={() => setSyncReadStatus(true)} className={pillCls(syncReadStatus)}>On</button>
+          <button onClick={() => setSyncReadStatus(false)} className={pillCls(!syncReadStatus)}>Off</button>
+        </div>
+      </div>
+
+      <div className="h-px bg-border my-10" />
+
+      <h2 className="text-[20px] font-semibold mb-2 text-text-primary">Read Status Sync by Channel</h2>
+      <p className="text-sm text-text-muted mb-5">
+        Not all messaging platforms expose read status control. Here&apos;s what happens on each channel when sync is enabled.
+      </p>
+
+      <div className="rounded-card border border-border overflow-hidden">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-surface-deep text-text-secondary text-left">
+              <th className="py-2.5 px-4 font-semibold">Channel</th>
+              <th className="py-2.5 px-4 font-semibold">Read Sync</th>
+              <th className="py-2.5 px-4 font-semibold">Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {READ_SYNC_CHANNELS.map((row) => (
+              <tr key={row.channel} className="border-t border-border">
+                <td className="py-2.5 px-4">
+                  <span className="inline-flex items-center gap-2">
+                    <ChannelLogo channel={row.channel} size={16} />
+                    <span className="text-text-primary font-medium">{channelLabel(row.channel)}</span>
+                  </span>
+                </td>
+                <td className="py-2.5 px-4">
+                  {row.supported
+                    ? <span className="inline-flex items-center gap-1 text-success"><Check size={13} /> Supported</span>
+                    : <span className="text-text-muted">Not available</span>}
+                </td>
+                <td className="py-2.5 px-4 text-text-muted">{row.detail}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  )
+}
+
+const READ_SYNC_CHANNELS = [
+  { channel: 'whatsapp', supported: true,  detail: 'Clears unread badge. Sends read receipts if enabled in your WhatsApp privacy settings.' },
+  { channel: 'linkedin', supported: true,  detail: 'Marks messages as read on LinkedIn.' },
+  { channel: 'instagram', supported: false, detail: 'Not supported by the messaging provider API.' },
+  { channel: 'telegram', supported: false, detail: 'Not supported by the messaging provider API.' },
+  { channel: 'email',    supported: false, detail: 'Email uses a different protocol (IMAP). Not applicable.' },
+  { channel: 'x',        supported: false, detail: 'Not supported by the messaging provider API.' },
+]

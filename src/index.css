@@ -419,6 +419,22 @@ button { border: none; background: none; cursor: pointer; }
   font-weight: 600; color: var(--color-white); overflow: hidden; flex-shrink: 0;
 }
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+/* Circle membership ring (conic-gradient pie for multi-circle) */
+.circle-ring::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: var(--circle-gradient);
+}
+.circle-ring > img,
+.circle-ring > .avatar { position: relative; z-index: 1; }
+.circle-ring > span { z-index: 2; }
+.circle-ring--hero::before { inset: -4px; }
+.circle-ring--square::before { border-radius: 13px; }
+.circle-ring--hero.circle-ring--square::before { border-radius: 12px; }
+
 .avatar--xs  { width: 20px; height: 20px; font-size: 8px; }
 .avatar--sm  { width: 24px; height: 24px; font-size: var(--font-2xs); }
 .avatar--md  { width: 28px; height: 28px; font-size: var(--font-xs); }
@@ -781,6 +797,12 @@ button { border: none; background: none; cursor: pointer; }
 .msg-row--compact { min-height: 22px; }
 .msg-row:hover { background: var(--hover-light); }
 
+.msg-highlight > .msg-row { animation: msg-flash 1.5s ease-out; }
+@keyframes msg-flash {
+  0%, 15% { background: color-mix(in srgb, var(--color-warning) 18%, transparent); }
+  100% { background: transparent; }
+}
+
 .msg-avatar {
   position: absolute; left: 16px; top: 2px; width: 40px; height: 40px;
   border-radius: 50%; object-fit: cover; cursor: pointer;
@@ -934,13 +956,6 @@ button { border: none; background: none; cursor: pointer; }
   justify-content: center; gap: 6px;
 }
 .system-event-time { font-size: var(--font-xs); }
-
-/* Recording indicator */
-.recording-indicator {
-  flex: 1; display: flex; align-items: center; gap: 8px; padding: 11px 10px;
-}
-.recording-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-danger); animation: pulse 1s infinite; }
-.recording-label { font-size: var(--font-base); color: var(--color-danger); font-weight: 600; }
 
 /* ════════════════════════════════════════════════════
    MESSAGE COMPACT HOVER

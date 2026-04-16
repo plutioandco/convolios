@@ -32,12 +32,17 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "Developer ID Application: Plutio LTD (LV436N5433)"
+    }
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["convolios"]
+        "schemes": [
+          "convolios"
+        ]
       }
     },
     "shell": {

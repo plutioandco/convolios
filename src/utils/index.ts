@@ -91,6 +91,13 @@ export function avatarCls(id: string): string {
   return `av-${(n % 8) + 1}`
 }
 
+export function circleGradient(colors: string[]): string | undefined {
+  if (!colors.length) return undefined
+  if (colors.length === 1) return colors[0]
+  const step = 360 / colors.length
+  return `conic-gradient(${colors.map((c, i) => `${c} ${i * step}deg ${(i + 1) * step}deg`).join(', ')})`
+}
+
 const ZERO_WIDTH_RE = /[\u00AD\u200B\u200C\u200D\u200E\u200F\uFEFF\u2060\u034F]/g
 
 export function cleanPreviewText(text: string): string {

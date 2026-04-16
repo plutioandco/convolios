@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import _ from 'lodash'
+import { invoke } from '@tauri-apps/api/core'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
@@ -8,6 +9,8 @@ import type { Message } from '../types'
 const FALLBACK_POLL_INTERVAL = 8_000
 const DEAD_THRESHOLD = 300_000
 const AUTO_RETRY_INTERVALS = [5_000, 15_000, 30_000, 60_000]
+const HEARTBEAT_INTERVAL = 60_000
+const HEARTBEAT_STALE_THRESHOLD = 120_000
 
 interface RealtimeState {
   connected: boolean
@@ -33,16 +36,19 @@ async function notifyIfAllowed(title: string, body: string) {
 export function useRealtimeMessages(userId: string | undefined): RealtimeState {
   const [connected, setConnected] = useState(false)
   const [dead, setDead] = useState(false)
+  const [reconnectKey, setReconnectKey] = useState(0)
   const disconnectedSince = useRef<number | null>(null)
   const retryCount = useRef(0)
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastEventAt = useRef(Date.now())
+  const connectedRef = useRef(false)
 
   const reconnect = useCallback(() => {
     setDead(false)
     disconnectedSince.current = null
     retryCount.current = 0
     if (retryTimer.current) { clearTimeout(retryTimer.current); retryTimer.current = null }
-    supabase.realtime.connect()
+    setReconnectKey((k) => k + 1)
   }, [])
 
   useEffect(() => {
@@ -79,8 +85,9 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
       if (fallbackPoll) { clearInterval(fallbackPoll); fallbackPoll = null }
     }
 
+    const channelName = `messages-realtime-${reconnectKey}`
     const channel = supabase
-      .channel('messages-realtime')
+      .channel(channelName)
       .on<Message>(
         'postgres_changes',
         {
@@ -90,6 +97,7 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           filter: `user_id=eq.${userId}`,
         },
         (payload) => {
+          lastEventAt.current = Date.now()
           const msg = payload.new as Message
           if (import.meta.env.DEV) console.debug('[realtime] INSERT', msg.direction, msg.body_text?.slice(0, 30), msg.person_id)
           if (_.isString(msg.person_id)) {
@@ -113,6 +121,7 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           filter: `user_id=eq.${userId}`,
         },
         (payload) => {
+          lastEventAt.current = Date.now()
           const msg = payload.new as Message
           if (import.meta.env.DEV) console.debug('[realtime] UPDATE', msg.direction, msg.body_text?.slice(0, 30), msg.person_id)
           if (_.isString(msg.person_id)) {
@@ -125,6 +134,8 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
         if (import.meta.env.DEV) console.debug('[realtime] status', status)
 
         if (status === 'SUBSCRIBED') {
+          lastEventAt.current = Date.now()
+          connectedRef.current = true
           setConnected(true)
           setDead(false)
           disconnectedSince.current = null
@@ -134,6 +145,7 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
         }
 
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          connectedRef.current = false
           setConnected(false)
           if (!disconnectedSince.current) disconnectedSince.current = Date.now()
           startFallbackPolling()
@@ -147,22 +159,34 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           } else {
             if (retryTimer.current) clearTimeout(retryTimer.current)
             retryTimer.current = setTimeout(() => {
-              supabase.removeChannel(channel)
-              supabase.realtime.connect()
+              setReconnectKey((k) => k + 1)
             }, delay)
           }
         }
       })
 
-    const onFocus = () => invalidateAll()
+    const heartbeat = setInterval(() => {
+      if (connectedRef.current && document.hasFocus() && Date.now() - lastEventAt.current > HEARTBEAT_STALE_THRESHOLD) {
+        if (import.meta.env.DEV) console.debug('[realtime] heartbeat: no events for 2min, forcing reconnect')
+        setReconnectKey((k) => k + 1)
+      }
+    }, HEARTBEAT_INTERVAL)
+
+    const onFocus = () => {
+      invalidateAll()
+      invoke('sync_email_flags', { userId }).then((r) => {
+        if (_.isString(r) && r !== '0') {
+          queryClient.invalidateQueries({ queryKey: ['flagged', userId] })
+          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+        }
+      }).catch(() => {})
+    }
     const onOnline = () => {
       invalidateAll()
       setDead(false)
       disconnectedSince.current = null
       retryCount.current = 0
-      if (!supabase.realtime.isConnected()) {
-        supabase.realtime.connect()
-      }
+      setReconnectKey((k) => k + 1)
     }
     window.addEventListener('focus', onFocus)
     window.addEventListener('online', onOnline)
@@ -170,12 +194,13 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
     return () => {
       debouncedInvalidateConvos.cancel()
       stopFallbackPolling()
+      clearInterval(heartbeat)
       if (retryTimer.current) { clearTimeout(retryTimer.current); retryTimer.current = null }
       supabase.removeChannel(channel)
       window.removeEventListener('focus', onFocus)
       window.removeEventListener('online', onOnline)
     }
-  }, [userId])
+  }, [userId, reconnectKey])
 
   return { connected, dead, reconnect }
 }

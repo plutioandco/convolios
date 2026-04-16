@@ -5,18 +5,20 @@ import _ from 'lodash'
 import {
   Link as LinkIcon, Music, FileText, Paperclip, MapPin,
   Phone, Video, MessageSquare, Users, CornerDownLeft, Smile,
-  Pencil, X as XIcon, Play, Pause, Mic, Check, CheckCheck, Clock,
+  Pencil, X as XIcon, Play, Pause, Check, CheckCheck, Clock,
   Download, ChevronDown, Link2, Upload, Flag,
 } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
+import { usePreferencesStore } from '../../stores/preferencesStore'
 import { useRealtimeConnected } from '../../App'
 import { useConversations } from '../../hooks/useConversations'
 import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
+import { usePersonCircleColors } from '../../hooks/useCircles'
 import { supabase } from '../../lib/supabase'
-import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText } from '../../utils'
+import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, circleGradient } from '../../utils'
 import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
 import * as S from './threadStyles'
 import type { Message, Channel, Identity } from '../../types'
@@ -926,6 +928,7 @@ function MessageActions({ msg, onReply, onEdit, onFlag }: {
 
 export function ThreadView() {
   const pid = useInboxStore((s) => s.selectedPersonId)
+  const focusMessageId = useInboxStore((s) => s.focusMessageId)
   const markRead = useInboxStore((s) => s.markConversationRead)
   const clearUnread = useInboxStore((s) => s.markPersonUnread)
   const flagMsg = useInboxStore((s) => s.flagMessage)
@@ -934,6 +937,7 @@ export function ThreadView() {
   const { data: convos = [] } = useConversations(user?.id, rtConnected, 'approved')
   const { data: pendingConvos = [] } = useConversations(user?.id, rtConnected, 'pending')
   const { data: thread = [], isLoading: threadLoading, hasMore, loadMore, isLoadingMore } = useThread(pid, user?.id, rtConnected)
+  const { data: circleColors } = usePersonCircleColors(user?.id)
   const [memberAvatars, setMemberAvatars] = useState<Record<string, string>>({})
   const [replyTo, setReplyTo] = useState<Message | null>(null)
   const [editingMsg, setEditingMsg] = useState<Message | null>(null)
@@ -1002,6 +1006,7 @@ export function ThreadView() {
     ?? pendingConvos.find((c) => c.person.id === pid)
   const person = convo?.person
   const isGroup = thread.some((m) => m.message_type === 'group')
+  const heroGradient = person ? circleGradient(circleColors?.get(person.id) ?? []) : undefined
   const chatId = _.last(thread)?.thread_id
     ?? convo?.lastMessage?.thread_id
 
@@ -1133,19 +1138,32 @@ export function ThreadView() {
 
   const handleEditCancel = useCallback(() => setEditingMsg(null), [])
 
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const lastFocusedRef = useRef<string | null>(null)
+
   useEffect(() => {
     setReplyTo(null)
     setEditingMsg(null)
     setThreadChannelFilter('all')
+    lastFocusedRef.current = null
   }, [pid])
-
-  const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const sentinelRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const el = scrollContainerRef.current
     if (el) el.scrollTop = 0
   }, [pid])
+
+  useEffect(() => {
+    if (!focusMessageId || !scrollContainerRef.current) return
+    if (lastFocusedRef.current === focusMessageId) return
+    const el = scrollContainerRef.current.querySelector(`[data-msg-id="${focusMessageId}"]`) as HTMLElement | null
+    if (!el) return
+    lastFocusedRef.current = focusMessageId
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    el.classList.add('msg-highlight')
+    el.addEventListener('animationend', () => { el.classList.remove('msg-highlight') }, { once: true })
+  }, [focusMessageId, thread])
 
   useEffect(() => {
     const sentinel = sentinelRef.current
@@ -1206,14 +1224,24 @@ export function ThreadView() {
             <div className="px-4 pt-4">
               <div className="pt-4 pb-3">
                 {isGroup
-                  ? <div className={`${avatarCls(person.id)} w-20 h-20 rounded-lg flex items-center justify-center text-white`}>
-                      <Users size={36} />
+                  ? <div
+                      className={`relative w-20 h-20${heroGradient ? ' circle-ring circle-ring--hero circle-ring--square' : ''}`}
+                      style={heroGradient ? { '--circle-gradient': heroGradient } as React.CSSProperties : undefined}
+                    >
+                      <div className={`${avatarCls(person.id)} w-20 h-20 rounded-lg flex items-center justify-center text-white`}>
+                        <Users size={36} />
+                      </div>
                     </div>
-                  : person.avatar_url
-                    ? <img src={person.avatar_url} alt="" className="w-20 h-20 rounded-full object-cover" />
-                    : <div className={`${avatarCls(person.id)} avatar avatar--hero`}>
-                        {initials(person.display_name)}
-                      </div>}
+                  : <div
+                      className={`relative w-20 h-20${heroGradient ? ' circle-ring circle-ring--hero' : ''}`}
+                      style={heroGradient ? { '--circle-gradient': heroGradient } as React.CSSProperties : undefined}
+                    >
+                      {person.avatar_url
+                        ? <img src={person.avatar_url} alt="" className="w-20 h-20 rounded-full object-cover" />
+                        : <div className={`${avatarCls(person.id)} avatar avatar--hero`}>
+                            {initials(person.display_name)}
+                          </div>}
+                    </div>}
                 <h3 className="text-[24px] font-bold text-text-primary mt-2 flex items-center gap-2">
                   {person.display_name}
                   {availableChannels.length > 1 && (
@@ -1297,7 +1325,7 @@ export function ThreadView() {
                 (new Date(msg.sent_at).getTime() - new Date(prev.sent_at).getTime() <= 420_000)
 
               return (
-                <div key={msg.id} style={msg._pending ? { opacity: msg._failed ? 0.5 : 0.7 } : undefined}>
+                <div key={msg.id} data-msg-id={msg.id} style={msg._pending ? { opacity: msg._failed ? 0.5 : 0.7 } : undefined}>
                   {showDivider && <DayDivider iso={msg.sent_at} />}
                   {editingMsg?.id === msg.id
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
@@ -1674,15 +1702,10 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
       onDropFilesConsumed?.()
     }
   }, [pendingDropFiles, onDropFilesConsumed])
-  const [recording, setRecording] = useState(false)
-  const [recordDuration, setRecordDuration] = useState(0)
   const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null)
   const [showChannelPicker, setShowChannelPicker] = useState(false)
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<Blob[]>([])
-  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const channelPickerRef = useRef<HTMLDivElement>(null)
   const { user } = useAuth()
   const qc = useQueryClient()
@@ -1722,17 +1745,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const failedMessages = thread.filter((m) => m._failed)
 
   useEffect(() => {
-    return () => {
-      if (recordTimerRef.current) clearInterval(recordTimerRef.current)
-      const recorder = mediaRecorderRef.current
-      if (recorder && recorder.state !== 'inactive') {
-        recorder.stream.getTracks().forEach((t) => t.stop())
-        recorder.stop()
-      }
-    }
-  }, [])
-
-  useEffect(() => {
     const el = ref.current
     if (!el) return
     el.style.height = '0'
@@ -1766,93 +1778,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   }
 
   const removeFile = (idx: number) => setFiles((prev) => prev.filter((_, i) => i !== idx))
-
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mimeType = MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4'
-        : MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus'
-        : 'audio/webm'
-      const recorder = new MediaRecorder(stream, { mimeType })
-      audioChunksRef.current = []
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
-      recorder.start()
-      mediaRecorderRef.current = recorder
-      setRecording(true)
-      setRecordDuration(0)
-      recordTimerRef.current = setInterval(() => setRecordDuration((d) => d + 1), 1000)
-    } catch (e) {
-      if (import.meta.env.DEV) console.error('Mic access denied:', e)
-    }
-  }
-
-  const stopRecording = () => {
-    const recorder = mediaRecorderRef.current
-    if (!recorder) return
-    return new Promise<{ data: string; mime: string }>((resolve) => {
-      recorder.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType })
-        const reader = new FileReader()
-        reader.onload = () => {
-          const result = reader.result as string
-          const b64 = result.split(',')[1] ?? ''
-          resolve({ data: b64, mime: recorder.mimeType })
-        }
-        reader.readAsDataURL(blob)
-        recorder.stream.getTracks().forEach((t) => t.stop())
-      }
-      recorder.stop()
-      setRecording(false)
-      if (recordTimerRef.current) { clearInterval(recordTimerRef.current); recordTimerRef.current = null }
-    })
-  }
-
-  const cancelRecording = () => {
-    const recorder = mediaRecorderRef.current
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.stream.getTracks().forEach((t) => t.stop())
-      recorder.stop()
-    }
-    setRecording(false)
-    setRecordDuration(0)
-    if (recordTimerRef.current) { clearInterval(recordTimerRef.current); recordTimerRef.current = null }
-  }
-
-  const sendVoice = async () => {
-    if (!resolvedChatId) return
-    const result = await stopRecording()
-    if (!result) return
-    const meta = {
-      userId: last?.user_id ?? '',
-      personId,
-      channel: activeChannel,
-      messageType: last?.message_type ?? 'dm',
-      accountId: resolvedAccountId,
-    }
-    const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    cancelThread()
-    addPendingMessage(personId, {
-      id: optId, user_id: meta.userId, person_id: personId, identity_id: null,
-      external_id: null, channel: activeChannel, direction: 'outbound',
-      message_type: meta.messageType, subject: null, body_text: 'Voice message',
-      body_html: null, attachments: [{ type: 'ptt' }], thread_id: resolvedChatId,
-      sender_name: null, reactions: [], sent_at: new Date().toISOString(),
-      synced_at: '', triage: 'unclassified', seen: false, seen_by: null,
-      delivered: false, edited: false, deleted: false, hidden: false,
-      is_event: false, event_type: null, quoted_text: null, quoted_sender: null,
-      provider_id: null, chat_provider_id: null, in_reply_to_message_id: null,
-      smtp_message_id: null, unipile_account_id: null, folder: null, read_at: null, flagged_at: null,
-    })
-    try {
-      await invoke('send_voice_message', {
-        chatId: resolvedChatId, voiceData: result.data, voiceMime: result.mime, ...meta,
-      })
-      invalidateThread()
-    } catch (e) {
-      if (import.meta.env.DEV) console.error('Voice send failed:', e)
-      markPendingFailed(personId, optId)
-    }
-  }
 
   const sendText = (body: string) => {
     if (!body || !resolvedChatId) return
@@ -1911,8 +1836,13 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
 
     ;(async () => {
       try {
-        await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
+        const extId = await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
+        if (extId) patchPendingExternalId(personId, optId, extId)
         invalidateThread()
+        if (usePreferencesStore.getState().syncReadStatus) {
+          invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
+            .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
+        }
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
         markPendingFailed(personId, optId)
@@ -2001,6 +1931,10 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           if (extId) patchPendingExternalId(personId, optId, extId)
         }
         invalidateThread()
+        if (usePreferencesStore.getState().syncReadStatus) {
+          invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
+            .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
+        }
       } catch (e) {
         if (import.meta.env.DEV) console.error('Send failed:', e)
         markPendingFailed(personId, optId)
@@ -2123,33 +2057,16 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           <input ref={fileRef} type="file" multiple hidden
             onChange={(e) => { addFiles(e.target.files); e.target.value = '' }} />
 
-          {recording ? (
-            <div className="recording-indicator">
-              <span className="recording-dot" />
-              <span className="recording-label">
-                Recording {formatDuration(recordDuration)}
-              </span>
-              <div className="flex-1" />
-              <button onClick={cancelRecording} className="bg-transparent border-none cursor-pointer text-text-muted text-base px-2 py-0.5">Cancel</button>
-              <button onClick={sendVoice} className="bg-accent border-none cursor-pointer text-white text-md font-semibold px-3 py-1 rounded-sm">Send</button>
-            </div>
-          ) : (
-            <>
-              <textarea
-                ref={ref}
-                rows={1}
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                onKeyDown={onKeyDown}
-                onPaste={onPaste}
-                placeholder={`Message @${personName ?? 'this chat'}`}
-                className="compose-textarea"
-              />
-              {!text.trim() && files.length === 0 && (
-                <button onClick={startRecording} title="Voice message" className="compose-icon-btn"><Mic size={20} /></button>
-              )}
-            </>
-          )}
+          <textarea
+            ref={ref}
+            rows={1}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            placeholder={`Message @${personName ?? 'this chat'}`}
+            className="compose-textarea"
+          />
         </div>
       </div>
     </div>

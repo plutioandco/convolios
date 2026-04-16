@@ -139,7 +139,6 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `backfill_messages` | Full historical backfill — all accounts including X DMs and iMessage |
 | `send_message` | Send text message via Unipile, X API, or AppleScript (dispatched by channel) |
 | `send_attachment` | Send file attachment via Unipile multipart upload |
-| `send_voice_message` | Send voice note via Unipile |
 | `add_reaction` | Add emoji reaction to a message via Unipile |
 | `edit_message` | Edit a sent message (WhatsApp) via Unipile |
 | `fetch_attachment` | Download attachment binary from Unipile, return as base64 (with disk cache) |
@@ -477,7 +476,6 @@ Edge Functions and Rust backend use the **service role key** which bypasses RLS.
 | `GET /api/v1/messages/{id}` | Edge Function | Fetch full message (email) |
 | `POST /api/v1/chats/{id}/messages` | Rust `send_message` | Send text message |
 | `POST /api/v1/chats/{id}/messages` (multipart) | Rust `send_attachment` | Send file |
-| `POST /api/v1/chats/{id}/messages` (multipart audio) | Rust `send_voice_message` | Send voice note |
 | `PUT /api/v1/messages/{id}/reactions` | Rust `add_reaction` | Add emoji reaction |
 | `PATCH /api/v1/messages/{id}` | Rust `edit_message` | Edit message text |
 | `GET /api/v1/messages/{id}/attachment` | Rust `fetch_attachment` | Download attachment |

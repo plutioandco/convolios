@@ -55,7 +55,6 @@ pub fn run() {
       sync_chat,
       send_message,
       send_attachment,
-      send_voice_message,
       add_reaction,
       edit_message,
       fetch_attachment,
@@ -66,7 +65,8 @@ pub fn run() {
       connect_imessage,
       read_dropped_files,
       chat_action,
-      email_flag_action
+      email_flag_action,
+      sync_email_flags
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -1913,7 +1913,7 @@ async fn send_message(
     account_id.as_deref(), "sent", None,
   ).await;
 
-  Ok(body)
+  Ok(external_id.to_string())
 }
 
 async fn log_send_audit(
@@ -2069,6 +2069,98 @@ async fn email_flag_action(
 }
 
 #[tauri::command]
+async fn sync_email_flags(user_id: String, state: State<'_, AppState>) -> Result<String, String> {
+  let (api_key, base) = unipile_config()?;
+  let supabase_url = std::env::var("VITE_SUPABASE_URL").map_err(|_| "VITE_SUPABASE_URL not set".to_string())?;
+  let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
+  let client = &state.http;
+
+  let accounts = match fetch_accounts_inner(client).await {
+    Ok(a) => a,
+    Err(e) => { dev_log!("[sync_email_flags] account fetch: {e}"); return Ok("skip".to_string()); }
+  };
+  let email_accs: Vec<&UnipileAccount> = accounts.iter()
+    .filter(|a| channel_from_type(&a.account_type) == "email" && (a.status == "OK" || a.status == "RUNNING"))
+    .collect();
+  if email_accs.is_empty() { return Ok("no email accounts".to_string()); }
+
+  let mut starred_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+  for acc in &email_accs {
+    let url = format!("{base}/api/v1/emails?account_id={}&folder=STARRED&limit=100", acc.id);
+    match fetch_paginated(client, &url, &api_key, 3).await {
+      Ok(emails) => {
+        for em in &emails {
+          if let Some(id) = em.get("id").and_then(|v| v.as_str()) {
+            starred_ids.insert(id.to_string());
+          }
+        }
+      }
+      Err(e) => dev_log!("[sync_email_flags] starred fetch {}: {e}", acc.id),
+    }
+  }
+
+  let db_url = format!(
+    "{supabase_url}/rest/v1/messages?select=id,external_id&user_id=eq.{user_id}&channel=eq.email&flagged_at=not.is.null"
+  );
+  let db_flagged: Vec<serde_json::Value> = match client.get(&db_url)
+    .header("apikey", &service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .send().await
+  {
+    Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+    _ => Vec::new(),
+  };
+
+  let mut changes = 0u32;
+
+  for row in &db_flagged {
+    let ext_id = row.get("external_id").and_then(|v| v.as_str()).unwrap_or("");
+    let db_id = row.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if ext_id.is_empty() || db_id.is_empty() { continue; }
+
+    if !starred_ids.contains(ext_id) {
+      let patch_url = format!("{supabase_url}/rest/v1/messages?id=eq.{db_id}");
+      if let Ok(r) = client.patch(&patch_url)
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "flagged_at": serde_json::Value::Null }))
+        .send().await
+      {
+        if r.status().is_success() { changes += 1; }
+      }
+    }
+  }
+
+  let db_ext_ids: std::collections::HashSet<String> = db_flagged.iter()
+    .filter_map(|r| r.get("external_id").and_then(|v| v.as_str()).map(String::from))
+    .collect();
+
+  let now = chrono::Utc::now().to_rfc3339();
+  for ext_id in &starred_ids {
+    if !db_ext_ids.contains(ext_id) {
+      let patch_url = format!(
+        "{supabase_url}/rest/v1/messages?external_id=eq.{ext_id}&user_id=eq.{user_id}"
+      );
+      if let Ok(r) = client.patch(&patch_url)
+        .header("apikey", &service_key)
+        .header("Authorization", format!("Bearer {service_key}"))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "flagged_at": now }))
+        .send().await
+      {
+        if r.status().is_success() { changes += 1; }
+      }
+    }
+  }
+
+  if changes > 0 {
+    dev_log!("[sync_email_flags] {changes} flag changes synced");
+  }
+  Ok(format!("{changes}"))
+}
+
+#[tauri::command]
 async fn send_attachment(
   chat_id: String,
   text: Option<String>,
@@ -2142,7 +2234,7 @@ async fn send_attachment(
     account_id.as_deref(), "sent", Some("attachment"),
   ).await;
 
-  Ok(body)
+  Ok(external_id.to_string())
 }
 
 #[tauri::command]
@@ -2168,7 +2260,7 @@ async fn add_reaction(
   if !status.is_success() {
     return Err(format!("Reaction error {status}: {body}"));
   }
-  Ok(body)
+  Ok(String::new())
 }
 
 #[tauri::command]
@@ -2194,78 +2286,7 @@ async fn edit_message(
   if !status.is_success() {
     return Err(format!("Edit error {status}: {body}"));
   }
-  Ok(body)
-}
-
-#[tauri::command]
-async fn send_voice_message(
-  chat_id: String,
-  voice_data: String,
-  voice_mime: String,
-  user_id: String,
-  person_id: String,
-  channel: String,
-  message_type: String,
-  account_id: Option<String>,
-  state: State<'_, AppState>,
-) -> Result<String, String> {
-  if chat_id.is_empty() {
-    return Err("No chat_id provided — cannot send without a target chat".to_string());
-  }
-
-  let (api_key, base) = unipile_config()?;
-  let client = &state.http;
-  let aid = account_id.as_deref().unwrap_or("");
-
-  let raw = base64::Engine::decode(&base64_engine(), &voice_data)
-    .map_err(|e| format!("base64 decode: {e}"))?;
-
-  let ext = if voice_mime.contains("mp4") || voice_mime.contains("m4a") { "m4a" }
-    else if voice_mime.contains("ogg") { "ogg" }
-    else { "mp3" };
-
-  dev_log!("[send_voice] person={person_id} channel={channel} chat_id={chat_id}");
-
-  let voice_part = reqwest::multipart::Part::bytes(raw)
-    .file_name(format!("voice.{ext}"))
-    .mime_str(&voice_mime)
-    .map_err(|e| format!("mime: {e}"))?;
-  let mut form = reqwest::multipart::Form::new().part("voice_message", voice_part);
-  if !aid.is_empty() { form = form.text("account_id", aid.to_string()); }
-
-  let url = format!("{base}/api/v1/chats/{chat_id}/messages");
-  let response = client.post(&url).header("X-API-KEY", &api_key).multipart(form).send().await
-    .map_err(|e| format!("Voice send failed: {e}"))?;
-
-  let status = response.status();
-  let body = response.text().await.unwrap_or_default();
-
-  if !status.is_success() {
-    log_send_audit(
-      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
-      account_id.as_deref(), "error", Some(&format!("voice {status}: {body}")),
-    ).await;
-    return Err(format!("Voice send error {status}: {body}"));
-  }
-
-  let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-  let external_id = resp.get("message_id")
-    .or_else(|| resp.get("id"))
-    .and_then(|v| v.as_str())
-    .unwrap_or("");
-
-  let att_json = serde_json::json!([{ "type": "ptt", "mimetype": voice_mime }]);
-  persist_outbound(
-    &state.http, &user_id, &person_id, &channel, &message_type,
-    "", &chat_id, external_id, &att_json, account_id.as_deref(),
-  ).await.unwrap_or_else(|e| dev_log!("[send_voice] persist warning: {e}"));
-
-  log_send_audit(
-    client, &user_id, &person_id, &channel, &chat_id, &chat_id,
-    account_id.as_deref(), "sent", Some("voice"),
-  ).await;
-
-  Ok(body)
+  Ok(String::new())
 }
 
 // ─── X / TWITTER INTEGRATION ─────────────────────────────────────────────────
@@ -2616,7 +2637,7 @@ async fn send_x_dm(
       client, user_id, person_id, "x", "dm", text,
       dm_conversation_id, event_id, &serde_json::json!([]), None,
     ).await.unwrap_or_else(|e| dev_log!("[send_x_dm] persist: {e}"));
-    return Ok(serde_json::to_string(&b2).unwrap_or_default());
+    return Ok(event_id.to_string());
   }
 
   let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -2632,7 +2653,7 @@ async fn send_x_dm(
     dm_conversation_id, event_id, &serde_json::json!([]), None,
   ).await.unwrap_or_else(|e| dev_log!("[send_x_dm] persist: {e}"));
 
-  Ok(serde_json::to_string(&body).unwrap_or_default())
+  Ok(event_id.to_string())
 }
 
 async fn backfill_x_dms(
@@ -3173,7 +3194,7 @@ async fn send_imessage_dm(
     chat_id, &event_id, &serde_json::json!([]), None,
   ).await.unwrap_or_else(|e| dev_log!("[send_imessage] persist: {e}"));
 
-  Ok(r#"{"status":"sent"}"#.to_string())
+  Ok(event_id.to_string())
 }
 
 async fn persist_outbound(

@@ -115,23 +115,45 @@ function App() {
       },
     }}>
       <div className="flex w-full h-screen overflow-hidden bg-surface-deep">
-        {loading ? <SplashScreen /> : !user ? <SignInScreen /> : <Authenticated userId={user.id} />}
+        {user ? <Authenticated userId={user.id} /> : loading ? <AppShellSkeleton /> : <SignInScreen />}
       </div>
     </PersistQueryClientProvider>
     </ErrorBoundary>
   )
 }
 
-function SplashScreen() {
+function AppShellSkeleton() {
   return (
-    <div className="flex w-full h-full items-center justify-center">
-      <div className="flex flex-col items-center gap-3">
-        <div className="avatar avatar--hero av-1">C</div>
-        <div className="flex gap-1">
-          <span className="launch-dot" />
-          <span className="launch-dot" style={{ animationDelay: '0.15s' }} />
-          <span className="launch-dot" style={{ animationDelay: '0.3s' }} />
+    <div className="app-shell">
+      <div className="app-main">
+        <nav className="sidebar-nav">
+          <div className="flex flex-col items-center gap-2 pt-2">
+            {Array.from({ length: 6 }, (_, i) => (
+              <div key={i} className="skeleton w-12 h-12 rounded-2xl shrink-0" />
+            ))}
+          </div>
+        </nav>
+        <div className="inbox-panel">
+          <div className="inbox-search-bar">
+            <div className="skeleton h-8 rounded-md mx-3 mt-1" />
+          </div>
+          <div className="px-2 pt-3">
+            {Array.from({ length: 8 }, (_, i) => (
+              <div key={i} className="inbox-skeleton-row">
+                <div className="skeleton w-[42px] h-[42px] rounded-full shrink-0" />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className="skeleton h-3.5 rounded-sm flex-1" style={{ maxWidth: `${60 + (i % 3) * 15}%` }} />
+                    <div className="skeleton h-2.5 rounded-sm w-8 shrink-0" />
+                  </div>
+                  <div className="skeleton h-2.5 rounded-sm mb-1" style={{ width: `${40 + (i % 4) * 12}%` }} />
+                  <div className="skeleton h-2.5 rounded-sm" style={{ width: `${55 + (i % 3) * 10}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
+        <div className="app-content-col" />
       </div>
     </div>
   )
@@ -272,7 +294,7 @@ function Authenticated({ userId }: { userId: string }) {
   const nav = useNavigate()
 
   const disconnectedAccounts = useMemo(
-    () => accounts.filter((a) => a.status === 'credentials' || a.status === 'error'),
+    () => accounts.filter((a) => a.status === 'credentials' || a.status === 'error' || a.status === 'disconnected'),
     [accounts],
   )
 

@@ -20,8 +20,6 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       - name: Install dependencies
         run: npm ci
@@ -57,4 +55,4 @@ jobs:
           releaseBody: "See the assets for download links."
           releaseDraft: false
           prerelease: false
-          args: --target aarch64-apple-darwin
+          includeUpdaterJson: true

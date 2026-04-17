@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Lock, Plus, Trash2, Undo2, Link2, Check, X } from 'lucide-react'
+import { Lock, Plus, Trash2, Undo2, Link2, Check, X, AlertTriangle, RefreshCw } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
@@ -582,6 +582,127 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
         {connected && <span>Connected {connected}</span>}
         {synced && <span>Synced {synced}</span>}
       </div>
+
+      {a.channel === 'imessage' && a.status === 'active' && user?.id && (
+        <IMessageStats userId={user.id} />
+      )}
+    </div>
+  )
+}
+
+// Low-threshold. If fewer than this many messages are sitting in this Mac's
+// local chat.db, we surface the multi-device nudge prominently. Anything above
+// and we still show stats, just without the warning styling.
+const IMESSAGE_LOW_COUNT = 500
+
+function IMessageStats({ userId }: { userId: string }) {
+  const [stats, setStats] = useState<{
+    handle_count: number
+    message_count: number
+    oldest_message_at: string | null
+    newest_message_at: string | null
+    accessible: boolean
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [resyncing, setResyncing] = useState(false)
+  const [resyncMsg, setResyncMsg] = useState('')
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await invoke<typeof stats & object>('imessage_status')
+      setStats(s as NonNullable<typeof stats>)
+    } catch (e) {
+      console.error('[imessage_status] failed', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  const resync = useCallback(async () => {
+    setResyncing(true); setResyncMsg('')
+    try {
+      await invoke<string>('connect_imessage', { userId })
+      await invoke<string>('backfill_messages', { userId })
+      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+      await refresh()
+      setResyncMsg('Re-sync complete')
+      setTimeout(() => setResyncMsg(''), 3_000)
+    } catch (e) {
+      console.error('[imessage resync] failed', e)
+      setResyncMsg(String(e))
+    } finally {
+      setResyncing(false)
+    }
+  }, [userId, refresh])
+
+  const openReleases = () => open('https://github.com/plutioandco/convolios/releases/latest').catch(() => {})
+  const openMessages = () =>
+    open('x-apple.systempreferences:com.apple.preference.icloud').catch(() => {})
+
+  if (loading) return null
+  if (!stats?.accessible) return null
+
+  const isLow = stats.message_count < IMESSAGE_LOW_COUNT
+  const oldest = _.isString(stats.oldest_message_at) ? new Date(stats.oldest_message_at) : null
+  const oldestLabel = oldest && !isNaN(oldest.getTime())
+    ? oldest.toLocaleDateString(undefined, { month: 'short', year: 'numeric' })
+    : null
+
+  return (
+    <div className="mx-4 mb-3 rounded-card border border-border bg-surface-deep overflow-hidden">
+      <div className="flex items-center justify-between py-2.5 px-3 text-sm">
+        <div className="text-text-secondary">
+          <span className="text-text-primary font-medium">{stats.message_count.toLocaleString()}</span> messages
+          {' · '}
+          <span className="text-text-primary font-medium">{stats.handle_count.toLocaleString()}</span> contacts
+          {oldestLabel && <span className="text-text-muted"> · oldest from {oldestLabel}</span>}
+          <span className="text-text-muted"> · this Mac</span>
+        </div>
+        <button
+          onClick={resync}
+          disabled={resyncing}
+          className="inline-flex items-center gap-1 text-sm py-1 px-2.5 rounded-sm bg-[var(--hover-accent-strong)] text-text-primary border-none cursor-pointer disabled:opacity-50"
+          title="Re-read chat.db and push any new messages to Supabase"
+        >
+          <RefreshCw size={12} className={resyncing ? 'animate-spin' : ''} />
+          {resyncing ? 'Re-syncing…' : 'Re-sync'}
+        </button>
+      </div>
+      {resyncMsg && <p className="px-3 pb-2 text-xs text-text-muted">{resyncMsg}</p>}
+
+      {isLow ? (
+        <div className="border-t border-warning/30 bg-[var(--hover-warning-subtle)] py-2.5 px-3 flex items-start gap-2">
+          <AlertTriangle size={14} className="text-warning mt-0.5 shrink-0" />
+          <div className="flex-1 text-sm text-text-secondary leading-normal">
+            <p className="text-text-primary font-medium mb-0.5">iMessage history on this Mac is sparse.</p>
+            <p className="mb-2">
+              iMessage stores messages per-Mac. If you use iMessage on another device,
+              install Convolios there (your inbox will merge automatically) or enable
+              Messages in iCloud so this Mac downloads full history.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={openReleases}
+                className="text-sm font-medium py-1 px-2.5 rounded-sm bg-[var(--hover-accent-strong)] text-text-primary border-none cursor-pointer"
+              >
+                Install on another Mac
+              </button>
+              <button
+                onClick={openMessages}
+                className="text-sm font-medium py-1 px-2.5 rounded-sm bg-transparent text-text-secondary border border-border cursor-pointer"
+              >
+                Enable Messages in iCloud
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="border-t border-border py-2 px-3 text-xs text-text-muted">
+          Using iMessage on multiple devices? Install Convolios on each Mac — history merges automatically via shared sync.
+        </div>
+      )}
     </div>
   )
 }

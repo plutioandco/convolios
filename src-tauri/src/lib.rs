@@ -65,6 +65,7 @@ pub fn run() {
       reconcile_chats,
       connect_x_account,
       connect_imessage,
+      imessage_status,
       read_dropped_files,
       chat_action,
       email_flag_action,
@@ -3158,6 +3159,74 @@ async fn connect_imessage(
   }
 
   Ok(format!("Connected! Found {handle_count} contacts and {msg_count} messages."))
+}
+
+// Lightweight read-only stats on the local chat.db. Called by the Settings UI
+// whenever the page renders so the iMessage card reflects *current* state,
+// not whatever `connect_imessage` persisted into connection_params last time.
+// Returns null-ish zeros if the DB is missing or unreadable, so the UI can
+// still render (and the full connect flow will surface a clearer error).
+#[tauri::command]
+async fn imessage_status() -> Result<serde_json::Value, String> {
+  let db_path = match imessage_db_path() {
+    Ok(p) => p,
+    Err(_) => {
+      return Ok(serde_json::json!({
+        "handle_count": 0,
+        "message_count": 0,
+        "oldest_message_at": serde_json::Value::Null,
+        "newest_message_at": serde_json::Value::Null,
+        "accessible": false,
+      }));
+    }
+  };
+  let conn = match open_imessage_db(&db_path) {
+    Ok(c) => c,
+    Err(_) => {
+      return Ok(serde_json::json!({
+        "handle_count": 0,
+        "message_count": 0,
+        "oldest_message_at": serde_json::Value::Null,
+        "newest_message_at": serde_json::Value::Null,
+        "accessible": false,
+      }));
+    }
+  };
+  let handle_count: i64 = conn
+    .query_row("SELECT COUNT(*) FROM handle", [], |r| r.get(0))
+    .unwrap_or(0);
+  let message_count: i64 = conn
+    .query_row(
+      "SELECT COUNT(*) FROM message WHERE text IS NOT NULL AND text != ''",
+      [],
+      |r| r.get(0),
+    )
+    .unwrap_or(0);
+  let oldest: Option<i64> = conn
+    .query_row(
+      "SELECT MIN(date) FROM message WHERE text IS NOT NULL AND text != ''",
+      [],
+      |r| r.get(0),
+    )
+    .ok();
+  let newest: Option<i64> = conn
+    .query_row(
+      "SELECT MAX(date) FROM message WHERE text IS NOT NULL AND text != ''",
+      [],
+      |r| r.get(0),
+    )
+    .ok();
+
+  let oldest_iso = oldest.map(apple_date_to_rfc3339).filter(|s| !s.is_empty());
+  let newest_iso = newest.map(apple_date_to_rfc3339).filter(|s| !s.is_empty());
+
+  Ok(serde_json::json!({
+    "handle_count": handle_count,
+    "message_count": message_count,
+    "oldest_message_at": oldest_iso,
+    "newest_message_at": newest_iso,
+    "accessible": true,
+  }))
 }
 
 async fn backfill_imessage(

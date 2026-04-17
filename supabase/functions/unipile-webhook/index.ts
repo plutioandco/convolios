@@ -187,6 +187,19 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     .maybeSingle();
 
   if (existing) {
+    // Rust `persist_outbound` writes the row with a placeholder attachments
+    // blob (`[{ name, mimetype }]`, no id) because the send response doesn't
+    // expose attachment IDs. The webhook payload IS authoritative — upgrade
+    // the row so the UI can fetch and render the media.
+    if ((payload.attachments?.length ?? 0) > 0) {
+      const attachments = await enrichAttachments(
+        payload.attachments ?? [], payload.message_id,
+      );
+      await supabase
+        .from("messages")
+        .update({ attachments })
+        .eq("id", existing.id);
+    }
     return jsonResponse({ ok: true, skipped: "already_persisted" });
   }
 
@@ -398,18 +411,26 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       .maybeSingle();
 
     if (contentDup) {
+      const update: Record<string, unknown> = {
+        external_id: payload.message_id,
+        thread_id: payload.chat_id,
+        identity_id: identityId,
+        unipile_account_id: payload.account_id,
+        seen: fullMsg?.seen ?? false,
+        delivered: fullMsg?.delivered ?? false,
+        provider_id: fullMsg?.provider_id ?? null,
+        chat_provider_id: fullMsg?.chat_provider_id ?? null,
+      };
+      // Rust persist_outbound writes placeholder attachments without IDs —
+      // overwrite with the webhook's authoritative metadata so media renders.
+      if ((payload.attachments?.length ?? 0) > 0) {
+        update.attachments = await enrichAttachments(
+          payload.attachments ?? [], payload.message_id,
+        );
+      }
       await supabase
         .from("messages")
-        .update({
-          external_id: payload.message_id,
-          thread_id: payload.chat_id,
-          identity_id: identityId,
-          unipile_account_id: payload.account_id,
-          seen: fullMsg?.seen ?? false,
-          delivered: fullMsg?.delivered ?? false,
-          provider_id: fullMsg?.provider_id ?? null,
-          chat_provider_id: fullMsg?.chat_provider_id ?? null,
-        })
+        .update(update)
         .eq("id", contentDup.id);
       return jsonResponse({ ok: true, merged: "outbound_content_dedup" });
     }

@@ -8,6 +8,7 @@ on:
 jobs:
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
@@ -39,6 +40,7 @@ jobs:
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
+        timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}

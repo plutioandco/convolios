@@ -1,5 +1,6 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
-import { useSyncExternalStore, useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
+import { create } from 'zustand'
 import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import type { Message } from '../types'
@@ -7,47 +8,81 @@ import type { Message } from '../types'
 const PAGE_SIZE = 80
 
 // ─── Pending messages store ───────────────────────────────────────────────────
-// Lives outside React Query so refetches never discard unsent messages.
+// Zustand so React sees a fresh reference on every mutation (no tearing under
+// concurrent rendering). Lives outside React Query so refetches never discard
+// unsent messages.
 
-const pending = new Map<string, Message[]>()
-let listeners = new Set<() => void>()
-const notify = () => listeners.forEach((fn) => fn())
+interface PendingState {
+  byPerson: Record<string, Message[]>
+  add: (personId: string, msg: Message) => void
+  markFailed: (personId: string, optId: string) => void
+  remove: (personId: string, optId: string) => void
+  patchExternalId: (personId: string, optId: string, externalId: string) => void
+}
 
-function getSnapshot() { return pending }
-function subscribe(cb: () => void) { listeners.add(cb); return () => { listeners.delete(cb) } }
+const usePendingStore = create<PendingState>((set) => ({
+  byPerson: {},
+  add: (personId, msg) =>
+    set((state) => ({
+      byPerson: {
+        ...state.byPerson,
+        [personId]: [...(state.byPerson[personId] ?? []), { ...msg, _pending: true }],
+      },
+    })),
+  markFailed: (personId, optId) =>
+    set((state) => {
+      const list = state.byPerson[personId]
+      if (!list) return state
+      return {
+        byPerson: {
+          ...state.byPerson,
+          [personId]: list.map((m) => (m.id === optId ? { ...m, _failed: true } : m)),
+        },
+      }
+    }),
+  remove: (personId, optId) =>
+    set((state) => {
+      const list = state.byPerson[personId]
+      if (!list) return state
+      const next = list.filter((m) => m.id !== optId)
+      const byPerson = { ...state.byPerson }
+      if (next.length) byPerson[personId] = next
+      else delete byPerson[personId]
+      return { byPerson }
+    }),
+  patchExternalId: (personId, optId, externalId) =>
+    set((state) => {
+      const list = state.byPerson[personId]
+      if (!list) return state
+      return {
+        byPerson: {
+          ...state.byPerson,
+          [personId]: list.map((m) => (m.id === optId ? { ...m, external_id: externalId } : m)),
+        },
+      }
+    }),
+}))
 
 export function addPendingMessage(personId: string, msg: Message) {
-  const list = pending.get(personId) ?? []
-  pending.set(personId, [...list, { ...msg, _pending: true }])
-  notify()
+  usePendingStore.getState().add(personId, msg)
 }
 
 export function markPendingFailed(personId: string, optId: string) {
-  const list = pending.get(personId)
-  if (!list) return
-  pending.set(personId, list.map((m) => m.id === optId ? { ...m, _failed: true } : m))
-  notify()
+  usePendingStore.getState().markFailed(personId, optId)
 }
 
 export function removePending(personId: string, optId: string) {
-  const list = pending.get(personId)
-  if (!list) return
-  const next = list.filter((m) => m.id !== optId)
-  if (next.length) pending.set(personId, next)
-  else pending.delete(personId)
-  notify()
+  usePendingStore.getState().remove(personId, optId)
 }
 
 export function patchPendingExternalId(personId: string, optId: string, externalId: string) {
-  const list = pending.get(personId)
-  if (!list) return
-  pending.set(personId, list.map((m) => m.id === optId ? { ...m, external_id: externalId } : m))
-  notify()
+  usePendingStore.getState().patchExternalId(personId, optId, externalId)
 }
 
+const EMPTY: Message[] = []
+
 function usePendingMessages(personId: string | null): Message[] {
-  const store = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
-  return personId ? store.get(personId) ?? [] : []
+  return usePendingStore((s) => (personId ? s.byPerson[personId] ?? EMPTY : EMPTY))
 }
 
 function isMatch(real: Message, opt: Message): boolean {
@@ -83,7 +118,6 @@ function dedup(raw: Message[]): Message[] {
 // ─── useThread ────────────────────────────────────────────────────────────────
 
 export function useThread(personId: string | null, userId?: string, realtimeConnected?: boolean) {
-  const interval = realtimeConnected === false ? 8_000 : 30_000
   const pendingMsgs = usePendingMessages(personId)
 
   const query = useInfiniteQuery({
@@ -114,8 +148,7 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
       return lastPage[lastPage.length - 1]?.sent_at
     },
     enabled: _.isString(personId) && _.isString(userId),
-    refetchInterval: interval,
-    staleTime: 30_000,
+    refetchInterval: realtimeConnected === false ? 15_000 : false,
   })
 
   const realMessages = useMemo(() => {

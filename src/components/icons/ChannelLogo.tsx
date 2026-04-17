@@ -32,13 +32,6 @@ function resolveChannel(ch: string): string {
   return aliases[ch.toLowerCase()] ?? ch
 }
 
-export function isLightBrandColor(hex: string): boolean {
-  const r = parseInt(hex.slice(1, 3), 16)
-  const g = parseInt(hex.slice(3, 5), 16)
-  const b = parseInt(hex.slice(5, 7), 16)
-  return (r * 299 + g * 587 + b * 114) / 1000 > 186
-}
-
 export function ChannelLogo({ channel, size = 16, color, className, style }: ChannelLogoProps) {
   const resolved = resolveChannel(channel) as Channel
   const path = PATHS[resolved]

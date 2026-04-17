@@ -29,7 +29,7 @@ This document describes the actual implementation as it exists today. For the vi
 - **Query keys**: `['conversations', userId]`, `['thread', personId, userId]`.
 - **Fetching**: use `supabase.rpc()` for aggregations/lists, `supabase.from().select()` for simple reads.
 - **`enabled` guards**: use `_.isString(id)` (Lodash), not `typeof` or `!!`.
-- **Polling fallback**: `refetchInterval` switches between 8s (realtime down) and 30s (realtime healthy). Use `realtimeConnected` from `useRealtimeConnected()`.
+- **Polling fallback**: `refetchInterval` switches between 15s (realtime down) and 60s (realtime healthy). Use `realtimeConnected` from `useRealtimeConnected()`.
 - **Optimistic updates**: `queryClient.setQueryData` to append/modify cache, then `invalidateQueries` on error to reconcile.
 
 ### Rust IPC Patterns
@@ -231,7 +231,7 @@ App
 |------|------|---------|
 | `useConversations` | `src/hooks/useConversations.ts` | Fetches conversation list via `get_conversations` RPC (server-side DISTINCT ON + persons JOIN). Calls `get_prev_inbound_batch` RPC for outbound conversation previews. Unread count comes from real `read_at`-based count. |
 | `useThread` | `src/hooks/useThread.ts` | Fetches all messages for a person, ordered by `sent_at`. Pending-message store (`addPendingMessage`, `markPendingFailed`, `removePending`, `patchPendingExternalId`) lets compose show optimistic sends and reconcile when realtime arrives. |
-| `useRealtimeMessages` | `src/hooks/useRealtimeMessages.ts` | Subscribes to Supabase Realtime for `messages` INSERT/UPDATE events. Robust retry with exponential backoff, 2-minute heartbeat that forces a reconnect, and 8-second fallback polling. Reconnect is driven by a `reconnectKey` state bump rather than poking `supabase.realtime.connect()` directly. Also calls `sync_email_flags` on window focus. |
+| `useRealtimeMessages` | `src/hooks/useRealtimeMessages.ts` | Subscribes once per `userId` to Supabase Realtime for `messages` INSERT/UPDATE events. Reconnect is delegated to supabase-js (phoenix socket's own reconnect + rejoin timers); the hook does not implement its own retry loop. INSERT/UPDATE payloads are applied via `queryClient.setQueryData` to the `['thread', personId, userId]` cache, falling back to debounced conversation invalidation. The `showConnecting` flag is delayed by a 3s grace period so transient blips don't show a banner; the `dead` flag fires only after 120s of continuous disconnection. On wake/focus/online, `supabase.auth.getSession()` is called to force a token refresh (Supabase's built-in visibility handling is not 100% reliable in Tauri WKWebView), and `sync_email_flags` is kicked off. |
 | `useCircles` | `src/hooks/useCircles.ts` | CRUD for circles (`useCreateCircle`, `useUpdateCircle`, `useDeleteCircle`) with optimistic cache updates. Also owns `useAddToCircle` / `useRemoveFromCircle`, `useApprovePerson` / `useBlockPerson` for screener actions, and `usePersonCircleColors` which returns a `Map<personId, string[]>` for the avatar color rings. |
 | `useFlaggedMessages` | `src/hooks/useFlaggedMessages.ts` | Calls `get_flagged_messages` RPC for the Flagged view. |
 | `useMergeSuggestions` | `src/hooks/useMergeSuggestions.ts` | Wraps the `merge-suggestions` edge function and the `merge_persons` / `undo_merge` RPCs. |
@@ -696,23 +696,27 @@ Supabase Realtime ──► React Frontend
 
 ### Architecture (`src/hooks/useRealtimeMessages.ts`)
 
-The realtime system has three layers of resilience:
+The realtime system delegates reconnect to the supabase-js library rather than re-implementing it:
 
-1. **Primary:** Supabase Realtime WebSocket subscription on `messages` table, filtered by `user_id`
-2. **Heartbeat:** Supabase's built-in `heartbeatCallback` monitors connection health every 15s, auto-reconnects on `'disconnected'`. Web Worker (`worker: true`) prevents background tab throttling.
-3. **Fallback polling:** If WebSocket disconnects, polls every 8 seconds. After 2 minutes of continuous disconnection, shows "Live updates paused" banner with manual retry.
+1. **Primary:** Supabase Realtime WebSocket subscription on `messages` table, filtered by `user_id=eq.${userId}`. One channel per user, named `messages:${userId}`.
+2. **Web Worker heartbeat:** `realtime.worker: true` in `src/lib/supabase.ts` runs the WS heartbeat off the main thread, avoiding macOS/WKWebView timer coalescing when the window is backgrounded.
+3. **Polling fallback:** `useConversations` / `useThread` adjust `refetchInterval` to 15s when realtime is down, 60s when healthy. No in-hook `setInterval` — React Query owns the polling.
 
 **Reconnection:**
-- Supabase Realtime has built-in auto-reconnect with exponential backoff (1s, 2s, 5s, 10s)
-- The `heartbeatCallback` in `src/lib/supabase.ts` explicitly calls `supabase.realtime.connect()` on disconnect as a fallback
-- On window focus: invalidates all queries
-- On network online: reconnects if not already connected
+- Phoenix (the WS layer under Supabase) handles reconnect with built-in exponential backoff, `beforeReconnect → _reconnectAuth`, and channel-level `rejoinTimer`.
+- The library also attaches its own `visibilitychange` listener that tears down and reconnects on wake when `closeWasClean` is false.
+- **Do not** implement a second reconnect loop on the React side — it races with the library and causes the "stuck Connecting…" banner bug. If manual reconnect is needed, call `supabase.realtime.disconnect() + supabase.realtime.connect()` once, not in a loop.
 
-**Cache invalidation:**
-- On `INSERT`: invalidates `['conversations', userId]` and `['thread', personId, userId]`
-- On `UPDATE`: same invalidation pattern
+**Cache updates:**
+- On `INSERT`: `setQueryData(['thread', personId, userId], …)` to prepend the message, plus debounced invalidation of `['conversations', userId]` and `['sidebar-unread', userId]`.
+- On `UPDATE`: `setQueryData(['thread', personId, userId], …)` to patch the message in place, plus debounced conversation invalidation. No full refetch.
 
-The `useConversations` hook also adjusts its polling interval based on realtime connection status: 30s when connected, 8s when disconnected.
+**Auth token refresh:**
+- auth-js auto-refreshes tokens when the tab is visible (`visibilitychange` → `_recoverAndRefresh`). SupabaseClient wires `TOKEN_REFRESHED` events to `realtime.setAuth(token)` internally, and realtime pushes the new token to each open channel via `CHANNEL_EVENTS.access_token`.
+- On wake/focus/online the hook calls `supabase.auth.getSession()` to force a refresh as a belt-and-braces measure — WKWebView in Tauri does not always fire `visibilitychange` reliably on OS sleep→wake.
+
+**Offline detection:**
+- `navigator.onLine` is unreliable in Tauri WKWebView after sleep/wake. `App.tsx` instead probes `${VITE_SUPABASE_URL}/auth/v1/health` every 15s; the offline banner only shows after 2 consecutive failures.
 
 ---
 
@@ -785,8 +789,12 @@ The `useConversations` hook also adjusts its polling interval based on realtime 
 
 3. **No `ChannelProvider` abstraction** — PLAN.md called for abstracting Unipile behind a generic interface. Not implemented. Unipile is hardcoded in the Rust backend. Only matters if switching providers.
 
-### Non-issues (previously flagged, now clarified)
+### Known security issues (P0, roadmapped)
 
-4. **Service role key on disk** — The user's own machine accessing their own data. Acceptable for a single-user desktop app. Not baked into the binary — loaded from `.env.local` at runtime via dotenvy.
+1. **Secrets baked into the shipped binary** — `src-tauri/src/lib.rs:load_root_env()` uses `option_env!()` to fall back to compile-time env values for `SUPABASE_SERVICE_ROLE_KEY`, `UNIPILE_API_KEY`, `UNIPILE_WEBHOOK_SECRET`, `GEMINI_API_KEY`, and `X_API_CLIENT_SECRET`. These end up as string literals inside the shipped `.app` bundle, recoverable by anyone who `strings` the binary. For a single-user, signed-build, trusted-device deployment this is manageable, but it is **not** suitable for multi-user distribution. The path forward is to move every Rust `service_role`-authenticated REST call (~80 call sites) into Supabase Edge Functions that the client invokes with the user's JWT, and retire the service role key from the client entirely. Until then, do not distribute production builds publicly.
+
+2. **Email HTML sanitization** — Handled by `DOMPurify` in `src/components/thread/ThreadView.tsx` (as of this change). Tracking-pixel stripping and dark-mode style rewriting are implemented as DOMPurify hooks. Do not roll a custom sanitizer.
+
+### Non-issues (previously flagged, now clarified)
 
 5. **No message partitioning** — Irrelevant for single-user. One user's data is effectively one partition.

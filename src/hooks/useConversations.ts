@@ -108,11 +108,11 @@ async function fetchConversations(userId: string, status?: string, circleId?: st
 
   const batchMap: Record<string, Record<string, unknown>> = {}
   if (outboundPersonIds.length > 0) {
-    const { data: inboundRows } = await supabase.rpc('get_prev_inbound_batch', {
+    const { data: inboundRows, error: batchErr } = await supabase.rpc('get_prev_inbound_batch', {
       p_user_id: userId,
       p_person_ids: outboundPersonIds,
     })
-    if (inboundRows) {
+    if (!batchErr && inboundRows) {
       for (const row of inboundRows as Record<string, unknown>[]) {
         batchMap[row.person_id as string] = row
       }
@@ -125,12 +125,10 @@ async function fetchConversations(userId: string, status?: string, circleId?: st
 }
 
 export function useConversations(userId: string | undefined, realtimeConnected?: boolean, status?: string, circleId?: string | null) {
-  const interval = realtimeConnected === false ? 8_000 : 30_000
   return useQuery({
     queryKey: ['conversations', userId, status ?? 'approved', circleId ?? null],
     queryFn: () => fetchConversations(userId!, status, circleId),
     enabled: _.isString(userId),
-    refetchInterval: interval,
-    staleTime: 60_000,
+    refetchInterval: realtimeConnected === false ? 15_000 : 60_000,
   })
 }

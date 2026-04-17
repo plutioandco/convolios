@@ -135,7 +135,7 @@ export function useRemoveFromCircle(userId: string | undefined) {
 }
 
 export function usePendingCount(userId: string | undefined, realtimeConnected?: boolean) {
-  const interval = realtimeConnected === false ? 8_000 : 30_000
+  const interval = realtimeConnected === false ? 15_000 : 60_000
   return useQuery({
     queryKey: ['pending-count', userId],
     queryFn: async () => {
@@ -248,7 +248,7 @@ export interface SidebarUnread {
 }
 
 export function useSidebarUnread(userId: string | undefined, realtimeConnected?: boolean) {
-  const interval = realtimeConnected === false ? 8_000 : 30_000
+  const interval = realtimeConnected === false ? 15_000 : 60_000
   return useQuery({
     queryKey: ['sidebar-unread', userId],
     queryFn: async () => {

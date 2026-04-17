@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, createElement, useCallback, useMemo } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import DOMPurify from 'dompurify'
 import _ from 'lodash'
 import {
   Link as LinkIcon, Music, FileText, Paperclip, MapPin,
@@ -12,20 +13,24 @@ import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
 import { usePreferencesStore } from '../../stores/preferencesStore'
-import { useRealtimeConnected } from '../../App'
+import { useRealtimeConnected } from '../../lib/realtimeContext'
 import { useConversations } from '../../hooks/useConversations'
 import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { usePersonCircleColors } from '../../hooks/useCircles'
 import { supabase } from '../../lib/supabase'
-import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, circleGradient } from '../../utils'
-import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
+import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, circleGradient, isLightBrandColor } from '../../utils'
+import { ChannelLogo } from '../icons/ChannelLogo'
 import * as S from './threadStyles'
 import type { Message, Channel, Identity } from '../../types'
 
 const URL_SPLIT_RE = /(https?:\/\/[^\s<>]+)/g
 const URL_TEST_RE = /^https?:\/\//
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+
+function newOptimisticId(): string {
+  return `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+}
 
 function RichText({ text }: { text: string }) {
   const parts = text.split(URL_SPLIT_RE)
@@ -487,6 +492,7 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
   const [playing, setPlaying] = useState(false)
   const [progress, setProgress] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
+  const [audioDuration, setAudioDuration] = useState(0)
   const audioRef = useRef<HTMLAudioElement>(null)
 
   useEffect(() => {
@@ -498,10 +504,18 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
         setProgress(audio.currentTime / audio.duration)
       }
     }
+    const onMeta = () => {
+      if (audio.duration && isFinite(audio.duration)) setAudioDuration(audio.duration)
+    }
     const onEnd = () => { setPlaying(false); setProgress(0); setCurrentTime(0) }
     audio.addEventListener('timeupdate', onTime)
+    audio.addEventListener('loadedmetadata', onMeta)
     audio.addEventListener('ended', onEnd)
-    return () => { audio.removeEventListener('timeupdate', onTime); audio.removeEventListener('ended', onEnd) }
+    return () => {
+      audio.removeEventListener('timeupdate', onTime)
+      audio.removeEventListener('loadedmetadata', onMeta)
+      audio.removeEventListener('ended', onEnd)
+    }
   }, [src])
 
   const toggle = () => {
@@ -511,7 +525,7 @@ function VoiceNotePlayer({ src, duration }: { src: string; duration?: number }) 
     setPlaying(!playing)
   }
 
-  const dur = duration ?? (audioRef.current?.duration && isFinite(audioRef.current.duration) ? audioRef.current.duration : 0)
+  const dur = duration ?? audioDuration
 
   return (
     <div className="flex items-center gap-2" style={{ ...S.card, borderRadius: 'var(--radius-pill)', maxWidth: 280 }}>
@@ -569,7 +583,7 @@ function stripHtml(html: string): string {
 
   const doc = new DOMParser().parseFromString(cleaned, 'text/html')
   return (doc.body.textContent ?? '')
-    .replace(/[\u00AD\u200B\u200C\u200D\u200E\u200F\uFEFF\u2060\u034F]/g, '')
+    .replace(/\u00AD|\u200B|\u200C|\u200D|\u200E|\u200F|\uFEFF|\u2060|\u034F/gu, '')
     .replace(/\s+/g, ' ')
     .trim()
 }
@@ -604,69 +618,50 @@ function extractEmailPreview(msg: Message): string {
 const LIGHT_BG_RE = /background(-color)?\s*:\s*(#[c-fC-F][0-9a-fA-F]{5}|#[c-fC-F][0-9a-fA-F]{2}|#fff[0-9a-fA-F]{0,3}|white|rgb\(\s*1[7-9]\d\s*,\s*1[7-9]\d\s*,\s*1[7-9]\d\s*\)|rgb\(\s*2[0-5]\d\s*,\s*2[0-5]\d\s*,\s*2[0-5]\d\s*\))/gi
 const DARK_TEXT_RE = /(?<![a-z-])color\s*:\s*(#[0-6][0-9a-fA-F]{5}|#[0-6][0-9a-fA-F]{2}|black|#000[0-9a-fA-F]{0,3}|rgb\(\s*[0-9]\d?\s*,\s*[0-9]\d?\s*,\s*[0-9]\d?\s*\))/gi
 
-function sanitizeEmailHtml(html: string): string {
-  const doc = new DOMParser().parseFromString(html, 'text/html')
-
-  doc.querySelectorAll(
-    'script, style, meta[http-equiv], base, object, embed, applet, form, iframe, frame, frameset, link, svg, math, portal'
-  ).forEach((el) => el.remove())
-
-  const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT)
-  const comments: Comment[] = []
-  while (walker.nextNode()) comments.push(walker.currentNode as Comment)
-  comments.forEach((c) => {
-    const txt = c.textContent ?? ''
-    if (/\[if\s/i.test(txt) || /\[endif\]/i.test(txt)) c.remove()
-  })
-
-  doc.querySelectorAll('[style]').forEach((el) => {
-    const s = el.getAttribute('style') ?? ''
-    if (/display\s*:\s*none/i.test(s) || /visibility\s*:\s*hidden/i.test(s) || /mso-hide\s*:\s*all/i.test(s)) {
-      el.remove()
-    }
-  })
-
-  doc.querySelectorAll('img').forEach((img) => {
+DOMPurify.addHook('uponSanitizeElement', (node, data) => {
+  if (data.tagName === 'img') {
+    const img = node as HTMLImageElement
     const src = img.getAttribute('src') ?? ''
     const w = parseInt(img.getAttribute('width') ?? '0', 10)
     const h = parseInt(img.getAttribute('height') ?? '0', 10)
-    if ((w > 0 && w <= 2) || (h > 0 && h <= 2) || src.includes('track') || src.includes('/open') || src.includes('beacon') || src.includes('pixel') || src.includes('spacer')) {
-      img.remove()
+    if ((w > 0 && w <= 2) || (h > 0 && h <= 2) || /track|\/open|beacon|pixel|spacer/i.test(src)) {
+      node.parentNode?.removeChild(node)
     }
+  }
+})
+
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+  if (!(node instanceof Element)) return
+
+  if (node.tagName === 'A') {
+    node.setAttribute('target', '_blank')
+    node.setAttribute('rel', 'noopener noreferrer')
+  }
+
+  node.removeAttribute('bgcolor')
+  node.removeAttribute('background')
+
+  const style = node.getAttribute('style')
+  if (_.isString(style)) {
+    if (/display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style) || /mso-hide\s*:\s*all/i.test(style)) {
+      node.parentNode?.removeChild(node)
+      return
+    }
+    const patched = style
+      .replace(LIGHT_BG_RE, 'background-color: transparent')
+      .replace(DARK_TEXT_RE, 'color: inherit')
+    if (patched !== style) node.setAttribute('style', patched)
+  }
+})
+
+function sanitizeEmailHtml(html: string): string {
+  return DOMPurify.sanitize(html, {
+    FORBID_TAGS: ['style', 'script', 'iframe', 'frame', 'frameset', 'object', 'embed', 'applet', 'form', 'meta', 'base', 'link', 'svg', 'math', 'portal'],
+    FORBID_ATTR: ['srcdoc', 'formaction'],
+    ALLOW_DATA_ATTR: false,
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+    USE_PROFILES: { html: true },
   })
-
-  doc.querySelectorAll('*').forEach((el) => {
-    const remove: string[] = []
-    for (const attr of el.attributes) {
-      if (attr.name.startsWith('on')) { remove.push(attr.name); continue }
-      if (attr.name === 'srcdoc' || attr.name === 'formaction') { remove.push(attr.name); continue }
-      if (attr.name === 'href' || attr.name === 'src' || attr.name === 'action' || attr.name === 'xlink:href') {
-        const v = attr.value.replace(/[\u0000-\u001F\u007F]/g, '').trim().toLowerCase()
-        if (v.startsWith('javascript:') || v.startsWith('vbscript:') || v.startsWith('data:text/html') || v.startsWith('data:application/')) {
-          remove.push(attr.name)
-        }
-      }
-    }
-    remove.forEach((n) => el.removeAttribute(n))
-
-    if (el.tagName === 'A') {
-      el.setAttribute('target', '_blank')
-      el.setAttribute('rel', 'noopener noreferrer')
-    }
-
-    el.removeAttribute('bgcolor')
-    el.removeAttribute('background')
-
-    const style = el.getAttribute('style')
-    if (_.isString(style)) {
-      const patched = style
-        .replace(LIGHT_BG_RE, 'background-color: transparent')
-        .replace(DARK_TEXT_RE, 'color: inherit')
-      if (patched !== style) el.setAttribute('style', patched)
-    }
-  })
-
-  return doc.body.innerHTML
 }
 
 const EMAIL_SHADOW_STYLES = `
@@ -932,6 +927,11 @@ function MessageActions({ msg, onReply, onEdit, onFlag }: {
 
 export function ThreadView() {
   const pid = useInboxStore((s) => s.selectedPersonId)
+  return <ThreadViewInner key={pid ?? 'empty'} />
+}
+
+function ThreadViewInner() {
+  const pid = useInboxStore((s) => s.selectedPersonId)
   const focusMessageId = useInboxStore((s) => s.focusMessageId)
   const markRead = useInboxStore((s) => s.markConversationRead)
   const clearUnread = useInboxStore((s) => s.markPersonUnread)
@@ -951,7 +951,6 @@ export function ThreadView() {
   const [dragOver, setDragOver] = useState(false)
   const dragCounterRef = useRef(0)
 
-  useEffect(() => { setShowLinkPerson(false) }, [pid])
   const qc = useQueryClient()
 
   useEffect(() => {
@@ -1067,21 +1066,27 @@ export function ThreadView() {
             qc.invalidateQueries({ queryKey: ['conversations', user!.id] })
           }
         })
-        .catch(() => {})
+        .catch(() => {
+          qc.invalidateQueries({ queryKey: ['thread', pid] })
+        })
     }
 
     doSync()
-    const interval = setInterval(doSync, 30_000)
+    const syncMs = rtConnected ? 20_000 : 10_000
+    const interval = setInterval(doSync, syncMs)
     return () => clearInterval(interval)
-  }, [pid, user?.id, chatId])
+  }, [pid, user, chatId, rtConnected, qc])
+
+  const senderNamesKey = isGroup
+    ? _.uniq(
+        thread.filter((m) => m.direction === 'inbound' && _.isString(m.sender_name))
+          .map((m) => m.sender_name!)
+      ).sort().join('\u0000')
+    : ''
 
   useEffect(() => {
-    if (!isGroup) { setMemberAvatars({}); return }
-    const senderNames = _.uniq(
-      thread.filter((m) => m.direction === 'inbound' && _.isString(m.sender_name))
-        .map((m) => m.sender_name!)
-    )
-    if (senderNames.length === 0) return
+    if (!isGroup || !senderNamesKey) return
+    const senderNames = senderNamesKey.split('\u0000')
 
     let cancelled = false
 
@@ -1110,24 +1115,24 @@ export function ThreadView() {
       })
 
     return () => { cancelled = true }
-  }, [chatId, isGroup, thread.length])
+  }, [chatId, isGroup, senderNamesKey, user?.id])
 
-  const handleReply = useCallback((msg: Message) => {
+  const handleReply = (msg: Message) => {
     setReplyTo(msg)
     setEditingMsg(null)
-  }, [])
+  }
 
-  const handleFlag = useCallback((msg: Message) => {
+  const handleFlag = (msg: Message) => {
     if (!user?.id || !pid) return
     flagMsg(user.id, pid, msg.id, !_.isString(msg.flagged_at))
-  }, [user?.id, pid, flagMsg])
+  }
 
-  const handleEdit = useCallback((msg: Message) => {
+  const handleEdit = (msg: Message) => {
     setEditingMsg(msg)
     setReplyTo(null)
-  }, [])
+  }
 
-  const handleEditSubmit = useCallback(async (msgId: string, newText: string) => {
+  const handleEditSubmit = async (msgId: string, newText: string) => {
     const msg = thread.find((m) => m.external_id === msgId || m.id === msgId)
     const extId = msg?.external_id
     if (!extId) return
@@ -1138,25 +1143,14 @@ export function ThreadView() {
       if (import.meta.env.DEV) console.error('Edit failed:', e)
     }
     setEditingMsg(null)
-  }, [thread, pid, qc])
+  }
 
-  const handleEditCancel = useCallback(() => setEditingMsg(null), [])
+  const handleEditCancel = () => setEditingMsg(null)
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
   const lastFocusedRef = useRef<string | null>(null)
 
-  useEffect(() => {
-    setReplyTo(null)
-    setEditingMsg(null)
-    setThreadChannelFilter('all')
-    lastFocusedRef.current = null
-  }, [pid])
-
-  useEffect(() => {
-    const el = scrollContainerRef.current
-    if (el) el.scrollTop = 0
-  }, [pid])
 
   useEffect(() => {
     if (!focusMessageId || !scrollContainerRef.current) return
@@ -1393,7 +1387,7 @@ function ManualMergeDialog({ personId, personName, userId, allConvos, onClose }:
   const merge = useMergePersons(userId)
   const inputRef = useRef<HTMLInputElement>(null)
   const onCloseRef = useRef(onClose)
-  onCloseRef.current = onClose
+  useEffect(() => { onCloseRef.current = onClose }, [onClose])
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
@@ -1703,6 +1697,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
 
   useEffect(() => {
     if (pendingDropFiles?.length) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing parent drop-queue prop into local state is a legitimate imperative hand-off; parent calls onDropFilesConsumed to clear.
       setFiles((prev) => mergePendingFiles(prev, pendingDropFiles))
       onDropFilesConsumed?.()
     }
@@ -1735,8 +1730,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const resolvedChatId = lastForChannel?.thread_id
   const resolvedAccountId = lastForChannel?.unipile_account_id
     ?? activeIdentity?.unipile_account_id ?? ''
-
-  useEffect(() => { setSelectedChannel(null) }, [personId])
 
   useEffect(() => {
     if (!showChannelPicker) return
@@ -1791,7 +1784,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const sendText = (body: string) => {
     if (!body || !resolvedChatId) return
 
-    const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    const optId = newOptimisticId()
 
     const optimistic: Message = {
       id: optId,
@@ -1864,7 +1857,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
     if ((!body && files.length === 0) || !resolvedChatId) return
 
     const filesToSend = [...files]
-    const optId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    const optId = newOptimisticId()
 
     const optimistic: Message = {
       id: optId,

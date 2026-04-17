@@ -91,6 +91,13 @@ export function avatarCls(id: string): string {
   return `av-${(n % 8) + 1}`
 }
 
+export function isLightBrandColor(hex: string): boolean {
+  const r = parseInt(hex.slice(1, 3), 16)
+  const g = parseInt(hex.slice(3, 5), 16)
+  const b = parseInt(hex.slice(5, 7), 16)
+  return (r * 299 + g * 587 + b * 114) / 1000 > 186
+}
+
 export function circleGradient(colors: string[]): string | undefined {
   if (!colors.length) return undefined
   if (colors.length === 1) return colors[0]
@@ -98,7 +105,7 @@ export function circleGradient(colors: string[]): string | undefined {
   return `conic-gradient(${colors.map((c, i) => `${c} ${i * step}deg ${(i + 1) * step}deg`).join(', ')})`
 }
 
-const ZERO_WIDTH_RE = /[\u00AD\u200B\u200C\u200D\u200E\u200F\uFEFF\u2060\u034F]/g
+const ZERO_WIDTH_RE = /\u00AD|\u200B|\u200C|\u200D|\u200E|\u200F|\uFEFF|\u2060|\u034F/gu
 
 export function cleanPreviewText(text: string): string {
   if (!text) return ''

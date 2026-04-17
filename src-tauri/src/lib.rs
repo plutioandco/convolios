@@ -80,8 +80,16 @@ fn load_root_env() {
   let _ = dotenvy::from_path(root.join(".env.local"));
   let _ = dotenvy::from_path(root.join(".env"));
 
-  // Production fallback: use values baked in at compile time (from CI env).
+  // Production fallback: values baked in at compile time (from CI env).
   // In dev, .env.local is loaded above and takes priority.
+  //
+  // SECURITY (tracked in ARCHITECTURE.md "Known security issues"): the secrets
+  // below are embedded into the shipped binary via `option_env!`. Anyone with
+  // the .app bundle can recover them with `strings`. This is acceptable only
+  // for single-user, signed-build deployments on trusted devices. Do not ship
+  // to the public until the service-role / Unipile / Gemini / X-secret calls
+  // are moved behind Supabase Edge Functions and this block is reduced to the
+  // public VITE_SUPABASE_URL only.
   set_if_missing("VITE_SUPABASE_URL", option_env!("VITE_SUPABASE_URL"));
   set_if_missing("SUPABASE_SERVICE_ROLE_KEY", option_env!("SUPABASE_SERVICE_ROLE_KEY"));
   set_if_missing("UNIPILE_API_KEY", option_env!("UNIPILE_API_KEY"));
@@ -706,7 +714,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
   let client = &state.http;
   let accounts = match fetch_accounts_inner(client).await {
     Ok(a) => a,
-    Err(e) => { dev_log!("[startup_sync] account fetch failed: {e}"); return Ok(format!("Skipped: {e}")); }
+    Err(e) => { dev_log!("[startup_sync] account fetch failed: {e}"); return Err(format!("Account fetch failed: {e}")); }
   };
 
   emit("syncing", "Ensuring webhooks…");

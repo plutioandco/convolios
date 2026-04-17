@@ -1,4 +1,4 @@
-import { useState, useEffect, createContext, useContext, Component, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, Component, useMemo, useCallback, useRef } from 'react'
 import type { ReactNode, ErrorInfo } from 'react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
@@ -20,6 +20,7 @@ import { queryClient } from './lib/queryClient'
 import { useAccountsStore } from './stores/accountsStore'
 import { channelLabel, channelColor, accountDisplayLabel, initials, avatarCls, relativeTime, cleanPreviewText } from './utils'
 import { ChannelLogo } from './components/icons/ChannelLogo'
+import { RealtimeContext, useRealtimeConnected } from './lib/realtimeContext'
 import type { ConnectedAccount, Channel } from './types'
 import _ from 'lodash'
 
@@ -37,9 +38,6 @@ for (const k of Object.keys(window.localStorage)) {
 const PERSIST_ALLOWED_KEYS = new Set([
   'conversations', 'circles', 'sidebar-unread', 'pending-count',
 ])
-
-const RealtimeContext = createContext(true)
-export const useRealtimeConnected = () => useContext(RealtimeContext)
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null }
@@ -281,12 +279,12 @@ function SignInScreen() {
 }
 
 function Authenticated({ userId }: { userId: string }) {
-  const { connected, dead, reconnect } = useRealtimeMessages(userId)
+  const { connected, showConnecting, dead, reconnect } = useRealtimeMessages(userId)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const subscribe = useAccountsStore((s) => s.subscribe)
   const unsubscribe = useAccountsStore((s) => s.unsubscribe)
   const accounts = useAccountsStore((s) => s.accounts)
-  const [online, setOnline] = useState(navigator.onLine)
+  const [offline, setOffline] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const nav = useNavigate()
 
@@ -296,11 +294,37 @@ function Authenticated({ userId }: { userId: string }) {
   )
 
   useEffect(() => {
-    const on = () => setOnline(true)
-    const off = () => setOnline(false)
-    window.addEventListener('online', on)
-    window.addEventListener('offline', off)
-    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
+    let cancelled = false
+    let failures = 0
+    const probe = async () => {
+      try {
+        const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/auth/v1/health`, {
+          method: 'GET',
+          cache: 'no-store',
+        })
+        if (cancelled) return
+        if (res.ok) {
+          failures = 0
+          setOffline(false)
+        } else {
+          failures += 1
+          if (failures >= 2) setOffline(true)
+        }
+      } catch {
+        if (cancelled) return
+        failures += 1
+        if (failures >= 2) setOffline(true)
+      }
+    }
+    probe()
+    const onOnline = () => { failures = 0; probe() }
+    const interval = setInterval(probe, 15_000)
+    window.addEventListener('online', onOnline)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+      window.removeEventListener('online', onOnline)
+    }
   }, [])
 
   useEffect(() => {
@@ -317,24 +341,20 @@ function Authenticated({ userId }: { userId: string }) {
   useEffect(() => {
     fetchAccounts(userId)
     subscribe(userId)
-    invoke('startup_sync', { userId }).then(() => {
+
+    const runSync = () => {
+      invoke('startup_sync', { userId })
+        .finally(() => {
+          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+        })
+    }
+
+    runSync()
+    const syncInterval = setInterval(runSync, 120_000)
+
+    const unlistenDisconnect = listen<{ accountId?: string; channel?: string }>('account-disconnected', () => {
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-    }).catch((e: unknown) => {
-      if (import.meta.env.DEV) console.warn('[startup_sync]', e)
-    })
-
-    const syncInterval = setInterval(() => {
-      invoke('startup_sync', { userId }).then(() => {
-        queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-      }).catch((e: unknown) => {
-        if (import.meta.env.DEV) console.warn('[periodic_sync]', e)
-      })
-    }, 300_000)
-
-    const unlistenDisconnect = listen('account-disconnected', () => {
-      queryClient.clear()
-      try { window.localStorage.removeItem('convolios-query-cache-v9') } catch { /* best-effort */ }
-      useInboxStore.getState().selectPerson(null)
+      queryClient.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
       fetchAccounts(userId)
     })
 
@@ -357,19 +377,19 @@ function Authenticated({ userId }: { userId: string }) {
   return (
     <RealtimeContext.Provider value={connected}>
     <div className="app-shell">
-      {!online && (
+      {offline && (
         <div className="app-banner app-banner--danger">
           <WifiOff size={14} />
           <span>You are offline — messages will sync when reconnected</span>
         </div>
       )}
-      {dead && (
+      {!offline && dead && (
         <div className="app-banner app-banner--danger">
-          <span>Live updates paused — polling every 8s</span>
+          <span>Live updates paused — click retry to reconnect</span>
           <button onClick={reconnect} className="bg-[var(--hover-accent)] text-sm font-semibold px-2.5 py-0.5 rounded-sm">Retry</button>
         </div>
       )}
-      {!dead && !connected && online && (
+      {!offline && !dead && showConnecting && (
         <div className="app-banner app-banner--warning">
           <span className="pulse-dot w-1.5 h-1.5 rounded-full bg-black" />
           <span className="text-sm">Connecting...</span>

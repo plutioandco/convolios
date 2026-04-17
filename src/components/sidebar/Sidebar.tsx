@@ -1,13 +1,14 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { Settings, Plus, Pencil, Trash2, ShieldCheck, ShieldOff, Flag } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { useInboxStore } from '../../stores/inboxStore'
 import { useAccountsStore } from '../../stores/accountsStore'
-import { useRealtimeConnected } from '../../App'
+import { useRealtimeConnected } from '../../lib/realtimeContext'
 import { useCircles, useCreateCircle, useUpdateCircle, useDeleteCircle, usePendingCount, useBlockedCount, useSidebarUnread } from '../../hooks/useCircles'
 import { channelColor } from '../../utils'
-import { ChannelLogo, isLightBrandColor } from '../icons/ChannelLogo'
+import { ChannelLogo } from '../icons/ChannelLogo'
+import { isLightBrandColor } from '../../utils'
 import type { Channel } from '../../types'
 
 const CHANNELS: { id: Channel; label: string }[] = [
@@ -88,21 +89,21 @@ export function Sidebar() {
     return () => document.removeEventListener('mousedown', handler)
   }, [showCreate])
 
-  const submitCreate = useCallback(() => {
+  const submitCreate = () => {
     const name = createName.trim()
     if (!name) return
     createCircle.mutate({ name, color: createColor }, {
       onSuccess: () => { setShowCreate(false); setCreateName('') },
     })
-  }, [createName, createColor, createCircle])
+  }
 
-  const submitRename = useCallback(() => {
+  const submitRename = () => {
     const name = renameValue.trim()
     if (!name || !renamingId) { setRenamingId(null); return }
     updateCircle.mutate({ id: renamingId, name }, {
       onSuccess: () => setRenamingId(null),
     })
-  }, [renamingId, renameValue, updateCircle])
+  }
 
   const handleRightClick = (e: React.MouseEvent, circleId: string) => {
     e.preventDefault()

@@ -42,7 +42,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         timeout-minutes: 30
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Org policy clamps the default GITHUB_TOKEN to read-only, which
+          # blocks release create/upload. RELEASE_TOKEN is a fine-grained PAT
+          # with contents:write scoped to this repo only.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: "Developer ID Application: Plutio LTD (LV436N5433)"
@@ -70,7 +73,7 @@ jobs:
 
       - name: Ensure latest.json exists
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |

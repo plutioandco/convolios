@@ -7,8 +7,39 @@ export interface Person {
   ai_summary: string | null
   ai_summary_updated_at: string | null
   status: 'approved' | 'pending' | 'blocked'
+  done_at: string | null
   created_at: string
   updated_at: string
+}
+
+export type ThreadState =
+  | 'my_turn'
+  | 'their_turn'
+  | 'stalled'
+  | 'dropped'
+  | 'done'
+  | 'gate'
+  | 'snoozed'
+
+export interface OpenQuestion {
+  id: string
+  question_text: string
+  asked_at: string
+  message_id: string
+}
+
+export interface OpenCommitment {
+  id: string
+  commitment_text: string
+  direction: 'mine' | 'theirs'
+  due_hint: string | null
+  created_at: string
+  message_id: string
+}
+
+export interface ThreadContext {
+  questions: OpenQuestion[]
+  commitments: OpenCommitment[]
 }
 
 export interface Identity {
@@ -115,6 +146,9 @@ export interface ConversationPreview {
   channels: string[]
   markedUnread: boolean
   pinnedAt: string | null
+  turnState: ThreadState
+  snoozeUntil: string | null
+  snoozeOnTheirReply: boolean
 }
 
 export interface FlaggedMessage {

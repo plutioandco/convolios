@@ -5,20 +5,48 @@ import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
 import type { InfiniteData } from '@tanstack/react-query'
-import type { ConversationPreview, Message } from '../types'
+import type { ConversationPreview, Message, ThreadState } from '../types'
 import type { Channel, TriageLevel } from '../types'
 import { usePreferencesStore } from './preferencesStore'
+
+export type ActiveView =
+  | 'all'
+  | 'my_turn'
+  | 'their_turn'
+  | 'stalled'
+  | 'dropped'
+  | 'done'
+  | 'gate'
+  | 'snoozed'
+  | 'blocked'
+  | 'flagged'
+
+// Single source of truth for mapping a sidebar view onto the two RPC filters
+// (person.status + derived turn_state). Both InboxRoute (selection/keyboard
+// nav) and InboxList (rendered list) MUST go through this so their query
+// cache keys stay aligned — otherwise React Query double-fetches and the
+// selection lookup can't see rows the list rendered.
+export function viewToRpcParams(view: ActiveView): {
+  status: 'approved' | 'pending' | 'blocked'
+  state: ThreadState | null
+} {
+  if (view === 'gate')    return { status: 'pending',  state: 'gate' }
+  if (view === 'blocked') return { status: 'blocked',  state: null   }
+  if (view === 'flagged') return { status: 'approved', state: null   }
+  if (view === 'all')     return { status: 'approved', state: null   }
+  return { status: 'approved', state: view }
+}
 
 interface InboxState {
   selectedPersonId: string | null
   focusMessageId: string | null
   activeChannel: Channel | 'all'
-  activeView: 'inbox' | 'screener' | 'blocked' | 'flagged'
+  activeView: ActiveView
   activeCircleId: string | null
   readFilter: 'all' | 'unread'
 
   setActiveChannel: (channel: Channel | 'all') => void
-  setActiveView: (view: InboxState['activeView']) => void
+  setActiveView: (view: ActiveView) => void
   setActiveCircleId: (circleId: string | null) => void
   setReadFilter: (filter: InboxState['readFilter']) => void
   selectPerson: (personId: string | null, focusMessageId?: string) => void
@@ -26,19 +54,20 @@ interface InboxState {
   markPersonUnread: (userId: string, personId: string, unread: boolean) => Promise<void>
   pinPerson: (userId: string, personId: string, pinned: boolean) => Promise<void>
   flagMessage: (userId: string, personId: string, messageId: string, flagged: boolean) => Promise<void>
+  markPersonDone: (userId: string, personId: string, done: boolean) => Promise<void>
 }
 
 export const useInboxStore = create<InboxState>((set) => ({
   selectedPersonId: null,
   focusMessageId: null,
   activeChannel: 'all',
-  activeView: 'inbox',
+  activeView: 'all',
   activeCircleId: null,
   readFilter: 'all',
 
-  setActiveChannel: (channel) => set({ activeChannel: channel, activeView: 'inbox', activeCircleId: null }),
-  setActiveView: (activeView) => set({ activeView, activeCircleId: null, activeChannel: 'all', readFilter: 'all' }),
-  setActiveCircleId: (activeCircleId) => set({ activeCircleId, activeView: 'inbox', activeChannel: 'all' }),
+  setActiveChannel: (channel) => set({ activeChannel: channel }),
+  setActiveView: (activeView) => set({ activeView }),
+  setActiveCircleId: (activeCircleId) => set({ activeCircleId }),
   setReadFilter: (readFilter) => set({ readFilter }),
 
   selectPerson: (personId, focusMessageId) => set({ selectedPersonId: personId, focusMessageId: focusMessageId ?? null }),
@@ -177,14 +206,61 @@ export const useInboxStore = create<InboxState>((set) => ({
       })
     }
   },
+
+  markPersonDone: async (userId: string, personId: string, done: boolean) => {
+    // Optimistic: toggle done_at + turn_state only for the "done -> done"
+    // case. Un-done-ing depends on time thresholds (2d / 3d) that live in
+    // SQL — we don't try to replicate them client-side; just invalidate on
+    // success so the server-derived turn_state lands quickly.
+    const nowIso = new Date().toISOString()
+    queryClient.setQueriesData<ConversationPreview[]>(
+      { queryKey: ['conversations', userId] },
+      (old) => {
+        if (!old) return old
+        return old.map((c) =>
+          c.person.id === personId
+            ? {
+                ...c,
+                person: { ...c.person, done_at: done ? nowIso : null },
+                ...(done ? { turnState: 'done' as const } : {}),
+              }
+            : c
+        )
+      }
+    )
+
+    const { error } = await supabase.rpc(done ? 'mark_person_done' : 'unmark_person_done', {
+      p_person_id: personId,
+    })
+
+    if (error) {
+      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+      return
+    }
+    queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+    queryClient.invalidateQueries({ queryKey: ['state-counts', userId] })
+  },
 }))
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const inboxTauriStore = createTauriStore('inbox', useInboxStore as any)
 
-inboxTauriStore.start().catch(() => {
-  if (import.meta.env.DEV) console.warn('Tauri store not available (non-Tauri env)')
-})
+// Nav-reachable views. Stalled/Dropped/Done are valid turn-states in data
+// but are no longer exposed as sidebar nav — auto-migrate those to 'all'.
+const VALID_VIEWS: ReadonlySet<ActiveView> = new Set([
+  'all', 'my_turn', 'their_turn', 'gate', 'snoozed', 'blocked', 'flagged',
+])
+
+inboxTauriStore.start()
+  .then(() => {
+    const current = useInboxStore.getState().activeView as string
+    if (!VALID_VIEWS.has(current as ActiveView)) {
+      useInboxStore.setState({ activeView: 'all' })
+    }
+  })
+  .catch(() => {
+    if (import.meta.env.DEV) console.warn('Tauri store not available (non-Tauri env)')
+  })
 
 interface FilterState {
   triageFilter: TriageLevel | 'all'
@@ -202,7 +278,7 @@ export const useFilterStore = create<FilterState>((set) => ({
 
 interface SyncState {
   lastSyncedAt: string | null
-  markDone: (detail: string) => void
+  markDone: () => void
 }
 
 export const useSyncStore = create<SyncState>((set) => ({

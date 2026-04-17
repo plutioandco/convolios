@@ -27,9 +27,19 @@ const CHANNEL_ALIAS: Record<string, string> = {
   rcs: 'sms',
 }
 
-function resolveChannel(ch: string): string {
+// Normalizes a raw provider channel string (e.g. 'gmail', 'microsoft') to a
+// canonical `Channel` key used in CHANNEL_META. ChannelLogo has its own
+// alias table because icon rendering preserves distinct brands like Outlook.
+export function resolveChannel(ch: string): string {
   return CHANNEL_ALIAS[ch.toLowerCase()] ?? ch
 }
+
+// Shared palette used by the sidebar swatch picker and the settings circle
+// editor. Kept short and visually distinct — 8 hues align with avatar tokens.
+export const CIRCLE_COLORS = [
+  '#5865f2', '#23a559', '#f0b132', '#ed4245',
+  '#eb459e', '#00b0f4', '#ff7733', '#9b59b6',
+]
 
 export function channelLabel(ch: string): string {
   return CHANNEL_META[resolveChannel(ch) as Channel]?.label ?? ch

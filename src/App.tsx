@@ -10,7 +10,7 @@ import { AlertTriangle, WifiOff, Search } from 'lucide-react'
 import { InboxList } from './components/inbox/InboxList'
 import { ThreadView } from './components/thread/ThreadView'
 import { Settings } from './components/settings/Settings'
-import { useInboxStore, useSyncStore, useFilterStore } from './stores/inboxStore'
+import { useInboxStore, useSyncStore, useFilterStore, viewToRpcParams } from './stores/inboxStore'
 import { useRealtimeMessages } from './hooks/useRealtimeMessages'
 import { useConversations } from './hooks/useConversations'
 import { useAuth, signOut } from './lib/auth'
@@ -39,6 +39,9 @@ const PERSIST_ALLOWED_KEYS = new Set([
   'conversations', 'circles', 'sidebar-unread', 'pending-count',
 ])
 
+const NETWORK_PROBE_INTERVAL_MS = 15_000
+const STARTUP_SYNC_INTERVAL_MS = 120_000
+
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null }
 
@@ -47,7 +50,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    if (import.meta.env.DEV) console.error('[ErrorBoundary]', error, info)
+    console.error('[ErrorBoundary]', error, info)
   }
 
   render() {
@@ -58,7 +61,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
           <span className="app-error-msg">{this.state.error.message}</span>
           <button
             type="button"
-            className="app-btn-primary"
+            className="btn-primary btn-primary-md"
             onClick={() => { this.setState({ error: null }); window.location.reload() }}
           >
             Reload
@@ -78,7 +81,7 @@ class SectionErrorBoundary extends Component<{ children: ReactNode; name: string
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    if (import.meta.env.DEV) console.error(`[${this.props.name}]`, error, info)
+    console.error(`[${this.props.name}]`, error, info)
   }
 
   render() {
@@ -87,7 +90,7 @@ class SectionErrorBoundary extends Component<{ children: ReactNode; name: string
         <div className="app-section-error">
           <span className="app-section-error-title">{this.props.name} failed to load</span>
           <span className="app-section-error-msg">{this.state.error.message}</span>
-          <button type="button" className="app-btn-primary app-btn-primary-sm" onClick={() => this.setState({ error: null })}>
+          <button type="button" className="btn-primary btn-primary-sm" onClick={() => this.setState({ error: null })}>
             Retry
           </button>
         </div>
@@ -102,13 +105,9 @@ function UpdateBanner() {
   if (status !== 'available' && status !== 'installing') return null
   const installing = status === 'installing'
   return (
-    <div className="flex items-center justify-between px-4 py-2 bg-blue-600 text-white text-sm">
+    <div className="app-banner app-banner--update app-banner--spread">
       <span>{installing ? 'Installing update…' : `Update ${version ?? ''} available`}</span>
-      <button
-        onClick={installUpdate}
-        disabled={installing}
-        className="px-3 py-1 bg-white text-blue-600 rounded text-xs font-medium hover:bg-blue-50 disabled:opacity-50"
-      >
+      <button onClick={installUpdate} disabled={installing} className="app-banner-btn">
         {installing ? 'Updating…' : 'Restart & Update'}
       </button>
     </div>
@@ -317,7 +316,7 @@ function Authenticated({ userId }: { userId: string }) {
     }
     probe()
     const onOnline = () => { failures = 0; probe() }
-    const interval = setInterval(probe, 15_000)
+    const interval = setInterval(probe, NETWORK_PROBE_INTERVAL_MS)
     window.addEventListener('online', onOnline)
     return () => {
       cancelled = true
@@ -349,7 +348,7 @@ function Authenticated({ userId }: { userId: string }) {
     }
 
     runSync()
-    const syncInterval = setInterval(runSync, 120_000)
+    const syncInterval = setInterval(runSync, STARTUP_SYNC_INTERVAL_MS)
 
     const unlistenDisconnect = listen<{ accountId?: string; channel?: string }>('account-disconnected', () => {
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
@@ -359,9 +358,9 @@ function Authenticated({ userId }: { userId: string }) {
 
     const { markDone } = useSyncStore.getState()
     const unlistenSync = listen<{ phase: string; detail?: string }>('sync-status', (event) => {
-      const { phase, detail } = event.payload
+      const { phase } = event.payload
       if (phase === 'done' || phase === 'idle') {
-        markDone(detail ?? '')
+        markDone()
       }
     })
 
@@ -427,15 +426,16 @@ function Authenticated({ userId }: { userId: string }) {
 function InboxRoute({ userId, realtimeConnected }: { userId: string; realtimeConnected: boolean }) {
   const pid = useInboxStore((s) => s.selectedPersonId)
   const pick = useInboxStore((s) => s.selectPerson)
-  const { data: convos = [] } = useConversations(userId, realtimeConnected, 'approved')
-  const { data: pendingConvos = [] } = useConversations(userId, realtimeConnected, 'pending')
+  const activeView = useInboxStore((s) => s.activeView)
+  const activeCircleId = useInboxStore((s) => s.activeCircleId)
   const ch = useInboxStore((s) => s.activeChannel)
+  const { status: rpcStatus, state: rpcState } = viewToRpcParams(activeView)
+  const { data: convos = [] } = useConversations(
+    userId, realtimeConnected, rpcStatus, activeCircleId, rpcState,
+  )
   const accounts = useAccountsStore((s) => s.accounts)
   const accountsLoading = useAccountsStore((s) => s.loading)
-  const selectedConvo = useMemo(() =>
-    convos.find((c) => c.person.id === pid) ?? pendingConvos.find((c) => c.person.id === pid),
-    [convos, pendingConvos, pid]
-  )
+  const selectedConvo = useMemo(() => convos.find((c) => c.person.id === pid), [convos, pid])
   const person = selectedConvo?.person
   const nav = useNavigate()
 
@@ -526,12 +526,7 @@ function TopBar({ children }: { children: React.ReactNode }) {
   return (
     <header className="top-bar">
       <div className="top-bar-left">{children}</div>
-      <button
-        onClick={signOut}
-        className="text-text-muted text-md px-2 py-1"
-        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--color-danger)' }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--color-text-muted)' }}
-      >
+      <button onClick={signOut} className="text-text-muted text-md px-2 py-1 hover-danger-text">
         Sign out
       </button>
     </header>
@@ -650,7 +645,7 @@ function SearchModal({ userId, onClose, onSelectPerson }: {
   return (
     <div
       onClick={onClose}
-      className="modal-backdrop modal-backdrop--top z-[100]"
+      className="modal-backdrop modal-backdrop--top"
     >
       <div
         onClick={(e) => e.stopPropagation()}

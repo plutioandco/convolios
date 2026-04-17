@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
-import type { ConversationPreview, Channel, Message, Person, TriageLevel } from '../types'
+import type { ConversationPreview, Channel, Message, Person, ThreadState, TriageLevel } from '../types'
 
 function rowToPreview(row: Record<string, unknown>, userId: string, status?: string): ConversationPreview {
   const person: Person = {
@@ -14,6 +14,7 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     ai_summary: (row.ai_summary as string | null) ?? null,
     ai_summary_updated_at: null,
     status: (status as Person['status']) ?? 'approved',
+    done_at: (row.done_at as string | null) ?? null,
     created_at: '',
     updated_at: '',
   }
@@ -66,6 +67,9 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     channels: _.isArray(row.channels) ? (row.channels as string[]) : [],
     markedUnread: (row.marked_unread as boolean) ?? false,
     pinnedAt: (row.pinned_at as string | null) ?? null,
+    turnState: ((row.turn_state as string) ?? 'their_turn') as ThreadState,
+    snoozeUntil: (row.snooze_until as string | null) ?? null,
+    snoozeOnTheirReply: (row.snooze_on_their_reply as boolean) ?? false,
   }
 }
 
@@ -90,10 +94,16 @@ function enrichPrevInbound(previews: ConversationPreview[], userId: string, batc
   })
 }
 
-async function fetchConversations(userId: string, status?: string, circleId?: string | null): Promise<ConversationPreview[]> {
+async function fetchConversations(
+  userId: string,
+  status?: string,
+  circleId?: string | null,
+  state?: ThreadState | null,
+): Promise<ConversationPreview[]> {
   const params: Record<string, unknown> = { p_user_id: userId }
   if (_.isString(status)) params.p_status = status
   if (_.isString(circleId)) params.p_circle_id = circleId
+  if (_.isString(state)) params.p_state = state
 
   const { data: rows, error } = await supabase.rpc('get_conversations', params)
 
@@ -124,10 +134,16 @@ async function fetchConversations(userId: string, status?: string, circleId?: st
   return previews
 }
 
-export function useConversations(userId: string | undefined, realtimeConnected?: boolean, status?: string, circleId?: string | null) {
+export function useConversations(
+  userId: string | undefined,
+  realtimeConnected?: boolean,
+  status?: string,
+  circleId?: string | null,
+  state?: ThreadState | null,
+) {
   return useQuery({
-    queryKey: ['conversations', userId, status ?? 'approved', circleId ?? null],
-    queryFn: () => fetchConversations(userId!, status, circleId),
+    queryKey: ['conversations', userId, status ?? 'approved', circleId ?? null, state ?? null],
+    queryFn: () => fetchConversations(userId!, status, circleId, state),
     enabled: _.isString(userId),
     refetchInterval: realtimeConnected === false ? 15_000 : 60_000,
   })

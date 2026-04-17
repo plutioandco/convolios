@@ -423,7 +423,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     payload.attachments ?? [], payload.message_id
   );
 
-  const { error: msgError } = await supabase.from("messages").upsert(
+  const { data: upserted, error: msgError } = await supabase.from("messages").upsert(
     {
       user_id: userId,
       person_id: personId,
@@ -455,7 +455,7 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       folder: chatInfo.folder ?? null,
     },
     { onConflict: "user_id,external_id", ignoreDuplicates: false }
-  );
+  ).select("id, user_id, person_id, direction, sent_at").single();
 
   if (msgError) {
     log.error("Insert message error", { error: msgError.message });
@@ -464,9 +464,9 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
 
   const response = jsonResponse({ ok: true, direction, channel, person_id: personId });
 
-  if (GEMINI_API_KEY && direction === "inbound" && payload.message) {
-    triageMessage(payload.message_id, payload.message).catch((err) => {
-      log.error("Triage failed", { message_id: payload.message_id, error: String(err) });
+  if (GEMINI_API_KEY && payload.message && upserted) {
+    extractMessageContext(upserted, payload.message).catch((err) => {
+      log.error("Extract failed", { message_id: payload.message_id, error: String(err) });
     });
   }
 
@@ -546,7 +546,7 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
       f.toUpperCase() === "STARRED" || f.toUpperCase() === "FLAGGED"
     );
 
-    const { error: msgError } = await supabase.from("messages").upsert(
+    const { data: upserted, error: msgError } = await supabase.from("messages").upsert(
       {
         user_id: userId,
         person_id: personId,
@@ -572,15 +572,16 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
         flagged_at: isStarred ? new Date().toISOString() : null,
       },
       { onConflict: "user_id,external_id", ignoreDuplicates: false }
-    );
+    ).select("id, user_id, person_id, direction, sent_at").single();
 
     if (msgError) {
       log.error("Email insert error", { error: msgError.message });
       return jsonResponse({ ok: false, error: "insert_failed" }, 500);
     }
 
-    if (GEMINI_API_KEY && direction === "inbound" && em.subject) {
-      await triageMessage(em.id ?? emailId, `${em.subject}\n${(em.body_plain ?? "").slice(0, 400)}`);
+    if (GEMINI_API_KEY && em.subject && upserted) {
+      const combined = `${em.subject}\n${(em.body_plain ?? "").slice(0, 1000)}`;
+      await extractMessageContext(upserted, combined);
     }
 
     return jsonResponse({ ok: true, direction, channel: "email", person_id: personId });
@@ -1027,23 +1028,95 @@ async function findOrCreatePerson(
   return { personId: person.id, identityId: identity!.id };
 }
 
-async function triageMessage(messageId: string, text: string) {
+// Structured JSON output via Gemini's responseSchema. Returns triage +
+// extracted unanswered questions + commitments (both directions) in a single
+// call. Consolidating avoids a second round-trip for AI enrichment.
+const GEMINI_SCHEMA = {
+  type: "object",
+  properties: {
+    triage: {
+      type: "string",
+      enum: ["urgent", "human", "newsletter", "notification", "noise"],
+      description: "Category of the message.",
+    },
+    their_questions: {
+      type: "array",
+      description:
+        "Direct questions asked by them that need an answer. Empty if no explicit questions or if the message is outbound.",
+      items: { type: "string" },
+    },
+    their_commitments: {
+      type: "array",
+      description:
+        "Things they explicitly promised to do (e.g. 'I will send the doc tomorrow'). Empty if outbound.",
+      items: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          due_hint: { type: "string", description: "Natural-language date/time if mentioned, else empty string." },
+        },
+        required: ["text", "due_hint"],
+      },
+    },
+    my_commitments: {
+      type: "array",
+      description:
+        "Things I explicitly promised to do. Populate only for outbound messages. Empty if inbound.",
+      items: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          due_hint: { type: "string", description: "Natural-language date/time if mentioned, else empty string." },
+        },
+        required: ["text", "due_hint"],
+      },
+    },
+  },
+  required: ["triage", "their_questions", "their_commitments", "my_commitments"],
+} as const;
+
+type ExtractedContext = {
+  triage: string;
+  their_questions: string[];
+  their_commitments: Array<{ text: string; due_hint: string }>;
+  my_commitments: Array<{ text: string; due_hint: string }>;
+};
+
+async function extractMessageContext(
+  messageRow: { id: string; user_id: string; person_id: string | null; direction: string; sent_at: string },
+  text: string,
+) {
+  if (!messageRow.person_id) return;
+
+  const directionLabel = messageRow.direction === "inbound" ? "INBOUND (from them)" : "OUTBOUND (from me)";
+
+  const prompt = `You analyse a single message in a conversation and return strict JSON per the provided schema.
+
+Direction: ${directionLabel}
+
+Rules:
+- triage: one of urgent | human | newsletter | notification | noise.
+  urgent = needs a fast reply (money, deadlines, explicit questions needing fast answers).
+  human = real person / real conversation, not time-sensitive.
+  newsletter = mass email, marketing.
+  notification = automated receipt / alert / shipping update.
+  noise = spam or irrelevant.
+- their_questions: include ONLY if direction is INBOUND. Verbatim or lightly cleaned questions asked of me.
+  Drop rhetorical questions. At most 3 items. Empty array if none.
+- their_commitments: include ONLY if direction is INBOUND. Things they explicitly promised.
+  Empty array if none.
+- my_commitments: include ONLY if direction is OUTBOUND. Things I explicitly promised.
+  Empty array if none.
+- due_hint: empty string if no date/time mentioned.
+
+Message:
+"""
+${text.slice(0, 1200)}
+"""`;
+
   try {
-    const prompt = `Classify this message into exactly ONE category. Reply with ONLY the category word, nothing else.
-
-Categories:
-- urgent: needs immediate reply (money, deadlines, direct questions needing fast answers)
-- human: real person, real conversation, but not time-sensitive
-- newsletter: mass email, marketing, promotional content
-- notification: automated system message (receipts, alerts, shipping updates)
-- noise: spam, irrelevant, or junk
-
-Message: "${text.slice(0, 500)}"
-
-Category:`;
-
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`,
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
       {
         method: "POST",
         headers: {
@@ -1052,30 +1125,94 @@ Category:`;
         },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 10, temperature: 0 },
+          generationConfig: {
+            maxOutputTokens: 512,
+            temperature: 0,
+            responseMimeType: "application/json",
+            responseSchema: GEMINI_SCHEMA,
+          },
         }),
-      }
+      },
     );
 
     if (!res.ok) {
-      log.error("Gemini triage error", { status: res.status });
+      log.error("Gemini extract error", { status: res.status });
       return;
     }
 
     const data = await res.json();
-    const raw =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toLowerCase() ??
-      "";
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
 
-    const valid = ["urgent", "human", "newsletter", "notification", "noise"];
-    const triage = valid.includes(raw) ? raw : "unclassified";
+    let parsed: ExtractedContext;
+    try {
+      parsed = JSON.parse(raw) as ExtractedContext;
+    } catch (err) {
+      log.error("Gemini JSON parse failed", { error: String(err), raw: raw.slice(0, 200) });
+      return;
+    }
 
-    await supabase
-      .from("messages")
-      .update({ triage })
-      .eq("external_id", messageId);
+    const triage = ["urgent", "human", "newsletter", "notification", "noise"].includes(parsed.triage)
+      ? parsed.triage
+      : "unclassified";
+
+    await supabase.from("messages").update({ triage }).eq("id", messageRow.id);
+
+    // Webhook retries re-run extraction on the same message. Dedup via the
+    // (message_id, …) unique constraints added in migration 058 so retries
+    // are no-ops instead of duplicating rows in the thread banner.
+    if (messageRow.direction === "inbound") {
+      const questions = (parsed.their_questions ?? [])
+        .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+        .slice(0, 3);
+      if (questions.length > 0) {
+        await supabase.from("unanswered_questions").upsert(
+          questions.map((q) => ({
+            user_id: messageRow.user_id,
+            person_id: messageRow.person_id,
+            message_id: messageRow.id,
+            question_text: q.trim(),
+            asked_at: messageRow.sent_at,
+          })),
+          { onConflict: "message_id,question_text", ignoreDuplicates: true },
+        );
+      }
+
+      const commitments = (parsed.their_commitments ?? [])
+        .filter((c) => c && typeof c.text === "string" && c.text.trim().length > 0)
+        .slice(0, 5);
+      if (commitments.length > 0) {
+        await supabase.from("commitments").upsert(
+          commitments.map((c) => ({
+            user_id: messageRow.user_id,
+            person_id: messageRow.person_id,
+            message_id: messageRow.id,
+            direction: "theirs",
+            commitment_text: c.text.trim(),
+            due_hint: c.due_hint?.trim() || null,
+          })),
+          { onConflict: "message_id,direction,commitment_text", ignoreDuplicates: true },
+        );
+      }
+    } else {
+      const myCommitments = (parsed.my_commitments ?? [])
+        .filter((c) => c && typeof c.text === "string" && c.text.trim().length > 0)
+        .slice(0, 5);
+      if (myCommitments.length > 0) {
+        await supabase.from("commitments").upsert(
+          myCommitments.map((c) => ({
+            user_id: messageRow.user_id,
+            person_id: messageRow.person_id,
+            message_id: messageRow.id,
+            direction: "mine",
+            commitment_text: c.text.trim(),
+            due_hint: c.due_hint?.trim() || null,
+          })),
+          { onConflict: "message_id,direction,commitment_text", ignoreDuplicates: true },
+        );
+      }
+    }
   } catch (err) {
-    log.error("Triage failed", { error: String(err) });
+    log.error("Context extraction failed", { error: String(err) });
   }
 }
 

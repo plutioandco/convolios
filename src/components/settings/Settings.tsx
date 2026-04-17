@@ -11,7 +11,7 @@ import { queryClient } from '../../lib/queryClient'
 import { useCircles, useCreateCircle, useUpdateCircle, useDeleteCircle } from '../../hooks/useCircles'
 import { useDismissMerge, useMergeLog, useUndoMerge, useMergeClusters, useMergeCluster, useFuzzyMergeSuggestions } from '../../hooks/useMergeSuggestions'
 import { usePreferencesStore } from '../../stores/preferencesStore'
-import { channelLabel, channelColor, relativeTime, initials, avatarCls } from '../../utils'
+import { channelLabel, channelColor, relativeTime, initials, avatarCls, CIRCLE_COLORS } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
 import type { ConnectedAccount, MergeCluster } from '../../types'
 import _ from 'lodash'
@@ -94,26 +94,22 @@ export function Settings() {
   }
 
   return (
-    <div className="flex flex-1 bg-surface overflow-hidden">
-      {/* left nav */}
-      <div className="w-[218px] shrink-0 flex justify-end">
-        <div className="w-48 pt-6 pb-5 pr-1.5 pl-5">
-          <SectionLabel>User Settings</SectionLabel>
-          <NavItem active={activeTab === 'connections'} onClick={() => setActiveTab('connections')}>Connections</NavItem>
-          <NavItem active={activeTab === 'circles'} onClick={() => setActiveTab('circles')}>Circles</NavItem>
-          <NavItem active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>Merge Suggestions</NavItem>
-          <NavItem active={activeTab === 'merges'} onClick={() => setActiveTab('merges')}>Merge History</NavItem>
-          <NavItem active={activeTab === 'preferences'} onClick={() => setActiveTab('preferences')}>Preferences</NavItem>
-          <NavItem active={activeTab === 'about'} onClick={() => setActiveTab('about')}>About</NavItem>
-        </div>
-      </div>
+    <div className="settings-shell">
+      <aside className="settings-side">
+        <div className="nav-section-header"><span>User Settings</span></div>
+        <NavItem active={activeTab === 'connections'} onClick={() => setActiveTab('connections')}>Connections</NavItem>
+        <NavItem active={activeTab === 'circles'} onClick={() => setActiveTab('circles')}>Circles</NavItem>
+        <NavItem active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>Merge Suggestions</NavItem>
+        <NavItem active={activeTab === 'merges'} onClick={() => setActiveTab('merges')}>Merge History</NavItem>
+        <NavItem active={activeTab === 'preferences'} onClick={() => setActiveTab('preferences')}>Preferences</NavItem>
+        <NavItem active={activeTab === 'about'} onClick={() => setActiveTab('about')}>About</NavItem>
+      </aside>
 
-      {/* main content */}
       <div className="settings-page thin-scroll">
 
         {activeTab === 'connections' && (
           <>
-            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Connections</h2>
+            <h2 className="settings-h2">Connections</h2>
             <p className="text-base mb-5 text-text-secondary">
               Connect your accounts to bring messages into Convolios
             </p>
@@ -146,7 +142,7 @@ export function Settings() {
 
             <div className="h-px bg-border my-10" />
 
-            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Data & Privacy</h2>
+            <h2 className="settings-h2">Data & Privacy</h2>
 
             <div className="settings-card">
               <div className="settings-card-body">
@@ -161,7 +157,7 @@ export function Settings() {
 
             <div className="h-px bg-border my-10" />
 
-            <h2 className="text-[20px] font-semibold mb-5 text-text-primary">System Health</h2>
+            <h2 className="settings-h2">System Health</h2>
 
             <HealthCard label="Unipile API" cmd="check_unipile_connection" />
             <HealthCard label="Gemini AI" cmd="check_gemini_connection" />
@@ -180,22 +176,16 @@ export function Settings() {
   )
 }
 
-function SectionLabel({ children }: { children: string }) {
-  return (
-    <div className="section-label px-2.5 pb-1.5">
-      {children}
-    </div>
-  )
-}
-
 function NavItem({ children, active, onClick }: { children: string; active?: boolean; onClick?: () => void }) {
   return (
-    <div
+    <button
+      type="button"
       onClick={onClick}
-      className={`text-base py-1.5 px-2.5 rounded-sm mb-0.5 cursor-pointer ${active ? 'text-text-primary bg-[var(--hover-row-strong)]' : 'text-text-secondary bg-transparent'}`}
+      className="nav-item"
+      data-active={active ? 'true' : 'false'}
     >
-      {children}
-    </div>
+      <span className="nav-item-label">{children}</span>
+    </button>
   )
 }
 
@@ -233,68 +223,67 @@ function SettingsSkeleton() {
   )
 }
 
+type ProviderState = 'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err' | 'permission'
+
+const PROVIDER_WAITING_TIMEOUT_MS = 120_000
+const PROVIDER_DONE_DISMISS_MS = 3_000
+const PROVIDER_ERR_DISMISS_MS = 6_000
+
 function ProviderCard({ providers, label, desc, channel, logo, userId }: {
   providers: string[]; label: string; desc: string; channel: string; logo: string; userId?: string
 }) {
-  const [st, setSt] = useState<'idle' | 'loading' | 'waiting' | 'syncing' | 'done' | 'err' | 'permission'>('idle')
+  const [st, setSt] = useState<ProviderState>('idle')
   const [errMsg, setErrMsg] = useState('')
   const accounts = useAccountsStore((s) => s.accounts)
   const countBefore = useRef(0)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
+  const runImessageFlow = useCallback((uid: string) => {
+    setSt('syncing')
+    return invoke<string>('backfill_messages', { userId: uid })
+      .then(() => {
+        queryClient.invalidateQueries({ queryKey: ['conversations', uid] })
+        setSt('done')
+      })
+      .catch((e) => {
+        setErrMsg(String(e))
+        setSt('err')
+      })
   }, [])
 
   useEffect(() => {
+    if (st !== 'done' && st !== 'err') return
+    const ms = st === 'done' ? PROVIDER_DONE_DISMISS_MS : PROVIDER_ERR_DISMISS_MS
+    const timer = setTimeout(() => setSt('idle'), ms)
+    return () => clearTimeout(timer)
+  }, [st])
+
+  useEffect(() => {
     if (st !== 'waiting') return
-    const timeout = setTimeout(() => {
-      setSt('err')
+    const timer = setTimeout(() => {
       setErrMsg('Connection timed out. Please try again.')
-      timerRef.current = setTimeout(() => setSt('idle'), 6_000)
-    }, 120_000)
-    return () => clearTimeout(timeout)
+      setSt('err')
+    }, PROVIDER_WAITING_TIMEOUT_MS)
+    return () => clearTimeout(timer)
   }, [st])
 
   useEffect(() => {
     if (st !== 'waiting') return
     const current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
-    if (current > countBefore.current) {
-      setSt('syncing')
-      if (userId) {
-        invoke<string>('backfill_messages', { userId }).then(() => {
-          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-          setSt('done')
-          timerRef.current = setTimeout(() => setSt('idle'), 3_000)
-        }).catch((e) => {
-          setErrMsg(String(e))
-          setSt('err')
-          timerRef.current = setTimeout(() => setSt('idle'), 6_000)
-        })
-      } else {
-        setSt('done')
-        timerRef.current = setTimeout(() => setSt('idle'), 3_000)
-      }
+    if (current <= countBefore.current) return
+    if (_.isString(userId)) {
+      runImessageFlow(userId)
+    } else {
+      setSt('done')
     }
-  }, [st, accounts, channel, userId])
+  }, [st, accounts, channel, userId, runImessageFlow])
 
   useEffect(() => {
     if (st !== 'permission') return
     const onFocus = () => {
-      if (!userId) return
+      if (!_.isString(userId)) return
       setSt('loading')
       invoke<string>('connect_imessage', { userId })
-        .then(() => {
-          setSt('syncing')
-          return invoke<string>('backfill_messages', { userId })
-        })
-        .then(() => {
-          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-          setSt('done')
-          timerRef.current = setTimeout(() => setSt('idle'), 3_000)
-        })
+        .then(() => runImessageFlow(userId))
         .catch((e) => {
           const msg = String(e)
           if (msg.includes('Full Disk Access') || msg.includes('Cannot access')) {
@@ -302,27 +291,22 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
           } else {
             setErrMsg(msg)
             setSt('err')
-            timerRef.current = setTimeout(() => setSt('idle'), 6_000)
           }
         })
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [st, userId])
+  }, [st, userId, runImessageFlow])
 
   const go = async () => {
-    if (!userId) return
+    if (!_.isString(userId)) return
     setSt('loading')
     setErrMsg('')
     countBefore.current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     try {
       if (channel === 'imessage') {
         await invoke<string>('connect_imessage', { userId })
-        setSt('syncing')
-        await invoke<string>('backfill_messages', { userId })
-        queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-        setSt('done')
-        timerRef.current = setTimeout(() => setSt('idle'), 3_000)
+        await runImessageFlow(userId)
         return
       }
       let link: string
@@ -347,7 +331,6 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
       }
       setErrMsg(msg)
       setSt('err')
-      timerRef.current = setTimeout(() => setSt('idle'), 6_000)
     }
   }
 
@@ -361,7 +344,7 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
 
   if (st === 'permission') {
     return (
-      <div className="w-[340px] rounded-card bg-surface-deep border border-warning p-4 flex flex-col gap-3">
+      <div className="provider-permission-card">
         <div className="flex items-center gap-2">
           <span className="flex items-center"><Lock size={18} /></span>
           <span className="text-base font-semibold text-text-primary">Full Disk Access Required</span>
@@ -373,10 +356,7 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
           <button className="btn-primary flex-1 h-8 text-base" onClick={openFdaSettings}>
             Open Settings
           </button>
-          <button
-            onClick={() => setSt('idle')}
-            className="h-8 rounded-[3px] text-base font-medium px-3 bg-transparent text-text-secondary border border-border cursor-pointer"
-          >
+          <button onClick={() => setSt('idle')} className="btn-outline">
             Cancel
           </button>
         </div>
@@ -400,9 +380,8 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
         onClick={go}
         disabled={st === 'loading' || st === 'waiting'}
         title={st === 'err' ? errMsg : undefined}
-        className={`w-[164px] h-12 rounded-card flex items-center gap-2 px-3 bg-surface-deep border ${st === 'waiting' ? 'border-warning' : st === 'done' ? 'border-success' : st === 'err' ? 'border-danger' : 'border-border'} ${st === 'loading' || st === 'waiting' ? 'cursor-default' : 'cursor-pointer'}`}
-        onMouseEnter={(e) => { if (st === 'idle') e.currentTarget.style.background = 'var(--color-bg)' }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--color-surface-deep)' }}
+        className="provider-btn"
+        data-state={st}
       >
         <ChannelLogo channel={logo} size={16} color="var(--color-text-primary)" className="shrink-0" />
         <span className="text-base font-medium flex-1 text-left text-text-primary">{label}</span>
@@ -412,9 +391,7 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
         </span>
       </button>
       {st === 'err' && errMsg && (
-        <div className="absolute left-0 right-0 top-[52px] z-10 py-1.5 px-2.5 rounded-[6px] bg-surface border border-danger text-sm text-danger leading-[1.4] max-w-[260px] break-words">
-          {errMsg}
-        </div>
+        <div className="provider-btn-error-tip">{errMsg}</div>
       )}
     </div>
   )
@@ -521,7 +498,7 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
       })
       if (link) await open(link)
     } catch (e) {
-      if (import.meta.env.DEV) console.error('[reconnect]', e)
+      console.error('[reconnect]', e)
     } finally {
       setReconnecting(false)
     }
@@ -542,7 +519,7 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
             <span className="text-lg font-semibold text-text-primary">
               {channelLabel(a.channel)}
             </span>
-            <span className={`text-xs font-semibold py-px px-1.5 rounded-[3px] capitalize ${a.status === 'active' ? 'bg-[var(--hover-success-subtle)] text-success' : 'bg-[var(--hover-danger-strong)] text-danger'}`}>
+            <span className={`text-xs font-semibold py-px px-1.5 rounded-chip capitalize ${a.status === 'active' ? 'bg-[var(--hover-success-subtle)] text-success' : 'bg-[var(--hover-danger-strong)] text-danger'}`}>
               {needsReconnect ? 'Reconnect required' : a.status}
             </span>
           </div>
@@ -559,20 +536,14 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
         </div>
 
         {needsReconnect && (
-          <button
-            onClick={handleReconnect}
-            disabled={reconnecting}
-            className={`text-sm font-medium rounded-[3px] h-7 shrink-0 py-0.5 px-3 bg-warning text-black mr-1.5 ${reconnecting ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
-          >
+          <button onClick={handleReconnect} disabled={reconnecting} className="btn-warning-sm mr-1.5">
             {reconnecting ? 'Opening...' : 'Reconnect'}
           </button>
         )}
         <button
           onClick={() => a.account_id && onDisconnect(a.account_id)}
           disabled={isDisconnecting || _.isNil(a.account_id)}
-          className={`text-sm font-medium rounded-[3px] h-7 shrink-0 py-0.5 px-3 bg-transparent text-danger border border-[var(--hover-warning-strong)] ${isDisconnecting ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}`}
-          onMouseEnter={(e) => { if (!isDisconnecting) { e.currentTarget.style.background = 'var(--color-danger)'; e.currentTarget.style.color = 'var(--color-white)' } }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--color-danger)' }}
+          className="btn-danger-outline-sm"
         >
           {isDisconnecting ? 'Removing...' : 'Disconnect'}
         </button>
@@ -707,8 +678,6 @@ function IMessageStats({ userId }: { userId: string }) {
   )
 }
 
-const CIRCLE_COLORS = ['#5865f2', '#ed4245', '#23a559', '#f0b132', '#e4405f', '#0a66c2', '#26a5e4', '#9b59b6', '#e67e22', '#1abc9c']
-
 function CircleManagement({ userId }: { userId?: string }) {
   const { data: circles = [] } = useCircles(userId)
   const create = useCreateCircle(userId)
@@ -743,7 +712,7 @@ function CircleManagement({ userId }: { userId?: string }) {
 
   return (
     <>
-      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Circles</h2>
+      <h2 className="settings-h2">Circles</h2>
       <p className="text-base mb-5 text-text-secondary">
         Organize your contacts into custom groups
       </p>
@@ -772,7 +741,7 @@ function CircleManagement({ userId }: { userId?: string }) {
                   value={editEmoji}
                   onChange={(e) => setEditEmoji(e.target.value)}
                   placeholder="Emoji"
-                  className="w-[50px] h-9 rounded-sm px-2 text-center bg-surface text-text-primary text-[18px] border border-border outline-none"
+                  className="w-[50px] h-9 rounded-sm px-2 text-center bg-surface text-text-primary text-xl border border-border outline-none"
                 />
                 <input
                   value={editName}
@@ -792,14 +761,8 @@ function CircleManagement({ userId }: { userId?: string }) {
               </div>
               <div className="flex gap-2 items-center">
                 <span className="text-md text-text-secondary">Notifications:</span>
-                <button
-                  onClick={() => setEditNotify('all')}
-                  className={`text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${editNotify === 'all' ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`}
-                >All</button>
-                <button
-                  onClick={() => setEditNotify('muted')}
-                  className={`text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${editNotify === 'muted' ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`}
-                >Muted</button>
+                <button onClick={() => setEditNotify('all')} className="settings-pill" data-active={editNotify === 'all'}>All</button>
+                <button onClick={() => setEditNotify('muted')} className="settings-pill" data-active={editNotify === 'muted'}>Muted</button>
               </div>
               <div className="flex gap-2 justify-end">
                 <button
@@ -842,7 +805,7 @@ function CircleManagement({ userId }: { userId?: string }) {
 function confidenceTier(score: number): { label: string; cls: string } {
   if (score >= 0.95) return { label: 'Exact match', cls: 'bg-[var(--hover-success-subtle)] text-success' }
   if (score >= 0.85) return { label: 'Strong match', cls: 'bg-[var(--hover-accent-subtle)] text-accent' }
-  return { label: 'Likely match', cls: 'bg-[var(--color-warning-bg,rgba(234,179,8,0.1))] text-[var(--color-warning,#eab308)]' }
+  return { label: 'Likely match', cls: 'bg-[var(--hover-warning-subtle)] text-warning' }
 }
 
 function mergeSuggestionSources(
@@ -914,20 +877,20 @@ function MergeSuggestionsView({ userId }: { userId?: string }) {
 
   return (
     <>
-      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Merge Suggestions</h2>
+      <h2 className="settings-h2">Merge Suggestions</h2>
       <p className="text-base mb-5 text-text-secondary">
         Contacts that appear to be the same person across channels. When you merge, all their conversations and identities are unified into one.
       </p>
 
       {error && (
-        <div className="py-2 px-3 rounded-[6px] mb-3 bg-[var(--hover-danger)] text-danger text-md">
+        <div className="py-2 px-3 rounded-md mb-3 bg-[var(--hover-danger)] text-danger text-md">
           {error}
         </div>
       )}
 
       {isLoading && <SettingsSkeleton />}
       {(detError || fuzzyError) && (
-        <div className="py-2 px-3 rounded-[6px] mb-3 bg-[var(--hover-danger)] text-danger text-md">
+        <div className="py-2 px-3 rounded-md mb-3 bg-[var(--hover-danger)] text-danger text-md">
           {_.isString((detFetchError as Error)?.message) ? (detFetchError as Error).message : 'Failed to load merge suggestions'}
         </div>
       )}
@@ -958,7 +921,7 @@ function MergeSuggestionsView({ userId }: { userId?: string }) {
 
             {/* Match signal with confidence tier */}
             <div className="flex items-center gap-2 mb-3">
-              <span className={`text-xs py-0.5 px-2 rounded-[3px] ${tier.cls}`}>
+              <span className={`text-xs py-0.5 px-2 rounded-chip ${tier.cls}`}>
                 {tier.label}
               </span>
               <span className="text-sm text-text-muted">{cluster.match_detail}</span>
@@ -1019,7 +982,7 @@ function SuggestionAvatar({ name, avatar, id }: { name: string; avatar: string |
 
 function ChannelPill({ channel }: { channel: string }) {
   return (
-    <span className="text-2xs py-px px-1.5 rounded-[3px] bg-surface text-text-muted flex items-center gap-[3px]">
+    <span className="text-2xs py-px px-1.5 rounded-chip bg-surface text-text-muted flex items-center gap-[3px]">
       <ChannelLogo channel={channel} size={10} color="var(--color-text-muted)" />
       {channelLabel(channel as import('../../types').Channel)}
     </span>
@@ -1032,7 +995,7 @@ function MergeHistory({ userId }: { userId?: string }) {
 
   return (
     <>
-      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Merge History</h2>
+      <h2 className="settings-h2">Merge History</h2>
       <p className="text-base mb-5 text-text-secondary">
         View and undo past person merges
       </p>
@@ -1051,7 +1014,7 @@ function MergeHistory({ userId }: { userId?: string }) {
               merged {relativeTime(entry.merged_at)}
             </span>
             {entry.undone_at && (
-              <span className="text-xs py-px px-1.5 rounded-[3px] bg-[var(--hover-warning-subtle)] text-warning">undone</span>
+              <span className="text-xs py-px px-1.5 rounded-chip bg-[var(--hover-warning-subtle)] text-warning">undone</span>
             )}
           </div>
           <div className="text-sm text-text-muted mb-1">
@@ -1059,7 +1022,7 @@ function MergeHistory({ userId }: { userId?: string }) {
           </div>
           <div className="flex gap-1 flex-wrap mb-2">
             {_.isArray(entry.merged_identities) && entry.merged_identities.map((ident) => (
-              <span key={ident.id} className="text-xs py-px px-1.5 rounded-[3px] bg-surface text-text-secondary">
+              <span key={ident.id} className="text-xs py-px px-1.5 rounded-chip bg-surface text-text-secondary">
                 {ident.channel}: {ident.handle}
               </span>
             ))}
@@ -1082,13 +1045,12 @@ function MergeHistory({ userId }: { userId?: string }) {
 function PreferencesSection() {
   const syncReadStatus = usePreferencesStore((s) => s.syncReadStatus)
   const setSyncReadStatus = usePreferencesStore((s) => s.setSyncReadStatus)
-
-  const pillCls = (active: boolean) =>
-    `text-sm py-0.5 px-2.5 rounded-[10px] border-none cursor-pointer ${active ? 'bg-[var(--hover-accent-strong)] text-text-primary' : 'bg-surface text-text-muted'}`
+  const autoSnoozeOnSend = usePreferencesStore((s) => s.autoSnoozeOnSend)
+  const setAutoSnoozeOnSend = usePreferencesStore((s) => s.setAutoSnoozeOnSend)
 
   return (
     <>
-      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">Preferences</h2>
+      <h2 className="settings-h2">Preferences</h2>
 
       <div className="settings-card">
         <div className="settings-card-body">
@@ -1098,14 +1060,27 @@ function PreferencesSection() {
           </p>
         </div>
         <div className="flex gap-2 items-center">
-          <button onClick={() => setSyncReadStatus(true)} className={pillCls(syncReadStatus)}>On</button>
-          <button onClick={() => setSyncReadStatus(false)} className={pillCls(!syncReadStatus)}>Off</button>
+          <button onClick={() => setSyncReadStatus(true)} className="settings-pill" data-active={syncReadStatus}>On</button>
+          <button onClick={() => setSyncReadStatus(false)} className="settings-pill" data-active={!syncReadStatus}>Off</button>
+        </div>
+      </div>
+
+      <div className="settings-card">
+        <div className="settings-card-body">
+          <p className="settings-card-name">Auto-snooze on send</p>
+          <p className="settings-card-desc">
+            When enabled, sending a reply automatically snoozes the conversation until the other person replies — keeping Their Turn clean.
+          </p>
+        </div>
+        <div className="flex gap-2 items-center">
+          <button onClick={() => setAutoSnoozeOnSend(true)} className="settings-pill" data-active={autoSnoozeOnSend}>On</button>
+          <button onClick={() => setAutoSnoozeOnSend(false)} className="settings-pill" data-active={!autoSnoozeOnSend}>Off</button>
         </div>
       </div>
 
       <div className="h-px bg-border my-10" />
 
-      <h2 className="text-[20px] font-semibold mb-2 text-text-primary">Read Status Sync by Channel</h2>
+      <h2 className="settings-h2 settings-h2--tight">Read Status Sync by Channel</h2>
       <p className="text-sm text-text-muted mb-5">
         Not all messaging platforms expose read status control. Here&apos;s what happens on each channel when sync is enabled.
       </p>
@@ -1173,7 +1148,7 @@ function AboutSection() {
 
   return (
     <>
-      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">About</h2>
+      <h2 className="settings-h2">About</h2>
 
       <div className="settings-card">
         <div className="settings-card-body">
@@ -1192,11 +1167,11 @@ function AboutSection() {
         <button
           onClick={onClick}
           disabled={busy}
-          className={`text-sm py-1 px-3 rounded-sm cursor-pointer border-none disabled:opacity-50 ${
+          className={
             status === 'available'
-              ? 'bg-blue-600 text-white hover:bg-blue-500'
-              : 'bg-[var(--hover-accent-strong)] text-text-primary'
-          }`}
+              ? 'btn-primary btn-primary-sm'
+              : 'settings-card-btn bg-[var(--hover-accent-strong)] text-text-primary'
+          }
         >
           {buttonLabel}
         </button>

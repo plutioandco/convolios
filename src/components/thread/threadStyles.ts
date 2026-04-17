@@ -11,7 +11,6 @@ export const card: CSSProperties = {
 export const cardBordered: CSSProperties = {
   ...card,
   border: '1px solid var(--color-border)',
-  transition: 'border-color .15s',
 }
 
 export const label: CSSProperties = {
@@ -35,12 +34,6 @@ export const linkText: CSSProperties = {
   fontSize: 'var(--font-sm)',
   color: 'var(--color-link)',
   textDecoration: 'none',
-}
-
-export const inlineLink: CSSProperties = {
-  color: 'var(--color-link)',
-  textDecoration: 'none',
-  wordBreak: 'break-all',
 }
 
 export const media: CSSProperties = {

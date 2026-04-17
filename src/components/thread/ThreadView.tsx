@@ -18,9 +18,11 @@ import { useConversations } from '../../hooks/useConversations'
 import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { usePersonCircleColors } from '../../hooks/useCircles'
+import { useSnoozePerson } from '../../hooks/useSnooze'
 import { supabase } from '../../lib/supabase'
-import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, cleanSenderName, REACTION_RE, circleGradient, isLightBrandColor } from '../../utils'
+import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, cleanSenderName, REACTION_RE, circleGradient, relativeTime } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
+import { ThreadBanner } from './ThreadBanner'
 import * as S from './threadStyles'
 import type { Message, Channel, Identity } from '../../types'
 
@@ -57,9 +59,7 @@ function RichText({ text }: { text: string }) {
               href: part,
               target: '_blank',
               rel: 'noopener noreferrer',
-              style: S.inlineLink,
-              onMouseEnter: (e: React.MouseEvent<HTMLAnchorElement>) => { e.currentTarget.style.textDecoration = 'underline' },
-              onMouseLeave: (e: React.MouseEvent<HTMLAnchorElement>) => { e.currentTarget.style.textDecoration = 'none' },
+              className: 'rich-text-link',
             }, part)
           : part
       )}
@@ -184,10 +184,8 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
         href={att.post.url}
         target="_blank"
         rel="noopener noreferrer"
-        className="flex flex-col gap-1 no-underline"
+        className="flex flex-col gap-1 no-underline hover-accent-border"
         style={S.cardBordered}
-        onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-accent)' }}
-        onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = 'var(--color-border)' }}
       >
         <span style={S.meta}>
           <LinkIcon size={14} className="align-middle mr-1" />
@@ -217,10 +215,8 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
     } : undefined
     return (
       <button onClick={handleClick} disabled={!canOpen}
-        className={`border-none ${canOpen ? 'cursor-pointer' : 'cursor-default'}`}
-        style={{ ...S.pillBadge, gap: 8 }}
-      onMouseEnter={(e) => { if (canOpen) e.currentTarget.style.background = 'var(--color-surface-deep)' }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
+        className={`border-none hover-deep-bg ${canOpen ? 'cursor-pointer' : 'cursor-default'}`}
+        style={{ ...S.pillBadge, gap: 8 }}>
         <span className="text-text-muted">{icon}</span>
         <span style={{ ...S.label, fontWeight: 400, color: canOpen ? 'var(--color-link)' : 'var(--color-text-muted)' }}>{label}</span>
         {canOpen && <Download size={14} className="shrink-0 opacity-60" />}
@@ -261,10 +257,8 @@ function AttachmentMedia({ messageId, att, channel }: { messageId: string; att: 
     }
     return (
       <button onClick={openDoc}
-        className="text-link no-underline cursor-pointer border-none"
-        style={{ ...S.pillBadge, gap: 8 }}
-      onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-surface-deep)' }}
-      onMouseLeave={(e) => { e.currentTarget.style.background = '' }}>
+        className="text-link no-underline cursor-pointer border-none hover-deep-bg"
+        style={{ ...S.pillBadge, gap: 8 }}>
         <FileText size={16} className="shrink-0" />
         <span className="flex-1 min-w-0 truncate">
           {att.name ?? 'Document'}
@@ -469,7 +463,7 @@ function parseVCard(text: string): { name: string; phone: string | null; email: 
 function ContactCard({ name, phone, email }: { name: string; phone: string | null; email: string | null }) {
   return (
     <div className="flex items-center gap-3" style={S.card}>
-      <div className="w-10 h-10 rounded-full bg-accent flex items-center justify-center text-[18px] font-semibold text-white shrink-0">
+      <div className="w-10 h-10 rounded-full bg-accent flex items-center justify-center text-xl font-semibold text-white shrink-0">
         {initials(name)}
       </div>
       <div className="min-w-0">
@@ -831,9 +825,9 @@ function MessageBody({ msg }: { msg: Message }) {
       {hasAttachments && attachments.map((att) => (
         <AttachmentMedia key={att.id} messageId={msg.external_id ?? msg.id} att={att} channel={msg.channel} />
       ))}
-      {(isEmpty && !hasAttachments && !location && !vcard) || (isUndisplayable && !hasAttachments)
-        ? <em style={S.mutedItalic}>unsupported message type</em>
-        : null}
+      {((isEmpty && !hasAttachments && !location && !vcard) || (isUndisplayable && !hasAttachments)) && (
+        <em style={S.mutedItalic}>unsupported message type</em>
+      )}
     </>
   )
 }
@@ -920,7 +914,7 @@ function MessageActions({ msg, onReply, onEdit, onFlag }: {
           className="absolute bottom-full right-0 mb-1 flex gap-0.5 p-1 rounded-card bg-surface-deep border border-border">
           {QUICK_EMOJIS.map((e) => (
             <button key={e} onClick={() => handleReaction(e)}
-              className="bg-transparent border-none cursor-pointer text-[20px] px-1 py-0.5 rounded-sm hover:bg-border">
+              className="bg-transparent border-none cursor-pointer text-xl px-1 py-0.5 rounded-sm hover:bg-border">
               {e}
             </button>
           ))}
@@ -1021,6 +1015,16 @@ function ThreadViewInner() {
   const personChannels = _.uniq(personIdentities.map((i) => i.channel))
   const threadChannels = _.uniq(thread.map((m) => m.channel))
   const availableChannels = _.uniq([...personChannels, ...threadChannels])
+
+  const lastSeenByChannel = (() => {
+    const map = new Map<Channel, string>()
+    for (const m of thread) {
+      if (!_.isString(m.channel) || !_.isString(m.sent_at)) continue
+      const existing = map.get(m.channel as Channel)
+      if (!existing || m.sent_at > existing) map.set(m.channel as Channel, m.sent_at)
+    }
+    return map
+  })()
 
   const filteredThread = threadChannelFilter === 'all'
     ? thread
@@ -1213,6 +1217,7 @@ function ThreadViewInner() {
         })
       }}
     >
+      {_.isString(pid) && <ThreadBanner personId={pid} />}
       <div className="thread-scroller-wrap">
         <div ref={scrollContainerRef} className="thread-scroller chat-scroll">
         <div>
@@ -1245,17 +1250,8 @@ function ThreadViewInner() {
                             {initials(person.display_name)}
                           </div>}
                     </div>}
-                <h3 className="text-[24px] font-bold text-text-primary mt-2 flex items-center gap-2">
+                <h3 className="text-2xl font-bold text-text-primary mt-2 flex items-center gap-2">
                   {person.display_name}
-                  {availableChannels.length > 1 && (
-                    <span className="flex gap-1">
-                      {availableChannels.map((ch) => (
-                        <span key={ch} className="w-5 h-5 rounded-sm flex items-center justify-center" style={{ background: channelColor(ch) }}>
-                          <ChannelLogo channel={ch} size={12} color={isLightBrandColor(channelColor(ch)) ? 'var(--color-black)' : 'var(--color-white)'} />
-                        </span>
-                      ))}
-                    </span>
-                  )}
                   {!isGroup && (
                     <button
                       onClick={() => setShowLinkPerson(true)}
@@ -1271,6 +1267,24 @@ function ThreadViewInner() {
                     ? <>This is the beginning of <strong>{person.display_name}</strong>.</>
                     : <>This is the beginning of your conversation with <strong>{person.display_name}</strong>.</>}
                 </p>
+                {availableChannels.length > 0 && (
+                  <div className="person-channel-strip">
+                    {availableChannels.map((ch) => {
+                      const seen = lastSeenByChannel.get(ch as Channel)
+                      return (
+                        <span key={ch} className="person-channel-chip" title={ch}>
+                          <ChannelLogo channel={ch} size={11} color={channelColor(ch)} />
+                          <span className="person-channel-chip-label">
+                            {ch === 'imessage' ? 'iMessage' : ch.charAt(0).toUpperCase() + ch.slice(1)}
+                          </span>
+                          {_.isString(seen) && (
+                            <span className="person-channel-chip-ts">{relativeTime(seen)}</span>
+                          )}
+                        </span>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1299,6 +1313,7 @@ function ThreadViewInner() {
               const curDay = new Date(msg.sent_at).toDateString()
               const prevDay = prev ? new Date(prev.sent_at).toDateString() : null
               const showDivider = prevDay !== null && curDay !== prevDay
+              const showChannelSwitch = !_.isNil(prev) && !_.isNil(msg.channel) && !_.isNil(prev.channel) && prev.channel !== msg.channel
 
               if (isSystemEvent(msg)) {
                 if (prev && isSystemEvent(prev) && !showDivider &&
@@ -1308,6 +1323,7 @@ function ThreadViewInner() {
                 return (
                   <div key={msg.id}>
                     {showDivider && <DayDivider iso={msg.sent_at} />}
+                    {showChannelSwitch && <ChannelSwitchDivider channel={msg.channel} />}
                     <SystemEvent msg={msg} />
                   </div>
                 )
@@ -1323,13 +1339,14 @@ function ThreadViewInner() {
                 ? (isMe && prevIsMe) ||
                   (_.isString(prev.sender_name) && prev.sender_name === msg.sender_name)
                 : isMe === prevIsMe)
-              const sameGroup = !showDivider && sameSender && !isSystemEvent(prev) && !isReactionMsg(prev) &&
+              const sameGroup = !showDivider && !showChannelSwitch && sameSender && !isSystemEvent(prev) && !isReactionMsg(prev) &&
                 msgIsGroup === prevIsGroup &&
                 (new Date(msg.sent_at).getTime() - new Date(prev.sent_at).getTime() <= 420_000)
 
               return (
                 <div key={msg.id} data-msg-id={msg.id} style={msg._pending ? { opacity: msg._failed ? 0.5 : 0.7 } : undefined}>
                   {showDivider && <DayDivider iso={msg.sent_at} />}
+                  {showChannelSwitch && <ChannelSwitchDivider channel={msg.channel} />}
                   {editingMsg?.id === msg.id
                       ? <EditInline msg={msg} onSubmit={handleEditSubmit} onCancel={handleEditCancel} />
                       : sameGroup
@@ -1415,53 +1432,50 @@ function ManualMergeDialog({ personId, personName, userId, allConvos, onClose }:
 
   return (
     <div onClick={onClose} className="modal-backdrop">
-      <div onClick={(e) => e.stopPropagation()} className="modal-panel w-[420px] max-h-[70vh]">
-        <div className="border-b border-[var(--color-border)] px-4 pt-4 pb-3">
-          <div className="mb-3 flex items-center justify-between">
-            <h3 className="text-base font-semibold text-white">
-              {selectedTarget ? 'Confirm merge' : `Link person to ${personName}`}
-            </h3>
-            <button onClick={onClose} className="cursor-pointer border-none bg-transparent p-1 text-text-muted">
-              <XIcon size={16} />
-            </button>
-          </div>
-          {!selectedTarget && (
+      <div onClick={(e) => e.stopPropagation()} className="modal-panel manual-merge-panel">
+        <div className="modal-header manual-merge-header">
+          <h3 className="text-base font-semibold text-text-primary flex-1">
+            {selectedTarget ? 'Confirm merge' : `Link person to ${personName}`}
+          </h3>
+          <button onClick={onClose} className="btn-ghost p-1">
+            <XIcon size={16} />
+          </button>
+        </div>
+        {!selectedTarget && (
+          <div className="px-4 pb-3">
             <input
               ref={inputRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search contacts..."
-              className="w-full rounded border border-[var(--color-border)] px-3 text-sm outline-none h-9 bg-bg text-white"
+              className="input-dark input-dark-lg input-dark-bordered w-full"
             />
-          )}
-        </div>
+          </div>
+        )}
 
         {selectedTarget ? (
           <div className="flex flex-col gap-3 p-4">
             <p className="text-sm text-text-muted">
-              Merge <strong className="text-white">{selectedTarget.person.display_name}</strong> into <strong className="text-white">{personName}</strong>?
+              Merge <strong className="text-text-primary">{selectedTarget.person.display_name}</strong> into <strong className="text-text-primary">{personName}</strong>?
             </p>
             <p className="text-xs text-text-muted">
               All conversations and identities will be moved to {personName}. This can be undone from Settings.
             </p>
             <div className="flex gap-2 pt-1">
-              <button
-                onClick={() => setSelectedTarget(null)}
-                className="flex-1 cursor-pointer rounded border border-[var(--color-border)] bg-transparent py-2 text-sm font-medium text-white"
-              >
+              <button onClick={() => setSelectedTarget(null)} className="btn-outline flex-1">
                 Back
               </button>
               <button
                 onClick={confirmMerge}
                 disabled={merge.isPending}
-                className={`flex-1 cursor-pointer rounded border-none py-2 text-sm font-medium text-white bg-accent ${merge.isPending ? 'opacity-50' : ''}`}
+                className="btn-primary btn-primary-md flex-1"
               >
                 {merge.isPending ? 'Merging...' : 'Confirm merge'}
               </button>
             </div>
           </div>
         ) : (
-          <div className="flex-1 overflow-y-auto p-2">
+          <div className="modal-body manual-merge-list">
             {search.length === 0 && (
               <p className="p-3 text-center text-xs text-text-muted">
                 Type to search for a person to link
@@ -1476,20 +1490,20 @@ function ManualMergeDialog({ personId, personName, userId, allConvos, onClose }:
               <button
                 key={c.person.id}
                 onClick={() => setSelectedTarget(c)}
-                className="flex w-full items-center gap-2.5 rounded border-none bg-transparent px-2.5 py-2 text-left text-white cursor-pointer hover:bg-[var(--hover-row-subtle)]"
+                className="manual-merge-candidate"
               >
                 {_.isString(c.person.avatar_url) ? (
                   <img src={c.person.avatar_url} alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" />
                 ) : (
-                  <div className={`${avatarCls(c.person.id)} flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white`}>
+                  <div className={`avatar avatar--lg ${avatarCls(c.person.id)}`}>
                     {initials(c.person.display_name)}
                   </div>
                 )}
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">{c.person.display_name}</div>
+                  <div className="text-sm font-medium text-text-primary">{c.person.display_name}</div>
                   <div className="mt-0.5 flex gap-1">
                     {_.isArray(c.channels) && c.channels.map((ch) => (
-                      <span key={ch} className="rounded px-1 text-2xs bg-bg text-text-muted">{ch}</span>
+                      <span key={ch} className="rounded-chip px-1 text-2xs bg-bg text-text-muted">{ch}</span>
                     ))}
                   </div>
                 </div>
@@ -1510,7 +1524,7 @@ function EmptyState() {
         <div className="av-1 avatar avatar--hero mx-auto mb-4">
           C
         </div>
-        <h2 className="text-[24px] font-bold text-text-primary">Welcome back!</h2>
+        <h2 className="text-2xl font-bold text-text-primary">Welcome back!</h2>
         <p className="text-body mt-1 text-text-secondary">Select a conversation to start</p>
       </div>
     </div>
@@ -1549,6 +1563,18 @@ function DayDivider({ iso }: { iso: string }) {
   return (
     <div className="day-divider">
       <span className="day-divider-text">{dateDivider(iso)}</span>
+    </div>
+  )
+}
+
+function ChannelSwitchDivider({ channel }: { channel: Channel }) {
+  const label = channel === 'imessage' ? 'iMessage' : channel.charAt(0).toUpperCase() + channel.slice(1)
+  return (
+    <div className="channel-switch">
+      <span className="channel-switch-pill">
+        <ChannelLogo channel={channel} size={10} color={channelColor(channel)} />
+        <span>continued on {label}</span>
+      </span>
     </div>
   )
 }
@@ -1715,15 +1741,33 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const { user } = useAuth()
   const qc = useQueryClient()
   const cancelThread = useCancelThreadQueries(personId, user?.id)
+  const snoozePerson = useSnoozePerson()
   const invalidateThread = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['thread', personId] })
     qc.invalidateQueries({ queryKey: ['conversations', user?.id] })
   }, [qc, personId, user?.id])
 
+  // Fire-and-forget: user opted into "snooze on send", so a failure should
+  // log but not block the send path. Cache invalidation is handled by the
+  // useSnoozePerson mutation's own onSuccess.
+  const applyAutoSnoozeIfEnabled = useCallback(() => {
+    if (!usePreferencesStore.getState().autoSnoozeOnSend) return
+    snoozePerson.mutate(
+      { personId, onTheirReply: true },
+      {
+        onError: (err) => {
+          console.error('[auto-snooze] failed:', err)
+        },
+      },
+    )
+  }, [personId, snoozePerson])
+
   const last = _.last(thread) ?? convoLastMessage
+  const lastInbound = _.findLast(thread, (m) => m.direction === 'inbound') ?? null
+  const replyInKindChannel = (lastInbound?.channel ?? last?.channel) as Channel | undefined
 
   const identityChannels = _.uniqBy(personIdentities ?? [], (i) => i.channel)
-  const activeChannel = selectedChannel ?? (last?.channel as Channel) ?? 'whatsapp'
+  const activeChannel = selectedChannel ?? replyInKindChannel ?? 'whatsapp'
   const activeIdentity = personIdentities?.find((i) => i.channel === activeChannel)
 
   const channelThread = useMemo(
@@ -1865,6 +1909,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
+        applyAutoSnoozeIfEnabled()
       } catch (e) {
         const reason = describeError(e)
         console.error('[send_message] failed:', reason, e)
@@ -1958,6 +2003,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
+        applyAutoSnoozeIfEnabled()
       } catch (e) {
         const reason = describeError(e)
         console.error('[send] failed:', reason, e)

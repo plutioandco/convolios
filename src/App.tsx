@@ -279,7 +279,7 @@ function SignInScreen() {
 }
 
 function Authenticated({ userId }: { userId: string }) {
-  const { connected, showConnecting, dead, reconnect } = useRealtimeMessages(userId)
+  const { connected, showConnecting } = useRealtimeMessages(userId)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const subscribe = useAccountsStore((s) => s.subscribe)
   const unsubscribe = useAccountsStore((s) => s.unsubscribe)
@@ -381,13 +381,7 @@ function Authenticated({ userId }: { userId: string }) {
           <span>You are offline — messages will sync when reconnected</span>
         </div>
       )}
-      {!offline && dead && (
-        <div className="app-banner app-banner--danger">
-          <span>Live updates paused — click retry to reconnect</span>
-          <button onClick={reconnect} className="bg-[var(--hover-accent)] text-sm font-semibold px-2.5 py-0.5 rounded-sm">Retry</button>
-        </div>
-      )}
-      {!offline && !dead && showConnecting && (
+      {!offline && showConnecting && (
         <div className="app-banner app-banner--warning">
           <span className="pulse-dot w-1.5 h-1.5 rounded-full bg-black" />
           <span className="text-sm">Connecting...</span>

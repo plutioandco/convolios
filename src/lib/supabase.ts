@@ -16,7 +16,6 @@ export const supabase = createClient(supabaseUrl, supabaseKey, {
     storage: window.localStorage,
   },
   realtime: {
-    worker: true,
     params: { eventsPerSecond: 10 },
   },
 })

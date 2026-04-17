@@ -2,7 +2,9 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Lock, Plus, Trash2, Undo2, Link2, Check, X } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { invoke } from '@tauri-apps/api/core'
+import { getVersion } from '@tauri-apps/api/app'
 import { open } from '@tauri-apps/plugin-shell'
+import { useUpdater } from '../../hooks/useUpdater'
 import { useAccountsStore } from '../../stores/accountsStore'
 import { useSyncStore } from '../../stores/inboxStore'
 import { queryClient } from '../../lib/queryClient'
@@ -38,7 +40,7 @@ export function Settings() {
   const [pullMsg, setPullMsg] = useState('')
   const [disconnecting, setDisconnecting] = useState<string | null>(null)
   const [disconnectErr, setDisconnectErr] = useState('')
-  const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges' | 'preferences'>('connections')
+  const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges' | 'preferences' | 'about'>('connections')
 
   const refresh = useCallback(() => {
     if (user?.id) fetchAccounts(user.id)
@@ -102,6 +104,7 @@ export function Settings() {
           <NavItem active={activeTab === 'suggestions'} onClick={() => setActiveTab('suggestions')}>Merge Suggestions</NavItem>
           <NavItem active={activeTab === 'merges'} onClick={() => setActiveTab('merges')}>Merge History</NavItem>
           <NavItem active={activeTab === 'preferences'} onClick={() => setActiveTab('preferences')}>Preferences</NavItem>
+          <NavItem active={activeTab === 'about'} onClick={() => setActiveTab('about')}>About</NavItem>
         </div>
       </div>
 
@@ -170,6 +173,8 @@ export function Settings() {
         {activeTab === 'suggestions' && <MergeSuggestionsView userId={user?.id} />}
         {activeTab === 'merges' && <MergeHistory userId={user?.id} />}
         {activeTab === 'preferences' && <PreferencesSection />}
+
+        {activeTab === 'about' && <AboutSection />}
       </div>
     </div>
   )
@@ -1025,3 +1030,56 @@ const READ_SYNC_CHANNELS = [
   { channel: 'email',    supported: false, detail: 'Email uses a different protocol (IMAP). Not applicable.' },
   { channel: 'x',        supported: false, detail: 'Not supported by the messaging provider API.' },
 ]
+
+function AboutSection() {
+  const [appVersion, setAppVersion] = useState<string | null>(null)
+  const { status, version, error, checkForUpdate, installUpdate } = useUpdater()
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch((e) => {
+      console.error('[about] getVersion failed', e)
+    })
+  }, [])
+
+  const busy = status === 'checking' || status === 'installing'
+  const buttonLabel =
+    status === 'checking'   ? 'Checking…'
+    : status === 'installing' ? 'Installing…'
+    : status === 'available'  ? 'Restart & Update'
+    :                           'Check for Updates'
+
+  const onClick = status === 'available' ? installUpdate : checkForUpdate
+
+  return (
+    <>
+      <h2 className="text-[20px] font-semibold mb-5 text-text-primary">About</h2>
+
+      <div className="settings-card">
+        <div className="settings-card-body">
+          <p className="settings-card-name">Convolios</p>
+          <p className="settings-card-desc">
+            {appVersion ? `Version ${appVersion}` : 'Loading version…'}
+            {status === 'available' && _.isString(version) && (
+              <> · <span className="text-accent font-medium">v{version} available</span></>
+            )}
+            {status === 'upToDate' && <> · <span className="text-success">Up to date</span></>}
+            {status === 'error' && _.isString(error) && (
+              <> · <span className="text-danger">{error}</span></>
+            )}
+          </p>
+        </div>
+        <button
+          onClick={onClick}
+          disabled={busy}
+          className={`text-sm py-1 px-3 rounded-sm cursor-pointer border-none disabled:opacity-50 ${
+            status === 'available'
+              ? 'bg-blue-600 text-white hover:bg-blue-500'
+              : 'bg-[var(--hover-accent-strong)] text-text-primary'
+          }`}
+        >
+          {buttonLabel}
+        </button>
+      </div>
+    </>
+  )
+}

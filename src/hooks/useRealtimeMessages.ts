@@ -5,7 +5,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
-import type { Message } from '../types'
+import { cleanSenderName, REACTION_RE, LID_RE, cleanPreviewText } from '../utils'
+import type { Message, ConversationPreview } from '../types'
 
 // Grace period before showing any "reconnecting" indicator — avoids flashing
 // it on brief WebSocket hiccups. Phoenix auto-reconnects with exponential
@@ -30,6 +31,40 @@ async function notifyIfAllowed(title: string, body: string) {
   } catch {
     /* notification plugin unavailable outside Tauri */
   }
+}
+
+// Look up a person's display name across every cached `['conversations', userId, …]`
+// query. Used as the notification title fallback when Unipile webhook payloads
+// arrive without a sender_name (common for reactions, system events).
+function personDisplayName(userId: string, personId: string): string | null {
+  const entries = queryClient.getQueriesData<ConversationPreview[]>({
+    queryKey: ['conversations', userId],
+  })
+  for (const [, data] of entries) {
+    const match = data?.find((c) => c.person.id === personId)
+    const name = match?.person.display_name
+    if (_.isString(name) && name.length > 0) return name
+  }
+  return null
+}
+
+// Build a clean (no LID placeholders, no gibberish) title+body for a push
+// notification. Reactions get a dedicated format so the user sees "❤ reacted"
+// instead of "{{145544244678857@lid}} reacted ❤".
+function formatNotification(msg: Message, userId: string): { title: string; body: string } {
+  const rawSender = _.isString(msg.sender_name) ? cleanSenderName(msg.sender_name) : ''
+  const fallbackName = _.isString(msg.person_id) ? personDisplayName(userId, msg.person_id) : null
+  const title = rawSender.length > 0
+    ? rawSender
+    : (fallbackName ?? 'New message')
+
+  const raw = _.isString(msg.body_text) ? msg.body_text : ''
+  const reaction = raw.match(REACTION_RE)
+  const cleaned = reaction
+    ? `Reacted ${reaction[1]}`
+    : cleanPreviewText(raw.replace(LID_RE, '').trim())
+
+  return { title, body: cleaned.slice(0, 140) }
 }
 
 function patchThread(personId: string, userId: string | undefined, msg: Message, mode: 'insert' | 'update') {
@@ -84,8 +119,7 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
           debouncedInvalidateConvos()
 
           if (msg.direction === 'inbound' && !document.hasFocus()) {
-            const title = _.isString(msg.sender_name) ? msg.sender_name : 'New message'
-            const body = _.isString(msg.body_text) ? msg.body_text.slice(0, 100) : ''
+            const { title, body } = formatNotification(msg, userId)
             notifyIfAllowed(title, body)
           }
         },

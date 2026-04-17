@@ -19,7 +19,7 @@ import { useThread, addPendingMessage, markPendingFailed, removePending, patchPe
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { usePersonCircleColors } from '../../hooks/useCircles'
 import { supabase } from '../../lib/supabase'
-import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, circleGradient, isLightBrandColor } from '../../utils'
+import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, cleanSenderName, REACTION_RE, circleGradient, isLightBrandColor } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
 import * as S from './threadStyles'
 import type { Message, Channel, Identity } from '../../types'
@@ -333,13 +333,6 @@ function mergePendingFiles(prev: PendingFile[], next: PendingFile[]): PendingFil
     }
   }
   return out
-}
-
-const REACTION_RE = /^\{\{[^}]+\}\}\s*reacted\s+(.+)$/
-const LID_RE = /\{\{[^}]+@lid\}\}/g
-
-function cleanSenderName(raw: string): string {
-  return raw.replace(LID_RE, '').trim() || raw
 }
 
 function isMine(msg: Message, mySenderNames: Set<string>): boolean {

@@ -118,6 +118,16 @@ export function cleanPreviewText(text: string): string {
   return out.replace(ZERO_WIDTH_RE, '').replace(/\s+/g, ' ').trim()
 }
 
+// WhatsApp webhooks embed the reacting user as `{{<phone-or-id>@lid}}` inside
+// sender_name and body_text. Strip those placeholders so UI never shows raw
+// `{{17053026490@lid}}` gunk — used by ThreadView, notifications, etc.
+export const LID_RE = /\{\{[^}]+@lid\}\}/g
+export const REACTION_RE = /^\{\{[^}]+\}\}\s*reacted\s+(.+)$/
+
+export function cleanSenderName(raw: string): string {
+  return raw.replace(LID_RE, '').trim() || raw
+}
+
 export function accountDisplayLabel(a: ConnectedAccount): string {
   if (_.isString(a.email) && a.email.length > 0) return a.email
   if (_.isString(a.phone) && a.phone.length > 0) {

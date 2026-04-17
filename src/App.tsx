@@ -98,17 +98,18 @@ class SectionErrorBoundary extends Component<{ children: ReactNode; name: string
 }
 
 function UpdateBanner() {
-  const { updateAvailable, updating, version, installUpdate } = useUpdater()
-  if (!updateAvailable) return null
+  const { status, version, installUpdate } = useUpdater()
+  if (status !== 'available' && status !== 'installing') return null
+  const installing = status === 'installing'
   return (
     <div className="flex items-center justify-between px-4 py-2 bg-blue-600 text-white text-sm">
-      <span>Update {version} available</span>
+      <span>{installing ? 'Installing update…' : `Update ${version ?? ''} available`}</span>
       <button
         onClick={installUpdate}
-        disabled={updating}
+        disabled={installing}
         className="px-3 py-1 bg-white text-blue-600 rounded text-xs font-medium hover:bg-blue-50 disabled:opacity-50"
       >
-        {updating ? 'Updating...' : 'Restart & Update'}
+        {installing ? 'Updating…' : 'Restart & Update'}
       </button>
     </div>
   )

@@ -298,18 +298,16 @@ function Authenticated({ userId }: { userId: string }) {
     let failures = 0
     const probe = async () => {
       try {
-        const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/auth/v1/health`, {
+        // Any HTTP response (even 4xx) proves the network + Supabase gateway are
+        // reachable; only a fetch exception (DNS, TCP, TLS) means we're offline.
+        await fetch(`${import.meta.env.VITE_SUPABASE_URL}/auth/v1/health`, {
           method: 'GET',
           cache: 'no-store',
+          headers: { apikey: import.meta.env.VITE_SUPABASE_ANON_KEY },
         })
         if (cancelled) return
-        if (res.ok) {
-          failures = 0
-          setOffline(false)
-        } else {
-          failures += 1
-          if (failures >= 2) setOffline(true)
-        }
+        failures = 0
+        setOffline(false)
       } catch {
         if (cancelled) return
         failures += 1

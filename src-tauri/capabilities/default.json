@@ -11,6 +11,8 @@
     "allow-infra-connections",
     "allow-account-management",
     "deep-link:default",
-    "notification:default"
+    "notification:default",
+    "updater:default",
+    "process:default"
   ]
 }

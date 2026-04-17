@@ -16,8 +16,10 @@ export function useUpdater() {
           setUpdateAvailable(true)
           setVersion(update.version)
         }
-      } catch {
-        // silently ignore update check failures
+      } catch (err) {
+        // Log so a missing capability, signature mismatch, or network error
+        // surfaces in DevTools instead of vanishing into a silent catch.
+        console.error('[updater] check failed', err)
       }
     }
     // Check after 5s delay to not block startup
@@ -33,7 +35,8 @@ export function useUpdater() {
         await update.downloadAndInstall()
         await relaunch()
       }
-    } catch {
+    } catch (err) {
+      console.error('[updater] install failed', err)
       setUpdating(false)
     }
   }

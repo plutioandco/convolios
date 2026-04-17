@@ -15,7 +15,7 @@ const PAGE_SIZE = 80
 interface PendingState {
   byPerson: Record<string, Message[]>
   add: (personId: string, msg: Message) => void
-  markFailed: (personId: string, optId: string) => void
+  markFailed: (personId: string, optId: string, reason?: string) => void
   remove: (personId: string, optId: string) => void
   patchExternalId: (personId: string, optId: string, externalId: string) => void
 }
@@ -29,14 +29,14 @@ const usePendingStore = create<PendingState>((set) => ({
         [personId]: [...(state.byPerson[personId] ?? []), { ...msg, _pending: true }],
       },
     })),
-  markFailed: (personId, optId) =>
+  markFailed: (personId, optId, reason) =>
     set((state) => {
       const list = state.byPerson[personId]
       if (!list) return state
       return {
         byPerson: {
           ...state.byPerson,
-          [personId]: list.map((m) => (m.id === optId ? { ...m, _failed: true } : m)),
+          [personId]: list.map((m) => (m.id === optId ? { ...m, _failed: true, _failedReason: reason } : m)),
         },
       }
     }),
@@ -67,8 +67,8 @@ export function addPendingMessage(personId: string, msg: Message) {
   usePendingStore.getState().add(personId, msg)
 }
 
-export function markPendingFailed(personId: string, optId: string) {
-  usePendingStore.getState().markFailed(personId, optId)
+export function markPendingFailed(personId: string, optId: string, reason?: string) {
+  usePendingStore.getState().markFailed(personId, optId, reason)
 }
 
 export function removePending(personId: string, optId: string) {

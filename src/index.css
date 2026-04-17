@@ -905,6 +905,7 @@ button { border: none; background: none; cursor: pointer; }
   border-radius: var(--radius-sm); background: var(--hover-danger-subtle); margin-bottom: 2px;
 }
 .failed-msg-text { font-size: var(--font-sm); color: var(--color-danger); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.failed-msg-reason { opacity: 0.7; font-weight: 400; }
 .failed-msg-retry { color: var(--color-danger); font-size: var(--font-sm); font-weight: 600; flex-shrink: 0; }
 
 /* Message actions bar */

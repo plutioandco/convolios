@@ -84,6 +84,7 @@ export interface Message {
   flagged_at: string | null
   _pending?: boolean
   _failed?: boolean
+  _failedReason?: string
 }
 
 export interface ConnectedAccount {

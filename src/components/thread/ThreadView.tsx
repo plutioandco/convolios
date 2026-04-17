@@ -32,6 +32,18 @@ function newOptimisticId(): string {
   return `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
 }
 
+// Tauri invoke rejects with a string (the Rust error) or an Error. Normalize
+// so UI and logs get a readable reason.
+function describeError(e: unknown): string {
+  if (_.isString(e)) return e
+  if (e instanceof Error) return e.message
+  if (_.isObject(e)) {
+    const msg = (e as { message?: unknown }).message
+    if (_.isString(msg)) return msg
+  }
+  return 'Unknown error'
+}
+
 function RichText({ text }: { text: string }) {
   const parts = text.split(URL_SPLIT_RE)
   if (parts.length <= 1) return <>{text}</>
@@ -888,7 +900,7 @@ function MessageActions({ msg, onReply, onEdit, onFlag }: {
     try {
       await invoke('add_reaction', { messageId: extId, reaction: emoji })
     } catch (e) {
-      if (import.meta.env.DEV) console.error('Reaction failed:', e)
+      console.error('[reaction] failed:', e)
     }
   }
 
@@ -976,7 +988,7 @@ function ThreadViewInner() {
                 setPendingDropFiles((prev) => mergePendingFiles(prev, files))
               }
             } catch (e) {
-              if (import.meta.env.DEV) console.error('Drop read failed:', e)
+              console.error('[drop] read failed:', e)
             }
           }
         }
@@ -1140,7 +1152,7 @@ function ThreadViewInner() {
       await invoke('edit_message', { messageId: extId, text: newText })
       qc.invalidateQueries({ queryKey: ['thread', pid] })
     } catch (e) {
-      if (import.meta.env.DEV) console.error('Edit failed:', e)
+      console.error('[edit] failed:', e)
     }
     setEditingMsg(null)
   }
@@ -1728,8 +1740,23 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const lastForChannel = _.last(channelThread)
     ?? (convoLastMessage?.channel === activeChannel ? convoLastMessage : null)
   const resolvedChatId = lastForChannel?.thread_id
-  const resolvedAccountId = lastForChannel?.unipile_account_id
-    ?? activeIdentity?.unipile_account_id ?? ''
+  // Account routing MUST come from a real persisted message. Optimistic
+  // pending messages are created with `unipile_account_id: null` — if we let
+  // that null fall through to `activeIdentity.unipile_account_id` when the
+  // user has multiple accounts on the same channel, `_.uniqBy(..., channel)`
+  // picks an arbitrary identity and we end up 403-ing with
+  // `errors/account_mismatch` from Unipile.
+  const lastRealWithAccount = _.findLast(
+    channelThread,
+    (m) => !m._pending && _.isString(m.unipile_account_id) && m.unipile_account_id.length > 0,
+  )
+  const convoAccountId = convoLastMessage?.channel === activeChannel
+    ? convoLastMessage.unipile_account_id
+    : null
+  const resolvedAccountId = lastRealWithAccount?.unipile_account_id
+    ?? (_.isString(convoAccountId) ? convoAccountId : null)
+    ?? activeIdentity?.unipile_account_id
+    ?? ''
 
   useEffect(() => {
     if (!showChannelPicker) return
@@ -1846,8 +1873,9 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
       } catch (e) {
-        if (import.meta.env.DEV) console.error('Send failed:', e)
-        markPendingFailed(personId, optId)
+        const reason = describeError(e)
+        console.error('[send_message] failed:', reason, e)
+        markPendingFailed(personId, optId, reason)
       }
     })()
   }
@@ -1938,8 +1966,9 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
       } catch (e) {
-        if (import.meta.env.DEV) console.error('Send failed:', e)
-        markPendingFailed(personId, optId)
+        const reason = describeError(e)
+        console.error('[send] failed:', reason, e)
+        markPendingFailed(personId, optId, reason)
       }
     })()
   }
@@ -1989,8 +2018,11 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
         <div className="mb-1.5">
           {failedMessages.map((m) => (
             <div key={m.id} className="failed-msg-row">
-              <span className="failed-msg-text">
+              <span className="failed-msg-text" title={m._failedReason ?? undefined}>
                 Failed to send: {cleanPreviewText(m.body_text ?? '').slice(0, 40)}
+                {_.isString(m._failedReason) && m._failedReason.length > 0 && (
+                  <span className="failed-msg-reason"> — {m._failedReason}</span>
+                )}
               </span>
               <button onClick={() => {
                 const bodyText = m.body_text ?? ''

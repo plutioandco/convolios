@@ -26,6 +26,104 @@ struct AppState {
 /// guidance: "fetch a larger period than your cron delay".
 const SYNC_SELF_HEAL_HOURS: i64 = 2;
 
+/// Supabase / PostgREST transient-failure retry budget.
+///
+/// Matches supabase-js v2.102.0's built-in behaviour: "up to 3 attempts with
+/// exponential backoff with jitter." See
+/// https://supabase.com/docs/guides/api/automatic-retries-in-supabase-js
+const SB_MAX_ATTEMPTS: u32 = 3;
+const SB_BASE_BACKOFF_MS: u64 = 250;
+
+/// HTTP status codes Supabase documents as transient / worth retrying on
+/// idempotent requests. 408 (Request Timeout), 502 (Bad Gateway from
+/// Cloudflare), 503 (Service Unavailable — e.g. PostgREST schema-cache
+/// reload), 504 (Gateway Timeout — e.g. PGRST003 pool-acquisition timeout),
+/// 520 (Cloudflare "unknown origin error").
+///
+/// 429 is handled separately on the Unipile path via `Retry-After`.
+fn is_transient_http_status(status: u16) -> bool {
+  matches!(status, 408 | 502 | 503 | 504 | 520)
+}
+
+/// Classify a `reqwest::Error` as transient (safe to retry) — connect
+/// failures, timeouts, and body-decode errors that typically represent
+/// a dropped connection mid-response.
+fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
+  err.is_timeout() || err.is_connect() || err.is_body()
+}
+
+/// Exponential backoff: 250ms, 500ms, 1000ms, 2000ms, 4000ms (capped).
+async fn sb_backoff_sleep(attempt: u32) {
+  let delay = SB_BASE_BACKOFF_MS.saturating_mul(1u64 << attempt.min(4));
+  tokio::time::sleep(Duration::from_millis(delay.min(4000))).await;
+}
+
+/// Bulk PostgREST upsert with transient-error retry.
+///
+/// Implements two documented resilience patterns:
+///   1. Bulk upsert — `POST /rest/v1/<table>?on_conflict=...` with a JSON
+///      array body. PostgREST's explicit guidance for PGRST003 is to
+///      "reduce write requests. Do Bulk Insert (or Upsert) instead of
+///      inserting rows one by one."
+///   2. Transient retry — on 408/502/503/504/520 or a transient network
+///      error, retry up to `SB_MAX_ATTEMPTS` times with exponential
+///      backoff, matching supabase-js's built-in retry behaviour.
+///
+/// `prefer` is passed through to the `Prefer:` header (e.g.
+/// `"resolution=ignore-duplicates"`). Empty input is a no-op.
+async fn supabase_upsert_batch(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  table: &str,
+  on_conflict: &str,
+  prefer: &str,
+  rows: &[serde_json::Value],
+  context: &str,
+) -> Result<usize, String> {
+  if rows.is_empty() { return Ok(0); }
+  let url = format!("{supabase_url}/rest/v1/{table}?on_conflict={on_conflict}");
+  let body = serde_json::Value::Array(rows.to_vec());
+
+  let mut attempt: u32 = 0;
+  loop {
+    attempt += 1;
+    let resp = client
+      .post(&url)
+      .header("apikey", service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .header("Content-Type", "application/json")
+      .header("Prefer", prefer)
+      .json(&body)
+      .send()
+      .await;
+
+    match resp {
+      Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
+        return Ok(rows.len());
+      }
+      Ok(r) => {
+        let status = r.status().as_u16();
+        if is_transient_http_status(status) && attempt < SB_MAX_ATTEMPTS {
+          err_log!("[{context}] transient {status} on upsert, retry {attempt}/{SB_MAX_ATTEMPTS}");
+          sb_backoff_sleep(attempt - 1).await;
+          continue;
+        }
+        let body_txt = r.text().await.unwrap_or_default();
+        return Err(format!("[{context}] upsert failed ({status}) after {attempt}/{SB_MAX_ATTEMPTS}: {body_txt}"));
+      }
+      Err(e) => {
+        if is_transient_reqwest_error(&e) && attempt < SB_MAX_ATTEMPTS {
+          err_log!("[{context}] transient network error on upsert, retry {attempt}/{SB_MAX_ATTEMPTS}: {e}");
+          sb_backoff_sleep(attempt - 1).await;
+          continue;
+        }
+        return Err(format!("[{context}] upsert error after {attempt}/{SB_MAX_ATTEMPTS}: {e}"));
+      }
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   load_root_env();
@@ -1170,6 +1268,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         }
       };
 
+      let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
       for msg in &messages {
         let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if external_id.is_empty() { continue; }
@@ -1276,27 +1375,32 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           );
         }
 
-        // ignore-duplicates (not merge-duplicates): startup re-fetches the
-        // latest slice per chat every launch, so existing rows must be left
-        // alone — otherwise fields the user/app mutates (triage, read_at,
-        // flagged_at, reactions) would be clobbered back to their Unipile
-        // state on every startup. Real-time updates to existing messages
-        // (edits, deletes, reactions, seen) arrive via dedicated webhook
-        // events that update the row directly.
-        let insert = client
-          .post(format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id"))
-          .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
-          .header("Content-Type", "application/json").header("Prefer", "resolution=ignore-duplicates")
-          .json(&row).send().await;
-        match insert {
-          Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => { msgs_synced += 1; }
-          Ok(r) => {
-            let s = r.status();
-            let b = r.text().await.unwrap_or_default();
-            err_log!("[startup_sync] message upsert failed ({s}): {b}");
-          }
-          Err(e) => { err_log!("[startup_sync] message upsert error: {e}"); }
-        }
+        rows_to_upsert.push(row);
+      }
+
+      // ignore-duplicates (not merge-duplicates): startup re-fetches the
+      // latest slice per chat every launch, so existing rows must be left
+      // alone — otherwise fields the user/app mutates (triage, read_at,
+      // flagged_at, reactions) would be clobbered back to their Unipile
+      // state on every startup. Real-time updates to existing messages
+      // (edits, deletes, reactions, seen) arrive via dedicated webhook
+      // events that update the row directly.
+      //
+      // Bulk POST with a JSON-array body per PostgREST's PGRST003 guidance
+      // ("reduce write requests. Do Bulk Insert instead of inserting rows
+      // one by one.") and with documented transient-error retry.
+      match supabase_upsert_batch(
+        client,
+        &supabase_url,
+        &service_key,
+        "messages",
+        "user_id,external_id",
+        "resolution=ignore-duplicates",
+        &rows_to_upsert,
+        "startup_sync",
+      ).await {
+        Ok(n) => msgs_synced += n as u32,
+        Err(e) => err_log!("{e}"),
       }
 
       if !is_group {
@@ -1986,7 +2090,7 @@ async fn sync_chat(
     std::collections::HashMap::new()
   };
 
-  let mut synced = 0u32;
+  let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
 
   for msg in &messages {
     let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2069,23 +2173,25 @@ async fn sync_chat(
       row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
     }
 
-    let insert = client
-      .post(format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id"))
-      .header("apikey", &service_key)
-      .header("Authorization", format!("Bearer {service_key}"))
-      .header("Content-Type", "application/json")
-      .header("Prefer", "resolution=merge-duplicates")
-      .json(&row).send().await;
-    match insert {
-      Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => { synced += 1; }
-      Ok(r) => {
-        let s = r.status();
-        let b = r.text().await.unwrap_or_default();
-        err_log!("[sync_chat] message upsert failed ({s}): {b}");
-      }
-      Err(e) => { err_log!("[sync_chat] message upsert error: {e}"); }
-    }
+    rows_to_upsert.push(row);
   }
+
+  // Bulk upsert — merge-duplicates because sync_chat is the on-demand
+  // refresh path: the user explicitly asked to resync, so newer provider
+  // state (reactions, read, edits) should overwrite the existing row.
+  let synced = match supabase_upsert_batch(
+    client,
+    &supabase_url,
+    &service_key,
+    "messages",
+    "user_id,external_id",
+    "resolution=merge-duplicates",
+    &rows_to_upsert,
+    "sync_chat",
+  ).await {
+    Ok(n) => n as u32,
+    Err(e) => { err_log!("{e}"); 0 }
+  };
 
   Ok(format!("{synced}"))
 }
@@ -2263,6 +2369,16 @@ async fn chat_action(
       .send().await
     {
       Ok(r) if r.status().is_success() => { synced += 1; }
+      Ok(r) if r.status().as_u16() == 404 => {
+        // Terminal per Unipile docs ("errors/resource_not_found"):
+        // the thread's provider chat_id is no longer valid on Unipile's
+        // side (e.g. the chat was deleted, the account was reconnected,
+        // or the `thread_id` is stale from before a reconcile). Don't
+        // retry — the stale mapping will be removed on the next
+        // `reconcile_chats` run, which prunes local chat_provider_ids
+        // not present in Unipile's current chat list.
+        dev_log!("[chat_action] {channel} {unipile_action}: stale thread_id {thread_id} (404), skipping. Run reconcile to clean up.");
+      }
       Ok(r) => {
         let status = r.status();
         let text = r.text().await.unwrap_or_default();
@@ -2919,6 +3035,35 @@ async fn backfill_x_dms(
     Err(_) => return Ok((0, 0)),
   };
 
+  // Self-heal cursor with a 2h floor, same strategy as Unipile startup_sync.
+  //
+  // Previously this pulled up to 500 events every 2 minutes and upserted
+  // them one-by-one, which meant the sync banner "Syncing X DMs…" was
+  // effectively always on. X's `/2/dm_events` doesn't document a
+  // `start_time` filter for its v2 endpoint, so we paginate and terminate
+  // client-side once we cross the cursor. Events are returned in reverse
+  // chronological order (X docs), so a page entirely older than the cursor
+  // means we're done.
+  let x_cursor_resp = client
+    .get(format!(
+      "{sb_url}/rest/v1/messages?user_id=eq.{user_id}&channel=eq.x&select=sent_at&order=sent_at.desc&limit=1"
+    ))
+    .header("apikey", sb_key)
+    .header("Authorization", format!("Bearer {sb_key}"))
+    .send().await;
+  let max_sent_at: Option<chrono::DateTime<chrono::Utc>> = match x_cursor_resp {
+    Ok(r) if r.status().is_success() => {
+      let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+      rows.first()
+        .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+    }
+    _ => None,
+  };
+  let self_heal_floor = chrono::Utc::now() - chrono::Duration::hours(SYNC_SELF_HEAL_HOURS);
+  let cursor: Option<chrono::DateTime<chrono::Utc>> = max_sent_at.map(|t| std::cmp::min(t, self_heal_floor));
+
   let base_dm_url = "https://api.twitter.com/2/dm_events?dm_event.fields=id,text,event_type,dm_conversation_id,created_at,sender_id&event_types=MessageCreate&max_results=100";
 
   let mut events: Vec<serde_json::Value> = Vec::new();
@@ -2927,9 +3072,27 @@ async fn backfill_x_dms(
 
   for _ in 0..max_pages {
     let dm_body = x_authed_get(client, &next_url, sb_url, sb_key, user_id).await?;
-    if let Some(page) = dm_body.get("data").and_then(|v| v.as_array()) {
+    let page: Vec<serde_json::Value> = dm_body.get("data")
+      .and_then(|v| v.as_array())
+      .cloned()
+      .unwrap_or_default();
+
+    let mut saw_older_than_cursor = false;
+    if let Some(cut) = cursor {
+      for ev in &page {
+        let ts = ev.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let older = chrono::DateTime::parse_from_rfc3339(ts).ok()
+          .map(|dt| dt.with_timezone(&chrono::Utc) < cut)
+          .unwrap_or(false);
+        if older { saw_older_than_cursor = true; }
+        else { events.push(ev.clone()); }
+      }
+    } else {
       events.extend(page.iter().cloned());
     }
+
+    if saw_older_than_cursor { break; }
+
     match dm_body.get("meta").and_then(|m| m.get("next_token")).and_then(|v| v.as_str()) {
       Some(token) => {
         next_url = format!("{base_dm_url}&pagination_token={token}");
@@ -3071,6 +3234,7 @@ async fn backfill_x_dms(
         .await;
     }
 
+    let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
     for msg in msgs {
       let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if external_id.is_empty() { continue; }
@@ -3096,29 +3260,21 @@ async fn backfill_x_dms(
       if direction == "inbound" {
         row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
       }
+      rows_to_upsert.push(row);
+    }
 
-      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=user_id,external_id");
-      let msg_resp = client
-        .post(&msg_url)
-        .header("apikey", sb_key)
-        .header("Authorization", format!("Bearer {sb_key}"))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates,return=minimal")
-        .json(&row)
-        .send()
-        .await;
-
-      match msg_resp {
-        Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
-          total_msgs += 1;
-        }
-        Ok(r) => {
-          let s = r.status();
-          let b = r.text().await.unwrap_or_default();
-          err_log!("[backfill_x_dms] message upsert failed ({s}): {b}");
-        }
-        Err(e) => { err_log!("[backfill_x_dms] message upsert error: {e}"); }
-      }
+    match supabase_upsert_batch(
+      client,
+      sb_url,
+      sb_key,
+      "messages",
+      "user_id,external_id",
+      "resolution=ignore-duplicates,return=minimal",
+      &rows_to_upsert,
+      "backfill_x_dms",
+    ).await {
+      Ok(n) => total_msgs += n as u32,
+      Err(e) => err_log!("{e}"),
     }
   }
 
@@ -3431,6 +3587,7 @@ async fn backfill_imessage(
       _ => continue,
     };
 
+    let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
     for msg in msgs {
       if msg.guid.is_empty() { continue; }
       let sent_at = apple_date_to_rfc3339(msg.date);
@@ -3460,28 +3617,21 @@ async fn backfill_imessage(
       if direction == "inbound" {
         row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
       }
+      rows_to_upsert.push(row);
+    }
 
-      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=user_id,external_id");
-      let msg_resp = client
-        .post(&msg_url)
-        .header("apikey", sb_key)
-        .header("Authorization", format!("Bearer {sb_key}"))
-        .header("Content-Type", "application/json")
-        .header("Prefer", "resolution=merge-duplicates,return=minimal")
-        .json(&row)
-        .send().await;
-
-      match msg_resp {
-        Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
-          total_msgs += 1;
-        }
-        Ok(r) => {
-          let s = r.status();
-          let b = r.text().await.unwrap_or_default();
-          err_log!("[backfill_imessage] message upsert failed ({s}): {b}");
-        }
-        Err(e) => { err_log!("[backfill_imessage] message upsert error: {e}"); }
-      }
+    match supabase_upsert_batch(
+      client,
+      sb_url,
+      sb_key,
+      "messages",
+      "user_id,external_id",
+      "resolution=ignore-duplicates,return=minimal",
+      &rows_to_upsert,
+      "backfill_imessage",
+    ).await {
+      Ok(n) => total_msgs += n as u32,
+      Err(e) => err_log!("{e}"),
     }
   }
 

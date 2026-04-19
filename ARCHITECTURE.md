@@ -472,6 +472,26 @@ This mirrors Unipile's documented guidance for cron-based sync ("fetch a larger 
 
 > **Important**: `startup_sync` uses `ignore-duplicates` so re-fetching is safe. The Supabase webhook Edge Function (`unipile-webhook`) uses `merge-duplicates` intentionally — webhooks carry real-time state updates (reactions, read, edits) that *should* overwrite existing rows.
 
+#### Write Resilience: Bulk Upsert + Transient Retry
+
+All message writes to Supabase go through `supabase_upsert_batch` (in `src-tauri/src/lib.rs`), which implements two documented resilience patterns:
+
+1. **Bulk upsert** — `POST /rest/v1/messages?on_conflict=...` with a JSON **array** body (one request per chat, not one request per message). This is PostgREST's explicit guidance for avoiding `PGRST003` ("Timed out acquiring connection from connection pool"): *"reduce write requests. Do Bulk Insert (or Upsert) instead of inserting rows one by one."* A startup sync of 20 chats × 50 messages used to issue 1,000 POSTs; it now issues 20.
+2. **Transient retry** — on `408` / `502` / `503` / `504` / `520` or a transient network error (connect / timeout / body decode), retry up to `SB_MAX_ATTEMPTS = 3` times with exponential backoff (250ms → 500ms → 1s, capped at 4s). Matches `supabase-js` v2.102.0's built-in retry behaviour.
+
+Callers: `startup_sync`, `sync_chat`, `backfill_x_dms`, `backfill_imessage`.
+
+Not retried:
+- `429 Too Many Requests` — Unipile rate-limit path, handled separately via `Retry-After` header in `fetch_paginated`
+- `404 Not Found` on Unipile `setReadStatus` — terminal per Unipile docs ("errors/resource_not_found"): the provider `chat_id` is stale. Logged once and left for `reconcile_chats` to prune
+- `400` / `401` / `403` / `42xxx` — deterministic failures; retry would just loop
+
+#### X DM Sync (Twitter)
+
+X DMs use the same self-heal cursor as Unipile, with one twist: `/2/dm_events` doesn't document a `start_time` filter, so we paginate and terminate client-side once a page goes below the cursor. Events are returned in reverse-chronological order per X docs, so a page of events all older than `cursor` means we're done.
+
+Before v0.2.13, `backfill_x_dms` pulled up to 500 events every 2 minutes and upserted them one-by-one, which is why the sync banner appeared stuck on "Syncing X DMs…" — it was literally always syncing. With the cursor + bulk upsert, steady-state cost is typically a single 100-event page and a single bulk POST.
+
 ### Unipile Event Types Handled
 
 | Event | Handler | What it does |

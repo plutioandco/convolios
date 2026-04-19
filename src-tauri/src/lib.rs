@@ -892,21 +892,22 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       "provider_type": acc.account_type, "connection_params": acc.connection_params,
       "last_synced_at": now,
     });
-    let resp = client.post(format!("{supabase_url}/rest/v1/connected_accounts?on_conflict=user_id,provider,account_id"))
-      .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
-      .header("Content-Type", "application/json").header("Prefer", "resolution=merge-duplicates")
-      .json(&body).send().await;
-    match resp {
-      Ok(r) => {
-        let status = r.status();
-        if status.is_success() {
-          synced += 1;
-        } else {
-          let body = r.text().await.unwrap_or_default();
-          err_log!("[startup_sync] account upsert failed ({status}) for {} ({}): {body}", acc.name, acc.id);
-        }
-      }
-      Err(e) => err_log!("[startup_sync] account upsert failed for {} ({}): {e}", acc.name, acc.id),
+    // Single-row bulk upsert so transient 5xx / network errors get the
+    // same exponential-backoff retry treatment as message writes. Without
+    // this, a transient Supabase pool stall aborts the whole account and
+    // `last_synced_at` never advances on that launch.
+    match supabase_upsert_batch(
+      client,
+      &supabase_url,
+      &service_key,
+      "connected_accounts",
+      "user_id,provider,account_id",
+      "resolution=merge-duplicates",
+      std::slice::from_ref(&body),
+      &format!("startup_sync account {} ({})", acc.name, acc.id),
+    ).await {
+      Ok(n) => synced += n as u32,
+      Err(e) => err_log!("{e}"),
     }
   }
 
@@ -1324,7 +1325,37 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
         let chat_folder = chat.get("folder").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut row = serde_json::json!({
+        // PGRST102 requires identical keys across every row in a bulk
+        // upsert, so `read_at` and `flagged_at` are always present. Both
+        // are only meaningful on insert (ignore-duplicates) — existing
+        // rows keep whatever value they already have.
+        let read_at_val = if !is_sender && !chat_exists_in_db {
+          serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+        } else {
+          serde_json::Value::Null
+        };
+
+        let flagged_at_val = if channel == "email" {
+          let is_starred = msg.get("role")
+            .and_then(|v| v.as_str())
+            .map(|r| r.contains("starred") || r.contains("flagged"))
+            .unwrap_or(false)
+            || msg.get("folders")
+              .and_then(|v| v.as_array())
+              .map(|arr| arr.iter().any(|f|
+                f.as_str().map(|s| s.eq_ignore_ascii_case("STARRED") || s.eq_ignore_ascii_case("FLAGGED")).unwrap_or(false)
+              ))
+              .unwrap_or(false);
+          if is_starred {
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+          } else {
+            serde_json::Value::Null
+          }
+        } else {
+          serde_json::Value::Null
+        };
+
+        let row = serde_json::json!({
           "user_id": user_id, "person_id": person_id,
           "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
           "external_id": external_id, "channel": channel,
@@ -1348,32 +1379,9 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           "quoted_text": quoted_text,
           "quoted_sender": quoted_sender,
           "folder": if chat_folder.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(chat_folder.to_string()) },
+          "read_at": read_at_val,
+          "flagged_at": flagged_at_val,
         });
-        if !is_sender && !chat_exists_in_db {
-          row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
-        }
-
-        // Inbound email flag sync: check if email is starred/flagged
-        if channel == "email" {
-          let is_starred = msg.get("role")
-            .and_then(|v| v.as_str())
-            .map(|r| r.contains("starred") || r.contains("flagged"))
-            .unwrap_or(false)
-            || msg.get("folders")
-              .and_then(|v| v.as_array())
-              .map(|arr| arr.iter().any(|f|
-                f.as_str().map(|s| s.eq_ignore_ascii_case("STARRED") || s.eq_ignore_ascii_case("FLAGGED")).unwrap_or(false)
-              ))
-              .unwrap_or(false);
-          row.as_object_mut().unwrap().insert(
-            "flagged_at".into(),
-            if is_starred {
-              serde_json::Value::String(chrono::Utc::now().to_rfc3339())
-            } else {
-              serde_json::Value::Null
-            },
-          );
-        }
 
         rows_to_upsert.push(row);
       }
@@ -2139,7 +2147,15 @@ async fn sync_chat(
     let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
     let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
 
-    let mut row = serde_json::json!({
+    // PGRST102 requires identical keys across all rows in a bulk upsert,
+    // so `read_at` is always present (null for outbound).
+    let read_at_val = if is_sender {
+      serde_json::Value::Null
+    } else {
+      serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+    };
+
+    let row = serde_json::json!({
       "user_id": user_id,
       "person_id": person_id,
       "identity_id": identity_id,
@@ -2168,10 +2184,8 @@ async fn sync_chat(
       "chat_provider_id": msg_chat_provider_id,
       "quoted_text": quoted_text,
       "quoted_sender": quoted_sender,
+      "read_at": read_at_val,
     });
-    if !is_sender {
-      row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
-    }
 
     rows_to_upsert.push(row);
   }
@@ -3244,7 +3258,14 @@ async fn backfill_x_dms(
       let text = msg.get("text").and_then(|v| v.as_str());
       let created_at = msg.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
 
-      let mut row = serde_json::json!({
+      // PGRST102 requires identical keys across every row in a bulk upsert.
+      let read_at_val = if direction == "inbound" {
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+      } else {
+        serde_json::Value::Null
+      };
+
+      let row = serde_json::json!({
         "user_id": user_id,
         "person_id": person_id,
         "external_id": external_id,
@@ -3256,10 +3277,8 @@ async fn backfill_x_dms(
         "thread_id": convo_id,
         "sent_at": created_at,
         "triage": "unclassified",
+        "read_at": read_at_val,
       });
-      if direction == "inbound" {
-        row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
-      }
       rows_to_upsert.push(row);
     }
 
@@ -3600,7 +3619,14 @@ async fn backfill_imessage(
         } else { "" })
       };
 
-      let mut row = serde_json::json!({
+      // PGRST102 requires identical keys across every row in a bulk upsert.
+      let read_at_val = if direction == "inbound" {
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339())
+      } else {
+        serde_json::Value::Null
+      };
+
+      let row = serde_json::json!({
         "user_id": user_id,
         "person_id": person_id,
         "external_id": format!("imsg-{}", msg.guid),
@@ -3613,10 +3639,8 @@ async fn backfill_imessage(
         "sender_name": sender_name,
         "sent_at": sent_at,
         "triage": "unclassified",
+        "read_at": read_at_val,
       });
-      if direction == "inbound" {
-        row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
-      }
       rows_to_upsert.push(row);
     }
 

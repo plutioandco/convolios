@@ -478,6 +478,7 @@ All message writes to Supabase go through `supabase_upsert_batch` (in `src-tauri
 
 1. **Bulk upsert** — `POST /rest/v1/messages?on_conflict=...` with a JSON **array** body (one request per chat, not one request per message). This is PostgREST's explicit guidance for avoiding `PGRST003` ("Timed out acquiring connection from connection pool"): *"reduce write requests. Do Bulk Insert (or Upsert) instead of inserting rows one by one."* A startup sync of 20 chats × 50 messages used to issue 1,000 POSTs; it now issues 20.
 2. **Transient retry** — on `408` / `502` / `503` / `504` / `520` or a transient network error (connect / timeout / body decode), retry up to `SB_MAX_ATTEMPTS = 3` times with exponential backoff (250ms → 500ms → 1s, capped at 4s). Matches `supabase-js` v2.102.0's built-in retry behaviour.
+3. **Uniform row schema (PGRST102)** — every object in a bulk-upsert array MUST have the same set of keys. PostgREST translates the array via `json_populate_recordset`, which requires matching columns across rows (see PostgREST issue #1118). So `read_at` and `flagged_at` are always present on every row — explicit `null` when the message is outbound, the chat already exists in the DB, or the channel isn't email. Missing keys trigger `PGRST102: All object keys must match` and the entire batch fails.
 
 Callers: `startup_sync`, `sync_chat`, `backfill_x_dms`, `backfill_imessage`.
 

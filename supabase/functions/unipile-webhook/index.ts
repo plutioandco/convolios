@@ -387,30 +387,50 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     }
   }
 
-  // Content-based dedup for outbound messages.
-  // Rust persist_outbound and the webhook receive different external_ids AND
-  // potentially different chat_ids (thread_id) from Unipile for the same
-  // physical message, so match by person + body + direction within a tight window,
-  // then adopt the webhook's external_id so future events resolve correctly.
+  // Outbound dedup — Rust persist_outbound writes a stub with its own
+  // external_id, and the webhook then arrives with a different external_id
+  // for the same physical message. The provider_id is the underlying network's
+  // native message ID and is stable across both paths; it's the correct dedup
+  // key. We fall back to a content+window match only when provider_id is
+  // absent on the incoming payload (some channels don't echo it via webhook).
   if (direction === "outbound") {
-    const ts = new Date(payload.timestamp).getTime();
-    const windowStart = new Date(ts - 10000).toISOString();
-    const windowEnd = new Date(ts + 10000).toISOString();
+    let existingDup: { id: string } | null = null;
 
-    const { data: contentDup } = await supabase
-      .from("messages")
-      .select("id")
-      .eq("person_id", personId)
-      .eq("user_id", userId)
-      .eq("direction", "outbound")
-      .eq("body_text", payload.message ?? "")
-      .gte("sent_at", windowStart)
-      .lte("sent_at", windowEnd)
-      .order("sent_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const incomingProviderId = fullMsg?.provider_id ?? null;
+    if (incomingProviderId) {
+      const { data } = await supabase
+        .from("messages")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("person_id", personId)
+        .eq("direction", "outbound")
+        .eq("provider_id", incomingProviderId)
+        .limit(1)
+        .maybeSingle();
+      existingDup = data ?? null;
+    }
 
-    if (contentDup) {
+    if (!existingDup) {
+      const ts = new Date(payload.timestamp).getTime();
+      const windowStart = new Date(ts - 10000).toISOString();
+      const windowEnd = new Date(ts + 10000).toISOString();
+
+      const { data } = await supabase
+        .from("messages")
+        .select("id")
+        .eq("person_id", personId)
+        .eq("user_id", userId)
+        .eq("direction", "outbound")
+        .eq("body_text", payload.message ?? "")
+        .gte("sent_at", windowStart)
+        .lte("sent_at", windowEnd)
+        .order("sent_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      existingDup = data ?? null;
+    }
+
+    if (existingDup) {
       const update: Record<string, unknown> = {
         external_id: payload.message_id,
         thread_id: payload.chat_id,
@@ -431,8 +451,11 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
       await supabase
         .from("messages")
         .update(update)
-        .eq("id", contentDup.id);
-      return jsonResponse({ ok: true, merged: "outbound_content_dedup" });
+        .eq("id", existingDup.id);
+      return jsonResponse({
+        ok: true,
+        merged: incomingProviderId ? "outbound_provider_id" : "outbound_content_dedup",
+      });
     }
   }
 
@@ -479,8 +502,19 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   ).select("id, user_id, person_id, direction, sent_at").single();
 
   if (msgError) {
-    log.error("Insert message error", { error: msgError.message });
-    return jsonResponse({ ok: false, error: "insert_failed" }, 500);
+    log.error("Insert message error", {
+      code: msgError.code,
+      message: msgError.message,
+      details: msgError.details,
+      hint: msgError.hint,
+      external_id: payload.message_id,
+      channel,
+      user_id: userId,
+    });
+    return jsonResponse(
+      { ok: false, error: "insert_failed", code: msgError.code ?? null },
+      500
+    );
   }
 
   const response = jsonResponse({ ok: true, direction, channel, person_id: personId });
@@ -596,8 +630,18 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
     ).select("id, user_id, person_id, direction, sent_at").single();
 
     if (msgError) {
-      log.error("Email insert error", { error: msgError.message });
-      return jsonResponse({ ok: false, error: "insert_failed" }, 500);
+      log.error("Email insert error", {
+        code: msgError.code,
+        message: msgError.message,
+        details: msgError.details,
+        hint: msgError.hint,
+        external_id: emailId,
+        user_id: userId,
+      });
+      return jsonResponse(
+        { ok: false, error: "insert_failed", code: msgError.code ?? null },
+        500
+      );
     }
 
     if (GEMINI_API_KEY && em.subject && upserted) {
@@ -618,32 +662,11 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
 
-  const reactionEmoji = (payload.reaction ?? "") as string;
-  if (!reactionEmoji) return jsonResponse({ ok: true, skipped: "no_reaction_data" });
-
-  const reactionSender = payload.reaction_sender as Record<string, unknown> | undefined;
-  const senderId = (reactionSender?.attendee_provider_id ?? reactionSender?.attendee_id ?? "") as string;
-
-  const { data: existing } = await supabase
-    .from("messages")
-    .select("reactions")
-    .eq("external_id", messageId)
-    .maybeSingle();
-
-  if (!existing) return jsonResponse({ ok: true, skipped: "message_not_found" });
-
-  const reactions = Array.isArray(existing.reactions) ? [...existing.reactions] : [];
-  const isDuplicate = reactions.some(
-    (r: { value?: string; sender_id?: string }) =>
-      r.value === reactionEmoji && r.sender_id === senderId,
-  );
-  if (isDuplicate) {
-    return jsonResponse({ ok: true, skipped: "duplicate_reaction" });
-  }
-  reactions.push({
-    value: reactionEmoji,
-    sender_id: senderId,
-  });
+  // GET /messages/{id} is the source of truth — the webhook event may lose
+  // reactions that were merged server-side before we processed it.
+  const full = await fetchFullMessage(messageId);
+  if (!full) return jsonResponse({ ok: true, skipped: "refetch_failed" });
+  const reactions = Array.isArray(full.reactions) ? full.reactions : [];
 
   const { error } = await supabase
     .from("messages")
@@ -651,7 +674,9 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
     .eq("external_id", messageId);
 
   if (error) {
-    log.error("Reaction update error", { error: error.message });
+    log.error("Reaction update error", {
+      code: error.code, message: error.message, details: error.details,
+    });
     return jsonResponse({ ok: false, error: "reaction_update_failed" }, 500);
   }
 
@@ -710,15 +735,23 @@ async function handleMessageEdited(payload: Record<string, unknown>): Promise<Re
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
 
-  const newText = (payload.message ?? payload.text ?? "") as string;
+  // Refetch the full message — the webhook payload's body may lag server state
+  // if multiple edits coalesced.
+  const full = await fetchFullMessage(messageId);
+  const body = (full?.text ?? payload.message ?? payload.text ?? "") as string;
+
+  const update: Record<string, unknown> = { edited: true };
+  if (body) update.body_text = body;
 
   const { error } = await supabase
     .from("messages")
-    .update({ body_text: newText || undefined, edited: true })
+    .update(update)
     .eq("external_id", messageId);
 
   if (error) {
-    log.error("Edit update error", { error: error.message });
+    log.error("Edit update error", {
+      code: error.code, message: error.message, details: error.details,
+    });
     return jsonResponse({ ok: false, error: "edit_update_failed" }, 500);
   }
 
@@ -746,10 +779,26 @@ async function handleMessageDelivered(payload: Record<string, unknown>): Promise
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
 
-  await supabase
+  // Refetch for the authoritative delivered/seen snapshot — in some channels
+  // the delivered and seen flags land within milliseconds of each other and
+  // arrive on separate webhook events.
+  const full = await fetchFullMessage(messageId);
+  const update: Record<string, unknown> = { delivered: true };
+  if (full) {
+    if (typeof full.seen === "boolean") update.seen = full.seen;
+    if (typeof full.delivered === "boolean") update.delivered = full.delivered;
+  }
+
+  const { error } = await supabase
     .from("messages")
-    .update({ delivered: true })
+    .update(update)
     .eq("external_id", messageId);
+
+  if (error) {
+    log.error("Delivered update error", {
+      code: error.code, message: error.message, details: error.details,
+    });
+  }
 
   return jsonResponse({ ok: true, event: "delivered" });
 }

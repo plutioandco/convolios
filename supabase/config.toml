@@ -384,6 +384,20 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+# Webhook endpoints called by external services (Unipile, X OAuth). These cannot
+# carry a Supabase JWT, so the gateway must not enforce one — auth is done inside
+# the function via shared secrets (x-webhook-secret) or OAuth state verification.
+# Without verify_jwt = false, Supabase 401s every webhook before the function
+# runs, which is what silently killed message ingestion in production.
+[functions.unipile-webhook]
+verify_jwt = false
+
+[functions.unipile-account-callback]
+verify_jwt = false
+
+[functions.x-account-callback]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 54327

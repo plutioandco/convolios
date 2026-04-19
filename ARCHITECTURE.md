@@ -135,7 +135,7 @@ Environment variables are loaded from `.env.local` and `.env` in the project roo
 | `create_connect_link` | Generate Unipile Hosted Auth URL (opens in browser) |
 | `sync_unipile_accounts` | Fetch Unipile accounts, deduplicate, upsert to `connected_accounts` |
 | `disconnect_account` | Delete account from Unipile + mark `disconnected` in Supabase |
-| `startup_sync` | On app launch: sync accounts + backfill last 24h of messages (Unipile + X + iMessage) |
+| `startup_sync` | On app launch (and every 2 min): reconcile accounts + per-chat delta fetch with a 2h self-heal floor (Unipile + X + iMessage). See [Sync Cursor Strategy](#sync-cursor-strategy). |
 | `backfill_messages` | Full historical backfill — all accounts including X DMs and iMessage |
 | `send_message` | Send text message via Unipile, X API, or AppleScript (dispatched by channel) |
 | `send_attachment` | Send file attachment via Unipile multipart upload |
@@ -440,13 +440,37 @@ Edge Functions and Rust backend use the **service role key** which bypasses RLS.
 4. For `message_received`: resolves account → determines direction → finds/creates person → persists message → triggers Gemini triage (non-blocking)
 5. Frontend receives the new message via Supabase Realtime subscription
 
-**Backfill (on-demand from Rust):**
+**Full backfill (manual, on-demand from Rust):**
 1. Rust `backfill_messages` iterates each connected account
 2. For each account, fetches all chats via `GET /api/v1/chats?account_id=X`
 3. For each chat, fetches messages via `GET /api/v1/chats/{chat_id}/messages`
 4. Paginates with cursor until no more pages
 5. For each message: calls `backfill_find_or_create_person` RPC → inserts to `messages` table
-6. `startup_sync` does a lightweight version (last 24h only) on every app launch
+
+**Incremental sync (`startup_sync` — runs on launch + every 2 min):**
+1. Lists the 72h chat-list window via `GET /api/v1/chats?account_id=X&after=<72h ago>`
+2. Reconciles `connected_accounts` (status, avatars, display names)
+3. For each chat, applies the [Sync Cursor Strategy](#sync-cursor-strategy) and fetches only the delta window via `GET /api/v1/chats/{id}/messages?limit=50&after=<cursor>`
+4. Upserts messages with `Prefer: resolution=ignore-duplicates` so user-mutated fields (read_at, flagged_at) are never clobbered by a re-fetch
+5. Progress is emitted to the frontend as `sync-status` events and rendered by `SyncBanner`
+
+#### Sync Cursor Strategy
+
+Tonight's missing-messages regression traced back to a simpler `cursor = MAX(sent_at)` that would advance past any silently-failed upsert window (e.g. a one-shot `42P10` during an in-flight migration), orphaning the messages inside that window. The current strategy is:
+
+```
+cursor = MIN(MAX(sent_at in DB for this chat), now - SYNC_SELF_HEAL_HOURS)
+```
+
+- `SYNC_SELF_HEAL_HOURS = 2` — defined in `src-tauri/src/lib.rs`
+- **Common case**: cursor sits at "2h ago" → fast delta fetch only
+- **Self-heal**: if a prior write failed silently, the next `startup_sync` within 2h re-fetches that window. Dedup is guaranteed by the `UNIQUE(user_id, external_id)` index on `messages` + `resolution=ignore-duplicates`
+- **Webhook safety**: inbound webhooks advance `MAX(sent_at)` but never advance the sync cursor past `now - 2h`, so a webhook arriving after a failed startup_sync cannot orphan earlier messages
+- **Gaps older than 2h**: require a manual Pull (Settings → Re-sync) which falls back to the 72h chat-list window
+
+This mirrors Unipile's documented guidance for cron-based sync ("fetch a larger period than your cron delay") and industry patterns (Slack's incremental boot, Matrix's `/sync` with gap detection, XMTP's topic-specific forward cursors).
+
+> **Important**: `startup_sync` uses `ignore-duplicates` so re-fetching is safe. The Supabase webhook Edge Function (`unipile-webhook`) uses `merge-duplicates` intentionally — webhooks carry real-time state updates (reactions, read, edits) that *should* overwrite existing rows.
 
 ### Unipile Event Types Handled
 

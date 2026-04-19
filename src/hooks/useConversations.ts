@@ -14,7 +14,6 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     ai_summary: (row.ai_summary as string | null) ?? null,
     ai_summary_updated_at: null,
     status: (status as Person['status']) ?? 'approved',
-    done_at: (row.done_at as string | null) ?? null,
     created_at: '',
     updated_at: '',
   }
@@ -68,8 +67,6 @@ function rowToPreview(row: Record<string, unknown>, userId: string, status?: str
     markedUnread: (row.marked_unread as boolean) ?? false,
     pinnedAt: (row.pinned_at as string | null) ?? null,
     turnState: ((row.turn_state as string) ?? 'their_turn') as ThreadState,
-    snoozeUntil: (row.snooze_until as string | null) ?? null,
-    snoozeOnTheirReply: (row.snooze_on_their_reply as boolean) ?? false,
   }
 }
 

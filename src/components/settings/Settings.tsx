@@ -6,7 +6,6 @@ import { getVersion } from '@tauri-apps/api/app'
 import { open } from '@tauri-apps/plugin-shell'
 import { useUpdater } from '../../hooks/useUpdater'
 import { useAccountsStore } from '../../stores/accountsStore'
-import { useSyncStore } from '../../stores/inboxStore'
 import { queryClient } from '../../lib/queryClient'
 import { useCircles, useCreateCircle, useUpdateCircle, useDeleteCircle } from '../../hooks/useCircles'
 import { useDismissMerge, useMergeLog, useUndoMerge, useMergeClusters, useMergeCluster, useFuzzyMergeSuggestions } from '../../hooks/useMergeSuggestions'
@@ -33,7 +32,11 @@ export function Settings() {
   const loading = useAccountsStore((s) => s.loading)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const removeAccount = useAccountsStore((s) => s.removeAccount)
-  const lastSyncedAt = useSyncStore((s) => s.lastSyncedAt)
+  const lastSyncedAt = accounts
+    .map((a) => a.last_synced_at)
+    .filter((v): v is string => _.isString(v) && v.length > 0)
+    .sort()
+    .at(-1) ?? null
   const [syncing, setSyncing] = useState(false)
   const [syncMsg, setSyncMsg] = useState('')
   const [pulling, setPulling] = useState(false)
@@ -1045,8 +1048,6 @@ function MergeHistory({ userId }: { userId?: string }) {
 function PreferencesSection() {
   const syncReadStatus = usePreferencesStore((s) => s.syncReadStatus)
   const setSyncReadStatus = usePreferencesStore((s) => s.setSyncReadStatus)
-  const autoSnoozeOnSend = usePreferencesStore((s) => s.autoSnoozeOnSend)
-  const setAutoSnoozeOnSend = usePreferencesStore((s) => s.setAutoSnoozeOnSend)
 
   return (
     <>
@@ -1062,19 +1063,6 @@ function PreferencesSection() {
         <div className="flex gap-2 items-center">
           <button onClick={() => setSyncReadStatus(true)} className="settings-pill" data-active={syncReadStatus}>On</button>
           <button onClick={() => setSyncReadStatus(false)} className="settings-pill" data-active={!syncReadStatus}>Off</button>
-        </div>
-      </div>
-
-      <div className="settings-card">
-        <div className="settings-card-body">
-          <p className="settings-card-name">Auto-snooze on send</p>
-          <p className="settings-card-desc">
-            When enabled, sending a reply automatically snoozes the conversation until the other person replies — keeping Their Turn clean.
-          </p>
-        </div>
-        <div className="flex gap-2 items-center">
-          <button onClick={() => setAutoSnoozeOnSend(true)} className="settings-pill" data-active={autoSnoozeOnSend}>On</button>
-          <button onClick={() => setAutoSnoozeOnSend(false)} className="settings-pill" data-active={!autoSnoozeOnSend}>Off</button>
         </div>
       </div>
 

@@ -265,15 +265,11 @@ export function useSidebarUnread(userId: string | undefined, realtimeConnected?:
 export interface StateCounts {
   my_turn: number
   their_turn: number
-  stalled: number
-  dropped: number
-  done: number
   gate: number
-  snoozed: number
 }
 
 const EMPTY_STATE_COUNTS: StateCounts = {
-  my_turn: 0, their_turn: 0, stalled: 0, dropped: 0, done: 0, gate: 0, snoozed: 0,
+  my_turn: 0, their_turn: 0, gate: 0,
 }
 
 export function useStateCounts(userId: string | undefined, realtimeConnected?: boolean) {

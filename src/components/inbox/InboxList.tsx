@@ -9,9 +9,8 @@ import {
   useCircles, useApprovePerson, useBlockPerson, useAddToCircle, useRemoveFromCircle, usePersonCircleColors,
 } from '../../hooks/useCircles'
 import { useOpenContextsByPerson, type PersonOpenContext } from '../../hooks/useThreadContext'
-import { useSnoozePerson, useUnsnoozePerson, snoozePresets } from '../../hooks/useSnooze'
 import {
-  Check, CheckCheck, Users, X, ShieldOff, Pin, BellDot, BellOff, Flag, CheckCircle2, HelpCircle,
+  Check, CheckCheck, Users, X, ShieldOff, Pin, BellDot, Flag, HelpCircle,
 } from 'lucide-react'
 import {
   channelColor, channelLabel, relativeTime, initials, avatarCls,
@@ -25,11 +24,7 @@ const REACTION_PREVIEW_RE = /^\{\{[^}]+\}\}\s*reacted\s+/
 const STATE_LABEL: Record<ThreadState, string> = {
   my_turn:    'My Turn',
   their_turn: 'Their Turn',
-  stalled:    'Stalled',
-  dropped:    'Dropped',
-  done:       'Done',
   gate:       'Gate',
-  snoozed:    'Snoozed',
 }
 
 function headingFor({
@@ -296,11 +291,7 @@ function EmptyState({ view }: { view: ActiveView }) {
       case 'all':        return 'No conversations.'
       case 'my_turn':    return 'Inbox zero. You owe no one a reply.'
       case 'their_turn': return 'You\u2019re waiting on no one right now.'
-      case 'stalled':    return 'No stalled conversations.'
-      case 'dropped':    return 'Nothing dropped. Nice streak.'
-      case 'done':       return 'No conversations marked done.'
       case 'gate':       return 'No new senders waiting.'
-      case 'snoozed':    return 'No snoozed conversations.'
       case 'blocked':    return 'No blocked contacts.'
       case 'flagged':    return 'No flagged messages.'
       default:           return 'No conversations.'
@@ -603,20 +594,14 @@ function ConversationContextMenu({ convo, x, y, circles, userId, onClose }: {
   const addToCircle = useAddToCircle(userId)
   const removeFromCircle = useRemoveFromCircle(userId)
   const block = useBlockPerson(userId)
-  const snooze = useSnoozePerson()
-  const unsnooze = useUnsnoozePerson()
   const deselect = useInboxStore((s) => s.selectPerson)
   const markUnread = useInboxStore((s) => s.markPersonUnread)
   const markRead = useInboxStore((s) => s.markConversationRead)
   const pinAction = useInboxStore((s) => s.pinPerson)
-  const markDone = useInboxStore((s) => s.markPersonDone)
-  const [snoozeOpen, setSnoozeOpen] = useState(false)
 
   const personId = convo.person.id
   const hasUnread = convo.unreadCount > 0 || convo.markedUnread
   const isPinned = _.isString(convo.pinnedAt)
-  const isDone = _.isString(convo.person.done_at)
-  const isSnoozed = _.isString(convo.snoozeUntil) || convo.snoozeOnTheirReply === true
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -656,69 +641,6 @@ function ConversationContextMenu({ convo, x, y, circles, userId, onClose }: {
         <Pin size={14} />
         <span className="text-md">{isPinned ? 'Unpin' : 'Pin'}</span>
       </div>
-
-      <div
-        className="context-menu-item"
-        onClick={() => {
-          if (_.isString(userId)) markDone(userId, personId, !isDone)
-          onClose()
-        }}
-      >
-        <CheckCircle2 size={14} />
-        <span className="text-md">{isDone ? 'Mark not done' : 'Mark done'}</span>
-      </div>
-
-      {isSnoozed
-        ? (
-          <div
-            className="context-menu-item"
-            onClick={() => { unsnooze.mutate(personId); onClose() }}
-          >
-            <BellOff size={14} />
-            <span className="text-md">Unsnooze</span>
-          </div>
-        )
-        : (
-          <div className="context-menu-submenu">
-            <div
-              className="context-menu-item"
-              data-open={snoozeOpen ? 'true' : 'false'}
-              onClick={() => setSnoozeOpen((v) => !v)}
-            >
-              <BellOff size={14} />
-              <span className="text-md">Snooze…</span>
-            </div>
-            {snoozeOpen && (
-              <>
-                <div className="context-menu-item context-menu-subitem"
-                  onClick={() => { snooze.mutate({ personId, snoozeUntil: snoozePresets.threeHours() }); onClose() }}
-                >
-                  <span className="text-md">In 3 hours</span>
-                </div>
-                <div className="context-menu-item context-menu-subitem"
-                  onClick={() => { snooze.mutate({ personId, snoozeUntil: snoozePresets.tonight() }); onClose() }}
-                >
-                  <span className="text-md">Tonight (8pm)</span>
-                </div>
-                <div className="context-menu-item context-menu-subitem"
-                  onClick={() => { snooze.mutate({ personId, snoozeUntil: snoozePresets.tomorrowMorning() }); onClose() }}
-                >
-                  <span className="text-md">Tomorrow 9am</span>
-                </div>
-                <div className="context-menu-item context-menu-subitem"
-                  onClick={() => { snooze.mutate({ personId, snoozeUntil: snoozePresets.nextWeek() }); onClose() }}
-                >
-                  <span className="text-md">Next week</span>
-                </div>
-                <div className="context-menu-item context-menu-subitem"
-                  onClick={() => { snooze.mutate({ personId, onTheirReply: true }); onClose() }}
-                >
-                  <span className="text-md">Until they reply</span>
-                </div>
-              </>
-            )}
-          </div>
-        )}
 
       <div className="context-sep" />
 

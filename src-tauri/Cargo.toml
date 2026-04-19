@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.11"
+version = "0.2.12"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -39,3 +39,4 @@ tauri-plugin-notification = "2.3.3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 aes-gcm = "0.10.3"
+tokio = { version = "1", features = ["time"] }

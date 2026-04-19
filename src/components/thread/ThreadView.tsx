@@ -18,7 +18,6 @@ import { useConversations } from '../../hooks/useConversations'
 import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
 import { useMergePersons } from '../../hooks/useMergeSuggestions'
 import { usePersonCircleColors } from '../../hooks/useCircles'
-import { useSnoozePerson } from '../../hooks/useSnooze'
 import { supabase } from '../../lib/supabase'
 import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, cleanSenderName, REACTION_RE, circleGradient, relativeTime } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
@@ -1741,26 +1740,10 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const { user } = useAuth()
   const qc = useQueryClient()
   const cancelThread = useCancelThreadQueries(personId, user?.id)
-  const snoozePerson = useSnoozePerson()
   const invalidateThread = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['thread', personId] })
     qc.invalidateQueries({ queryKey: ['conversations', user?.id] })
   }, [qc, personId, user?.id])
-
-  // Fire-and-forget: user opted into "snooze on send", so a failure should
-  // log but not block the send path. Cache invalidation is handled by the
-  // useSnoozePerson mutation's own onSuccess.
-  const applyAutoSnoozeIfEnabled = useCallback(() => {
-    if (!usePreferencesStore.getState().autoSnoozeOnSend) return
-    snoozePerson.mutate(
-      { personId, onTheirReply: true },
-      {
-        onError: (err) => {
-          console.error('[auto-snooze] failed:', err)
-        },
-      },
-    )
-  }, [personId, snoozePerson])
 
   const last = _.last(thread) ?? convoLastMessage
   const lastInbound = _.findLast(thread, (m) => m.direction === 'inbound') ?? null
@@ -1909,7 +1892,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
-        applyAutoSnoozeIfEnabled()
       } catch (e) {
         const reason = describeError(e)
         console.error('[send_message] failed:', reason, e)
@@ -2003,7 +1985,6 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
             .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
         }
-        applyAutoSnoozeIfEnabled()
       } catch (e) {
         const reason = describeError(e)
         console.error('[send] failed:', reason, e)

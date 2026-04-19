@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import _ from 'lodash'
 import type { InfiniteData } from '@tanstack/react-query'
 import { invoke } from '@tauri-apps/api/core'
@@ -8,14 +8,8 @@ import { isPermissionGranted, requestPermission, sendNotification } from '@tauri
 import { cleanSenderName, REACTION_RE, LID_RE, cleanPreviewText } from '../utils'
 import type { Message, ConversationPreview } from '../types'
 
-// Grace period before showing any "reconnecting" indicator — avoids flashing
-// it on brief WebSocket hiccups. Phoenix auto-reconnects with exponential
-// backoff, and React Query polling (15s) is the real reliability fallback.
-const CONNECTING_GRACE_MS = 5_000
-
 interface RealtimeState {
   connected: boolean
-  showConnecting: boolean
 }
 
 async function notifyIfAllowed(title: string, body: string) {
@@ -84,8 +78,6 @@ function patchThread(personId: string, userId: string | undefined, msg: Message,
 
 export function useRealtimeMessages(userId: string | undefined): RealtimeState {
   const [connected, setConnected] = useState(false)
-  const [showConnecting, setShowConnecting] = useState(false)
-  const connectingGraceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!userId) return
@@ -142,25 +134,12 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
       )
       .subscribe((status) => {
         if (import.meta.env.DEV) console.debug('[realtime] status', status)
-
         if (status === 'SUBSCRIBED') {
           setConnected(true)
-          setShowConnecting(false)
-          if (connectingGraceTimer.current) {
-            clearTimeout(connectingGraceTimer.current)
-            connectingGraceTimer.current = null
-          }
           return
         }
-
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
           setConnected(false)
-          if (!connectingGraceTimer.current) {
-            connectingGraceTimer.current = setTimeout(() => {
-              setShowConnecting(true)
-              connectingGraceTimer.current = null
-            }, CONNECTING_GRACE_MS)
-          }
         }
       })
 
@@ -194,10 +173,6 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
     return () => {
       debouncedInvalidateConvos.cancel()
       onWake.cancel()
-      if (connectingGraceTimer.current) {
-        clearTimeout(connectingGraceTimer.current)
-        connectingGraceTimer.current = null
-      }
       supabase.removeChannel(channel)
       window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisibility)
@@ -205,5 +180,5 @@ export function useRealtimeMessages(userId: string | undefined): RealtimeState {
     }
   }, [userId])
 
-  return { connected, showConnecting: showConnecting && !connected }
+  return { connected }
 }

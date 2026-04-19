@@ -7,7 +7,6 @@ export interface Person {
   ai_summary: string | null
   ai_summary_updated_at: string | null
   status: 'approved' | 'pending' | 'blocked'
-  done_at: string | null
   created_at: string
   updated_at: string
 }
@@ -15,11 +14,7 @@ export interface Person {
 export type ThreadState =
   | 'my_turn'
   | 'their_turn'
-  | 'stalled'
-  | 'dropped'
-  | 'done'
   | 'gate'
-  | 'snoozed'
 
 export interface OpenQuestion {
   id: string
@@ -147,8 +142,6 @@ export interface ConversationPreview {
   markedUnread: boolean
   pinnedAt: string | null
   turnState: ThreadState
-  snoozeUntil: string | null
-  snoozeOnTheirReply: boolean
 }
 
 export interface FlaggedMessage {

@@ -10,7 +10,7 @@ import { AlertTriangle, WifiOff, Search } from 'lucide-react'
 import { InboxList } from './components/inbox/InboxList'
 import { ThreadView } from './components/thread/ThreadView'
 import { Settings } from './components/settings/Settings'
-import { useInboxStore, useSyncStore, useFilterStore, viewToRpcParams } from './stores/inboxStore'
+import { useInboxStore, useFilterStore, viewToRpcParams } from './stores/inboxStore'
 import { useRealtimeMessages } from './hooks/useRealtimeMessages'
 import { useConversations } from './hooks/useConversations'
 import { useAuth, signOut } from './lib/auth'
@@ -18,6 +18,7 @@ import { useUpdater } from './hooks/useUpdater'
 import { supabase } from './lib/supabase'
 import { queryClient } from './lib/queryClient'
 import { useAccountsStore } from './stores/accountsStore'
+import { useSyncStatusStore } from './stores/syncStatusStore'
 import { channelLabel, channelColor, accountDisplayLabel, initials, avatarCls, relativeTime, cleanPreviewText } from './utils'
 import { ChannelLogo } from './components/icons/ChannelLogo'
 import { RealtimeContext, useRealtimeConnected } from './lib/realtimeContext'
@@ -26,20 +27,17 @@ import _ from 'lodash'
 
 const persister = createSyncStoragePersister({
   storage: window.localStorage,
-  key: 'convolios-query-cache-v9',
+  key: 'convolios-query-cache',
 })
-
-for (const k of Object.keys(window.localStorage)) {
-  if (k.startsWith('convolios-query-cache') && k !== 'convolios-query-cache-v9') {
-    window.localStorage.removeItem(k)
-  }
-}
 
 const PERSIST_ALLOWED_KEYS = new Set([
   'conversations', 'circles', 'sidebar-unread', 'pending-count',
 ])
 
-const NETWORK_PROBE_INTERVAL_MS = 15_000
+// Bump when cache shape changes — PersistQueryClientProvider auto-evicts caches
+// written under a different buster value.
+const CACHE_BUSTER = 'v10'
+
 const STARTUP_SYNC_INTERVAL_MS = 120_000
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -122,6 +120,7 @@ function App() {
     <PersistQueryClientProvider client={queryClient} persistOptions={{
       persister,
       maxAge: 24 * 60 * 60 * 1000,
+      buster: CACHE_BUSTER,
       dehydrateOptions: {
         shouldDehydrateQuery: (query) => {
           const key = query.queryKey[0] as string
@@ -279,12 +278,12 @@ function SignInScreen() {
 }
 
 function Authenticated({ userId }: { userId: string }) {
-  const { connected, showConnecting } = useRealtimeMessages(userId)
+  const { connected } = useRealtimeMessages(userId)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const subscribe = useAccountsStore((s) => s.subscribe)
   const unsubscribe = useAccountsStore((s) => s.unsubscribe)
   const accounts = useAccountsStore((s) => s.accounts)
-  const [offline, setOffline] = useState(false)
+  const [offline, setOffline] = useState(!navigator.onLine)
   const [searchOpen, setSearchOpen] = useState(false)
   const nav = useNavigate()
 
@@ -294,34 +293,13 @@ function Authenticated({ userId }: { userId: string }) {
   )
 
   useEffect(() => {
-    let cancelled = false
-    let failures = 0
-    const probe = async () => {
-      try {
-        // Any HTTP response (even 4xx) proves the network + Supabase gateway are
-        // reachable; only a fetch exception (DNS, TCP, TLS) means we're offline.
-        await fetch(`${import.meta.env.VITE_SUPABASE_URL}/auth/v1/health`, {
-          method: 'GET',
-          cache: 'no-store',
-          headers: { apikey: import.meta.env.VITE_SUPABASE_ANON_KEY },
-        })
-        if (cancelled) return
-        failures = 0
-        setOffline(false)
-      } catch {
-        if (cancelled) return
-        failures += 1
-        if (failures >= 2) setOffline(true)
-      }
-    }
-    probe()
-    const onOnline = () => { failures = 0; probe() }
-    const interval = setInterval(probe, NETWORK_PROBE_INTERVAL_MS)
+    const onOnline = () => setOffline(false)
+    const onOffline = () => setOffline(true)
     window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
     return () => {
-      cancelled = true
-      clearInterval(interval)
       window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
     }
   }, [])
 
@@ -356,13 +334,33 @@ function Authenticated({ userId }: { userId: string }) {
       fetchAccounts(userId)
     })
 
-    const { markDone } = useSyncStore.getState()
-    const unlistenSync = listen<{ phase: string; detail?: string }>('sync-status', (event) => {
-      const { phase } = event.payload
-      if (phase === 'done' || phase === 'idle') {
-        markDone()
+    // Sync progress banner. Rust emits `sync-status` from startup_sync_inner
+    // at every phase; we mirror it into a Zustand store and render a banner
+    // via .app-banner--connecting (CSS delayed appear) so fast incremental
+    // syncs never flash.
+    const unlistenSync = listen<{
+      phase: 'syncing' | 'idle'
+      detail?: string
+      account?: { idx: number; total: number; channel: Channel }
+    }>('sync-status', (e) => {
+      const store = useSyncStatusStore.getState()
+      if (e.payload.phase === 'idle') {
+        store.reset()
+      } else {
+        store.set({
+          phase: 'syncing',
+          detail: _.isString(e.payload.detail) ? e.payload.detail : null,
+          account: e.payload.account ?? null,
+        })
       }
     })
+
+    // NOTE: notification-click → conversation routing is not implementable
+    // with @tauri-apps/plugin-notification on macOS desktop — `onAction` and
+    // `registerActionTypes` are mobile-only commands. A desktop bridge
+    // (deep-link scheme or NSUserNotification delegate) is tracked separately.
+    // Clicking a notification currently just focuses the window, which is
+    // macOS default behaviour.
 
     return () => {
       clearInterval(syncInterval)
@@ -381,12 +379,13 @@ function Authenticated({ userId }: { userId: string }) {
           <span>You are offline — messages will sync when reconnected</span>
         </div>
       )}
-      {!offline && showConnecting && (
-        <div className="app-banner app-banner--warning">
+      {!offline && !connected && (
+        <div className="app-banner app-banner--warning app-banner--connecting">
           <span className="pulse-dot w-1.5 h-1.5 rounded-full bg-black" />
           <span className="text-sm">Connecting...</span>
         </div>
       )}
+      <SyncBanner />
       {disconnectedAccounts.length > 0 && (
         <div className="app-banner app-banner--warning-subtle">
           <AlertTriangle size={13} />
@@ -530,6 +529,28 @@ function TopBar({ children }: { children: React.ReactNode }) {
         Sign out
       </button>
     </header>
+  )
+}
+
+function SyncBanner() {
+  const phase = useSyncStatusStore((s) => s.phase)
+  const detail = useSyncStatusStore((s) => s.detail)
+  const account = useSyncStatusStore((s) => s.account)
+
+  if (phase !== 'syncing') return null
+
+  // Prefer structured account progress when available ("Syncing WhatsApp (3 of 9)");
+  // fall back to the raw phase detail for the pre-loop phases (fetching
+  // accounts, webhooks, iMessage/X backfill, avatar refresh).
+  const label = account
+    ? `Syncing ${channelLabel(account.channel)} (${account.idx} of ${account.total})`
+    : detail ?? 'Syncing…'
+
+  return (
+    <div className="app-banner app-banner--warning-subtle app-banner--sync">
+      <span className="pulse-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--color-accent)' }} />
+      <span className="text-sm">{label}</span>
+    </div>
   )
 }
 

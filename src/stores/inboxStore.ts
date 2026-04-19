@@ -13,11 +13,7 @@ export type ActiveView =
   | 'all'
   | 'my_turn'
   | 'their_turn'
-  | 'stalled'
-  | 'dropped'
-  | 'done'
   | 'gate'
-  | 'snoozed'
   | 'blocked'
   | 'flagged'
 
@@ -54,7 +50,6 @@ interface InboxState {
   markPersonUnread: (userId: string, personId: string, unread: boolean) => Promise<void>
   pinPerson: (userId: string, personId: string, pinned: boolean) => Promise<void>
   flagMessage: (userId: string, personId: string, messageId: string, flagged: boolean) => Promise<void>
-  markPersonDone: (userId: string, personId: string, done: boolean) => Promise<void>
 }
 
 export const useInboxStore = create<InboxState>((set) => ({
@@ -206,49 +201,15 @@ export const useInboxStore = create<InboxState>((set) => ({
       })
     }
   },
-
-  markPersonDone: async (userId: string, personId: string, done: boolean) => {
-    // Optimistic: toggle done_at + turn_state only for the "done -> done"
-    // case. Un-done-ing depends on time thresholds (2d / 3d) that live in
-    // SQL — we don't try to replicate them client-side; just invalidate on
-    // success so the server-derived turn_state lands quickly.
-    const nowIso = new Date().toISOString()
-    queryClient.setQueriesData<ConversationPreview[]>(
-      { queryKey: ['conversations', userId] },
-      (old) => {
-        if (!old) return old
-        return old.map((c) =>
-          c.person.id === personId
-            ? {
-                ...c,
-                person: { ...c.person, done_at: done ? nowIso : null },
-                ...(done ? { turnState: 'done' as const } : {}),
-              }
-            : c
-        )
-      }
-    )
-
-    const { error } = await supabase.rpc(done ? 'mark_person_done' : 'unmark_person_done', {
-      p_person_id: personId,
-    })
-
-    if (error) {
-      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-      return
-    }
-    queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-    queryClient.invalidateQueries({ queryKey: ['state-counts', userId] })
-  },
 }))
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const inboxTauriStore = createTauriStore('inbox', useInboxStore as any)
 
-// Nav-reachable views. Stalled/Dropped/Done are valid turn-states in data
-// but are no longer exposed as sidebar nav — auto-migrate those to 'all'.
+// Nav-reachable views. Anything else (legacy persisted values like
+// 'stalled', 'dropped', 'done', 'snoozed') is auto-migrated to 'all'.
 const VALID_VIEWS: ReadonlySet<ActiveView> = new Set([
-  'all', 'my_turn', 'their_turn', 'gate', 'snoozed', 'blocked', 'flagged',
+  'all', 'my_turn', 'their_turn', 'gate', 'blocked', 'flagged',
 ])
 
 inboxTauriStore.start()
@@ -276,12 +237,3 @@ export const useFilterStore = create<FilterState>((set) => ({
   setSearchQuery: (searchQuery) => set({ searchQuery }),
 }))
 
-interface SyncState {
-  lastSyncedAt: string | null
-  markDone: () => void
-}
-
-export const useSyncStore = create<SyncState>((set) => ({
-  lastSyncedAt: null,
-  markDone: () => set({ lastSyncedAt: new Date().toISOString() }),
-}))

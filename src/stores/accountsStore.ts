@@ -16,7 +16,6 @@ interface AccountsState {
 }
 
 let _channel: RealtimeChannel | null = null
-let _pollTimer: ReturnType<typeof setInterval> | null = null
 let _debouncedRefetch: ReturnType<typeof _.debounce> | null = null
 
 const ACCOUNTS_CACHE_KEY = 'convolios-accounts-v1'
@@ -90,14 +89,6 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       )
       .subscribe((status) => {
         if (import.meta.env.DEV) console.debug('[realtime] connected_accounts', status)
-        if (status === 'SUBSCRIBED') {
-          if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null }
-        }
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          if (!_pollTimer) {
-            _pollTimer = setInterval(() => get().fetchAccounts(userId), 10_000)
-          }
-        }
       })
   },
 
@@ -107,10 +98,6 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     if (_channel) {
       supabase.removeChannel(_channel)
       _channel = null
-    }
-    if (_pollTimer) {
-      clearInterval(_pollTimer)
-      _pollTimer = null
     }
   },
 }))

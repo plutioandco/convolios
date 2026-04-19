@@ -8,10 +8,23 @@ macro_rules! dev_log {
   };
 }
 
+macro_rules! err_log {
+  ($($arg:tt)*) => {
+    eprintln!($($arg)*)
+  };
+}
+
 struct AppState {
   http: reqwest::Client,
   syncing: std::sync::atomic::AtomicBool,
 }
+
+/// Hours of overlap between the per-chat sync cursor (`MAX(sent_at)` in DB)
+/// and the Unipile `?after=` filter. Any message written within this window
+/// is re-fetched on the next `startup_sync`, so a silently-dropped upsert
+/// self-heals without requiring manual intervention. Matches Unipile's own
+/// guidance: "fetch a larger period than your cron delay".
+const SYNC_SELF_HEAL_HOURS: i64 = 2;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -140,11 +153,29 @@ async fn fetch_paginated(
       None => base_url.to_string(),
     };
 
-    let resp = client.get(&url)
-      .header("X-API-KEY", api_key)
-      .send()
-      .await
-      .map_err(|e| format!("fetch failed: {e}"))?;
+    // Honor Unipile's rate limit: on 429 read Retry-After and try once more.
+    // Unipile already paces Instagram/WhatsApp/LinkedIn upstream; our only job
+    // is to back off when they ask. No arbitrary sleeps — that would duplicate
+    // Unipile's own pacing and hide their signals.
+    let resp = {
+      let mut attempt = 0u8;
+      loop {
+        let r = client.get(&url).header("X-API-KEY", api_key).send().await
+          .map_err(|e| format!("fetch failed: {e}"))?;
+        if r.status().as_u16() != 429 || attempt >= 1 {
+          break r;
+        }
+        let wait_s = r.headers()
+          .get("retry-after")
+          .and_then(|v| v.to_str().ok())
+          .and_then(|s| s.parse::<u64>().ok())
+          .unwrap_or(5)
+          .min(60);
+        err_log!("[fetch_paginated] 429 from {url} — waiting {wait_s}s");
+        tokio::time::sleep(Duration::from_secs(wait_s)).await;
+        attempt += 1;
+      }
+    };
 
     if !resp.status().is_success() {
       let status = resp.status();
@@ -476,7 +507,7 @@ async fn sync_unipile_accounts(user_id: String, state: State<'_, AppState>) -> R
     });
 
     let resp = client
-      .post(format!("{supabase_url}/rest/v1/connected_accounts"))
+      .post(format!("{supabase_url}/rest/v1/connected_accounts?on_conflict=user_id,provider,account_id"))
       .header("apikey", &service_key)
       .header("Authorization", format!("Bearer {service_key}"))
       .header("Content-Type", "application/json")
@@ -701,8 +732,19 @@ async fn startup_sync(user_id: String, state: State<'_, AppState>, app_handle: t
 }
 
 async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
+  // Simple emit for phase transitions without per-account progress.
   let emit = |phase: &str, detail: &str| {
     let _ = app.emit("sync-status", serde_json::json!({ "phase": phase, "detail": detail }));
+  };
+  // Enriched emit with account progress — surfaced in the sync banner as
+  // "Syncing WhatsApp (3 of 9)". Channel is the frontend `Channel` enum value
+  // so the UI can look up the localised label itself.
+  let emit_account = |phase: &str, detail: &str, idx: usize, total: usize, channel: &str| {
+    let _ = app.emit("sync-status", serde_json::json!({
+      "phase": phase,
+      "detail": detail,
+      "account": { "idx": idx, "total": total, "channel": channel },
+    }));
   };
   emit("syncing", "Fetching accounts...");
 
@@ -752,11 +794,22 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       "provider_type": acc.account_type, "connection_params": acc.connection_params,
       "last_synced_at": now,
     });
-    let resp = client.post(format!("{supabase_url}/rest/v1/connected_accounts"))
+    let resp = client.post(format!("{supabase_url}/rest/v1/connected_accounts?on_conflict=user_id,provider,account_id"))
       .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
       .header("Content-Type", "application/json").header("Prefer", "resolution=merge-duplicates")
       .json(&body).send().await;
-    if let Ok(r) = resp { if r.status().is_success() || r.status().as_u16() == 409 { synced += 1; } }
+    match resp {
+      Ok(r) => {
+        let status = r.status();
+        if status.is_success() {
+          synced += 1;
+        } else {
+          let body = r.text().await.unwrap_or_default();
+          err_log!("[startup_sync] account upsert failed ({status}) for {} ({}): {body}", acc.name, acc.id);
+        }
+      }
+      Err(e) => err_log!("[startup_sync] account upsert failed for {} ({}): {e}", acc.name, acc.id),
+    }
   }
 
   let cutoff = (chrono::Utc::now() - chrono::Duration::hours(72))
@@ -784,18 +837,44 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
 
   for (acc_idx, acc) in active_accounts.iter().enumerate() {
     let channel = channel_from_type(&acc.account_type);
-    emit("syncing", &format!("Checking {} ({}/{})", acc.name, acc_idx + 1, active_accounts.len()));
+    emit_account(
+      "syncing",
+      &format!("Checking {}", acc.name),
+      acc_idx + 1,
+      active_accounts.len(),
+      channel,
+    );
 
     let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
     let chats = match fetch_paginated(client, &chats_url, &api_key, 10).await {
       Ok(c) => c,
-      Err(_) => continue,
+      Err(e) => {
+        err_log!("[startup_sync] chats fetch failed for {} ({}): {e}", acc.name, acc.id);
+        continue;
+      }
     };
 
     for chat in &chats {
       let chat_id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if chat_id.is_empty() { continue; }
 
+      // Per-chat sync cursor with a 2h self-heal floor.
+      //
+      // Strategy (matches Unipile's own guidance for cron-based sync):
+      // "fetch a larger period than your cron delay to account for any
+      // potential disconnects or errors" — plus dedupe by message_id.
+      //
+      //   cursor = MIN(MAX(sent_at in DB), now - 2h)
+      //
+      // - Common case: cursor is "2h ago" → fast fetch of recent deltas only.
+      // - If a prior write failed silently (42P10, network drop, etc.), the
+      //   next startup within 2h re-fetches that window and fills the gap.
+      //   Dedup is guaranteed by the (user_id, external_id) unique index +
+      //   resolution=ignore-duplicates on the upsert below.
+      // - Webhooks advance MAX(sent_at) but NEVER advance the sync cursor
+      //   past "now - 2h", so a webhook-after-failed-sync cannot orphan
+      //   messages like the old cursor did.
+      // - Gaps older than 2h require a manual Pull (72h chat-list window).
       let last_sync_resp = client
         .get(format!(
           "{supabase_url}/rest/v1/messages?user_id=eq.{user_id}&thread_id=eq.{chat_id}&select=sent_at&order=sent_at.desc&limit=1"
@@ -804,17 +883,24 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         .header("Authorization", format!("Bearer {service_key}"))
         .send().await;
 
-      let msg_cutoff: Option<String> = match last_sync_resp {
+      let max_sent_at: Option<chrono::DateTime<chrono::Utc>> = match last_sync_resp {
         Ok(r) if r.status().is_success() => {
           let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
           rows.first()
             .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
             .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
               .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
-            .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
         }
         _ => None,
       };
+      let chat_exists_in_db = max_sent_at.is_some();
+
+      let self_heal_floor = chrono::Utc::now() - chrono::Duration::hours(SYNC_SELF_HEAL_HOURS);
+      let msg_cutoff: Option<String> = max_sent_at.map(|t| {
+        std::cmp::min(t, self_heal_floor)
+          .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+      });
 
       let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
       let msg_type = if is_group { "group" } else { "dm" };
@@ -903,7 +989,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
 
       // For new conversations, pre-fetch messages to determine direction before creating person.
       // Reused later to avoid a redundant API call.
-      let pre_fetched_msgs: Option<Vec<serde_json::Value>> = if msg_cutoff.is_none() && !is_group {
+      let pre_fetched_msgs: Option<Vec<serde_json::Value>> = if !chat_exists_in_db && !is_group {
         let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=50");
         fetch_paginated(client, &msgs_url, &api_key, 3).await.ok()
       } else {
@@ -912,7 +998,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
 
       let direction_param = if is_group {
         Some("outbound")
-      } else if msg_cutoff.is_none() {
+      } else if !chat_exists_in_db {
         let has_outbound = pre_fetched_msgs.as_ref().map_or(false, |msgs| {
           msgs.iter().any(|m| m.get("is_sender").map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1)).unwrap_or(false))
         });
@@ -1075,10 +1161,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         m
       } else {
         let msgs_url = match &msg_cutoff {
-          Some(ts) => {
-            dev_log!("[startup_sync] {}: after={ts} chat={chat_id}", acc.name);
-            format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}")
-          }
+          Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
           None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
         };
         match fetch_paginated(client, &msgs_url, &api_key, 3).await {
@@ -1167,7 +1250,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           "quoted_sender": quoted_sender,
           "folder": if chat_folder.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(chat_folder.to_string()) },
         });
-        if !is_sender && msg_cutoff.is_none() {
+        if !is_sender && !chat_exists_in_db {
           row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
         }
 
@@ -1193,13 +1276,26 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           );
         }
 
+        // ignore-duplicates (not merge-duplicates): startup re-fetches the
+        // latest slice per chat every launch, so existing rows must be left
+        // alone — otherwise fields the user/app mutates (triage, read_at,
+        // flagged_at, reactions) would be clobbered back to their Unipile
+        // state on every startup. Real-time updates to existing messages
+        // (edits, deletes, reactions, seen) arrive via dedicated webhook
+        // events that update the row directly.
         let insert = client
-          .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
+          .post(format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id"))
           .header("apikey", &service_key).header("Authorization", format!("Bearer {service_key}"))
-          .header("Content-Type", "application/json").header("Prefer", "resolution=merge-duplicates")
+          .header("Content-Type", "application/json").header("Prefer", "resolution=ignore-duplicates")
           .json(&row).send().await;
-        if let Ok(r) = insert {
-          if r.status().is_success() || r.status().as_u16() == 409 { msgs_synced += 1; }
+        match insert {
+          Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => { msgs_synced += 1; }
+          Ok(r) => {
+            let s = r.status();
+            let b = r.text().await.unwrap_or_default();
+            err_log!("[startup_sync] message upsert failed ({s}): {b}");
+          }
+          Err(e) => { err_log!("[startup_sync] message upsert error: {e}"); }
         }
       }
 
@@ -1739,7 +1835,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         }
 
         let insert_resp = client
-          .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
+          .post(format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id"))
           .header("apikey", &service_key)
           .header("Authorization", format!("Bearer {service_key}"))
           .header("Content-Type", "application/json")
@@ -1974,14 +2070,20 @@ async fn sync_chat(
     }
 
     let insert = client
-      .post(format!("{supabase_url}/rest/v1/messages?on_conflict=external_id"))
+      .post(format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id"))
       .header("apikey", &service_key)
       .header("Authorization", format!("Bearer {service_key}"))
       .header("Content-Type", "application/json")
       .header("Prefer", "resolution=merge-duplicates")
       .json(&row).send().await;
-    if let Ok(r) = insert {
-      if r.status().is_success() || r.status().as_u16() == 409 { synced += 1; }
+    match insert {
+      Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => { synced += 1; }
+      Ok(r) => {
+        let s = r.status();
+        let b = r.text().await.unwrap_or_default();
+        err_log!("[sync_chat] message upsert failed ({s}): {b}");
+      }
+      Err(e) => { err_log!("[sync_chat] message upsert error: {e}"); }
     }
   }
 
@@ -2995,7 +3097,7 @@ async fn backfill_x_dms(
         row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
       }
 
-      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
+      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=user_id,external_id");
       let msg_resp = client
         .post(&msg_url)
         .header("apikey", sb_key)
@@ -3006,10 +3108,16 @@ async fn backfill_x_dms(
         .send()
         .await;
 
-      if let Ok(r) = msg_resp {
-        if r.status().is_success() || r.status().as_u16() == 409 {
+      match msg_resp {
+        Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
           total_msgs += 1;
         }
+        Ok(r) => {
+          let s = r.status();
+          let b = r.text().await.unwrap_or_default();
+          err_log!("[backfill_x_dms] message upsert failed ({s}): {b}");
+        }
+        Err(e) => { err_log!("[backfill_x_dms] message upsert error: {e}"); }
       }
     }
   }
@@ -3353,7 +3461,7 @@ async fn backfill_imessage(
         row.as_object_mut().unwrap().insert("read_at".into(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
       }
 
-      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=external_id");
+      let msg_url = format!("{sb_url}/rest/v1/messages?on_conflict=user_id,external_id");
       let msg_resp = client
         .post(&msg_url)
         .header("apikey", sb_key)
@@ -3363,10 +3471,16 @@ async fn backfill_imessage(
         .json(&row)
         .send().await;
 
-      if let Ok(r) = msg_resp {
-        if r.status().is_success() || r.status().as_u16() == 409 {
+      match msg_resp {
+        Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => {
           total_msgs += 1;
         }
+        Ok(r) => {
+          let s = r.status();
+          let b = r.text().await.unwrap_or_default();
+          err_log!("[backfill_imessage] message upsert failed ({s}): {b}");
+        }
+        Err(e) => { err_log!("[backfill_imessage] message upsert error: {e}"); }
       }
     }
   }
@@ -3495,7 +3609,7 @@ async fn persist_outbound(
   let url = if external_id.is_empty() {
     format!("{supabase_url}/rest/v1/messages")
   } else {
-    format!("{supabase_url}/rest/v1/messages?on_conflict=external_id")
+    format!("{supabase_url}/rest/v1/messages?on_conflict=user_id,external_id")
   };
 
   let resp = client
@@ -3812,7 +3926,10 @@ async fn reconcile_chats(
     let chats_url = format!("{base}/api/v1/chats?account_id={account_id}&limit=50");
     let remote_chats = match fetch_paginated(client, &chats_url, &api_key, 100).await {
       Ok(c) => c,
-      Err(_) => continue,
+      Err(e) => {
+        err_log!("[reconcile_unipile] chats fetch failed for {account_id}: {e}");
+        continue;
+      }
     };
 
     let remote_chat_ids: std::collections::HashSet<String> = remote_chats.iter()

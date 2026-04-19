@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import {
   Settings, Plus, Pencil, Trash2, Flag, ShieldOff,
   Inbox, Sparkles, Hourglass, CheckCircle2, DoorOpen,
-  Search, BellOff, Layers,
+  Search, Layers,
 } from 'lucide-react'
 import _ from 'lodash'
 import { useAuth } from '../../lib/auth'
@@ -350,18 +350,6 @@ export function Sidebar() {
                   {(commitmentsCount?.mine ?? 0) + (commitmentsCount?.questions ?? 0)}
                 </span>
               </div>
-            )}
-            {(stateCounts?.snoozed ?? 0) > 0 && (
-              <button
-                type="button"
-                className="nav-item"
-                data-active={!onSettings && activeView === 'snoozed' ? 'true' : 'false'}
-                onClick={() => selectLibraryView('snoozed')}
-              >
-                <span className="nav-item-icon"><BellOff size={14} /></span>
-                <span className="nav-item-label">Snoozed</span>
-                <span className="nav-item-count">{stateCounts?.snoozed ?? 0}</span>
-              </button>
             )}
             {blockedCount > 0 && (
               <button

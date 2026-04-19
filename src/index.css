@@ -161,9 +161,6 @@
   /* State colors — the heart of the new product */
   --color-state-my-turn:    var(--indigo-500);
   --color-state-their-turn: var(--gray-400);
-  --color-state-stalled:    var(--amber-500);
-  --color-state-dropped:    var(--red-500);
-  --color-state-done:       var(--green-500);
   --color-state-gate:       var(--cyan-500);
 
   /* ── Interaction overlays ── */
@@ -426,8 +423,6 @@ button { border: none; background: none; cursor: pointer; }
 
 /* State-specific count tints (replaces dot + color in one element) */
 .nav-item-count[data-state='my_turn']  { color: var(--color-state-my-turn); font-weight: 700; }
-.nav-item-count[data-state='stalled']  { color: var(--color-state-stalled); font-weight: 700; }
-.nav-item-count[data-state='dropped']  { color: var(--color-state-dropped); font-weight: 700; }
 .nav-item-count[data-state='gate']     { color: var(--color-state-gate); font-weight: 700; }
 
 /* Leading dot for state items */
@@ -436,9 +431,6 @@ button { border: none; background: none; cursor: pointer; }
 }
 .nav-state-dot[data-state='my_turn']    { background: var(--color-state-my-turn); }
 .nav-state-dot[data-state='their_turn'] { background: var(--color-state-their-turn); }
-.nav-state-dot[data-state='stalled']    { background: var(--color-state-stalled); }
-.nav-state-dot[data-state='dropped']    { background: var(--color-state-dropped); }
-.nav-state-dot[data-state='done']       { background: var(--color-state-done); }
 .nav-state-dot[data-state='gate']       { background: var(--color-state-gate); }
 
 /* Circle color dot — 18px box with centered colored disc.
@@ -681,6 +673,15 @@ button { border: none; background: none; cursor: pointer; }
 .app-banner--danger  { padding: var(--space-1) var(--space-4); background: var(--color-danger); }
 .app-banner--update  { background: var(--color-accent); }
 .app-banner--warning { padding: var(--space-1) var(--space-4); background: var(--color-warning); color: var(--color-black); }
+/* Grace period before the connecting banner is visible — avoids flashing on
+   brief WebSocket hiccups. If the channel reconnects within 5s the element
+   unmounts before ever becoming visible. */
+.app-banner--connecting { opacity: 0; animation: banner-delayed-appear 0s 5s forwards; }
+/* Sync banner has a shorter grace so users see progress for any sync that
+   actually needs their attention, but still hides the common incremental
+   case (seconds per channel) where the banner would just flicker. */
+.app-banner--sync { opacity: 0; animation: banner-delayed-appear 0s 2s forwards; }
+@keyframes banner-delayed-appear { to { opacity: 1; } }
 .app-banner-btn {
   padding: var(--space-0-5) var(--space-3); border-radius: var(--radius-sm);
   background: var(--white); color: var(--color-accent);
@@ -864,9 +865,6 @@ button { border: none; background: none; cursor: pointer; }
 }
 .state-chip[data-state='my_turn']    { background: color-mix(in srgb, var(--color-state-my-turn) 18%, transparent); color: var(--color-state-my-turn); }
 .state-chip[data-state='their_turn'] { background: color-mix(in srgb, var(--color-state-their-turn) 16%, transparent); color: var(--color-text-muted); }
-.state-chip[data-state='stalled']    { background: color-mix(in srgb, var(--color-state-stalled) 18%, transparent); color: var(--color-state-stalled); }
-.state-chip[data-state='dropped']    { background: color-mix(in srgb, var(--color-state-dropped) 18%, transparent); color: var(--color-state-dropped); }
-.state-chip[data-state='done']       { background: color-mix(in srgb, var(--color-state-done) 18%, transparent); color: var(--color-state-done); }
 .state-chip[data-state='gate']       { background: color-mix(in srgb, var(--color-state-gate) 18%, transparent); color: var(--color-state-gate); }
 
 /* Connection pill */

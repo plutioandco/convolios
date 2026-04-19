@@ -1,5 +1,5 @@
 # Convolios — Master Plan
-_Last updated: April 16, 2026_
+_Last updated: April 19, 2026_
 
 **The Single Source of Truth for Every Conversation.**
 
@@ -225,7 +225,9 @@ Break-even at a $20/mo subscription: **~8 paying users**.
 - Pinning + marked-unread reminders
 - Read-status sync (toggleable in Preferences)
 - AI triage on ingest
-- Realtime with heartbeat, reconnect-on-stale, and fallback polling
+- Turn-state inbox (`my_turn` / `their_turn` / `all` + `gate` scanner)
+- Realtime with reconnect + 60 s fallback polling
+- Tauri auto-updater (GitHub releases + signed `latest.json`)
 - Security: email XSS sanitizer, AES-GCM X tokens, attachment size caps, tenant-scoped service-role queries, webhook-secret constant-time compare
 
 ### Next
@@ -236,7 +238,6 @@ Break-even at a $20/mo subscription: **~8 paying users**.
 
 ### Later
 - Slack / Google Chat / ClickUp via their official APIs
-- Auto-updater
 - Offline mode improvements
 
 ---

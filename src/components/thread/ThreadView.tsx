@@ -1966,6 +1966,14 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
         if (filesToSend.length > 0) {
           for (let i = 0; i < filesToSend.length; i++) {
             const f = filesToSend[i]
+            // Inter-attachment jitter (1–3s) when sending multiple files.
+            // Back-to-back multipart uploads at machine speed are one of
+            // the strongest automation fingerprints on IG/WA — real users
+            // pick/upload one at a time. Skip before the first file.
+            if (i > 0) {
+              const ms = 1000 + Math.floor(Math.random() * 2000)
+              await new Promise((r) => setTimeout(r, ms))
+            }
             const extId = await invoke<string>('send_attachment', {
               chatId: resolvedChatId,
               text: i === 0 ? (body || null) : null,

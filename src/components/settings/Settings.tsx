@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Lock, Plus, Trash2, Undo2, Link2, Check, X, AlertTriangle, RefreshCw } from 'lucide-react'
+import { Lock, Plus, Trash2, Undo2, Link2, Check, X, AlertTriangle, RefreshCw, HardDrive } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
@@ -15,15 +15,28 @@ import { ChannelLogo } from '../icons/ChannelLogo'
 import type { ConnectedAccount, MergeCluster } from '../../types'
 import _ from 'lodash'
 
-const PROVIDERS = [
-  { providers: ['WHATSAPP'],  label: 'WhatsApp',  desc: 'QR code',  channel: 'whatsapp',  logo: 'whatsapp' },
-  { providers: ['GOOGLE'],    label: 'Gmail',      desc: 'OAuth',    channel: 'email',     logo: 'email' },
-  { providers: ['LINKEDIN'],  label: 'LinkedIn',   desc: 'Sign in',  channel: 'linkedin',  logo: 'linkedin' },
-  { providers: ['INSTAGRAM'], label: 'Instagram',  desc: 'Sign in',  channel: 'instagram', logo: 'instagram' },
-  { providers: ['TELEGRAM'],  label: 'Telegram',   desc: 'QR code',  channel: 'telegram',  logo: 'telegram' },
-  { providers: ['MICROSOFT'], label: 'Outlook',    desc: 'OAuth',    channel: 'email',     logo: 'outlook' },
-  { providers: ['X'],         label: 'X',          desc: 'OAuth',    channel: 'x',         logo: 'x' },
-  { providers: ['IMESSAGE'],  label: 'iMessage',   desc: 'Local',    channel: 'imessage',  logo: 'imessage' },
+type ProviderFlow = 'unipile' | 'x_oauth' | 'imessage' | 'on_device'
+
+interface ProviderDef {
+  providers: string[]
+  label: string
+  desc: string
+  channel: string
+  logo: string
+  flow: ProviderFlow
+}
+
+const PROVIDERS: ProviderDef[] = [
+  { providers: ['WHATSAPP'],            label: 'WhatsApp',              desc: 'QR code',  channel: 'whatsapp',  logo: 'whatsapp',  flow: 'unipile' },
+  { providers: ['GOOGLE'],              label: 'Gmail',                 desc: 'OAuth',    channel: 'email',     logo: 'email',     flow: 'unipile' },
+  { providers: ['LINKEDIN'],            label: 'LinkedIn',              desc: 'Sign in',  channel: 'linkedin',  logo: 'linkedin',  flow: 'unipile' },
+  { providers: ['INSTAGRAM'],           label: 'Instagram',             desc: 'Sign in',  channel: 'instagram', logo: 'instagram', flow: 'unipile' },
+  { providers: ['ON_DEVICE_INSTAGRAM'], label: 'Instagram (on device)', desc: 'Local',    channel: 'instagram', logo: 'instagram', flow: 'on_device' },
+  { providers: ['ON_DEVICE_MESSENGER'], label: 'Messenger (on device)', desc: 'Local',    channel: 'messenger', logo: 'messenger', flow: 'on_device' },
+  { providers: ['TELEGRAM'],            label: 'Telegram',              desc: 'QR code',  channel: 'telegram',  logo: 'telegram',  flow: 'unipile' },
+  { providers: ['MICROSOFT'],           label: 'Outlook',               desc: 'OAuth',    channel: 'email',     logo: 'outlook',   flow: 'unipile' },
+  { providers: ['X'],                   label: 'X',                     desc: 'OAuth',    channel: 'x',         logo: 'x',         flow: 'x_oauth' },
+  { providers: ['IMESSAGE'],            label: 'iMessage',              desc: 'Local',    channel: 'imessage',  logo: 'imessage',  flow: 'imessage' },
 ]
 
 export function Settings() {
@@ -86,7 +99,11 @@ export function Settings() {
     setDisconnecting(accountId)
     setDisconnectErr('')
     try {
-      await invoke<string>('disconnect_account', { accountId, userId: user.id })
+      const account = accounts.find((a) => a.account_id === accountId)
+      const cmd = account?.provider === 'on_device'
+        ? 'on_device_disconnect'
+        : 'disconnect_account'
+      await invoke<string>(cmd, { accountId, userId: user.id })
       removeAccount(accountId)
       queryClient.invalidateQueries({ queryKey: ['conversations', user.id] })
     } catch (e) {
@@ -232,12 +249,12 @@ const PROVIDER_WAITING_TIMEOUT_MS = 120_000
 const PROVIDER_DONE_DISMISS_MS = 3_000
 const PROVIDER_ERR_DISMISS_MS = 6_000
 
-function ProviderCard({ providers, label, desc, channel, logo, userId }: {
-  providers: string[]; label: string; desc: string; channel: string; logo: string; userId?: string
-}) {
+function ProviderCard({ providers, label, desc, channel, logo, flow, userId }: ProviderDef & { userId?: string }) {
   const [st, setSt] = useState<ProviderState>('idle')
   const [errMsg, setErrMsg] = useState('')
+  const [onDeviceOpen, setOnDeviceOpen] = useState(false)
   const accounts = useAccountsStore((s) => s.accounts)
+  const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const countBefore = useRef(0)
 
   const runImessageFlow = useCallback((uid: string) => {
@@ -303,17 +320,23 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
 
   const go = async () => {
     if (!_.isString(userId)) return
+
+    if (flow === 'on_device') {
+      setOnDeviceOpen(true)
+      return
+    }
+
     setSt('loading')
     setErrMsg('')
     countBefore.current = accounts.filter((a) => a.channel === channel && a.status === 'active').length
     try {
-      if (channel === 'imessage') {
+      if (flow === 'imessage') {
         await invoke<string>('connect_imessage', { userId })
         await runImessageFlow(userId)
         return
       }
       let link: string
-      if (channel === 'x') {
+      if (flow === 'x_oauth') {
         link = await invoke<string>('connect_x_account', { userId })
       } else {
         const url = import.meta.env.VITE_SUPABASE_URL
@@ -328,7 +351,7 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
       setSt('waiting')
     } catch (e) {
       const msg = String(e)
-      if (channel === 'imessage' && (msg.includes('Full Disk Access') || msg.includes('Cannot access'))) {
+      if (flow === 'imessage' && (msg.includes('Full Disk Access') || msg.includes('Cannot access'))) {
         setSt('permission')
         return
       }
@@ -388,6 +411,9 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
       >
         <ChannelLogo channel={logo} size={16} color="var(--color-text-primary)" className="shrink-0" />
         <span className="text-base font-medium flex-1 text-left text-text-primary">{label}</span>
+        {flow === 'on_device' && (
+          <HardDrive size={11} className="text-text-muted shrink-0" aria-label="On device" />
+        )}
         <span className="flex items-center gap-1 text-xs truncate max-w-[80px]" style={{ color: stColor }}>
           {st === 'waiting' && <span className="pulse-dot w-1.5 h-1.5 rounded-full shrink-0" style={{ background: stColor }} />}
           {st === 'err' ? 'Failed' : stText}
@@ -396,6 +422,139 @@ function ProviderCard({ providers, label, desc, channel, logo, userId }: {
       {st === 'err' && errMsg && (
         <div className="provider-btn-error-tip">{errMsg}</div>
       )}
+      {onDeviceOpen && _.isString(userId) && (
+        <OnDeviceLoginModal
+          userId={userId}
+          channel={channel}
+          label={label}
+          onClose={() => setOnDeviceOpen(false)}
+          onSuccess={() => {
+            setOnDeviceOpen(false)
+            setSt('done')
+            fetchAccounts(userId)
+            queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+type OnDeviceStep = 'idle' | 'busy' | 'done' | 'action_required' | 'err'
+
+type LoginStatus =
+  | 'success'
+  | 'challenge_required'
+  | 'consent_required'
+  | 'checkpoint_required'
+  | 'token_invalidated'
+  | 'cancelled'
+
+interface LoginOutcome {
+  status: LoginStatus
+  account_id?: string
+  username?: string
+  display_name?: string | null
+  avatar_url?: string | null
+  channel: string
+}
+
+const ACTION_COPY: Record<Exclude<LoginStatus, 'success' | 'cancelled'>, (label: string) => string> = {
+  challenge_required: (label) =>
+    `${label} asked for a verification step. Complete it in a regular ${label} browser tab, then click Connect again.`,
+  consent_required: (label) =>
+    `${label} is showing a consent screen. Accept it in a regular browser, then click Connect again.`,
+  checkpoint_required: (label) =>
+    `${label} opened a security checkpoint. Resolve it at ${label.toLowerCase()}.com in a regular browser, then click Connect again.`,
+  token_invalidated: (label) =>
+    `Your ${label} session is no longer valid. Click Connect to sign in again.`,
+}
+
+function OnDeviceLoginModal({ userId, channel, label, onClose, onSuccess }: {
+  userId: string
+  channel: string
+  label: string
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const [step, setStep] = useState<OnDeviceStep>('idle')
+  const [message, setMessage] = useState('')
+
+  const connect = async () => {
+    setStep('busy')
+    setMessage('')
+    try {
+      const outcome = await invoke<LoginOutcome>('on_device_start_login', { userId, channel })
+      if (outcome.status === 'success') {
+        setStep('done')
+        setTimeout(onSuccess, 600)
+        return
+      }
+      if (outcome.status === 'cancelled') {
+        onClose()
+        return
+      }
+      setMessage(ACTION_COPY[outcome.status](label))
+      setStep('action_required')
+    } catch (e) {
+      const raw = String(e).toLowerCase()
+      if (raw.includes('password') || raw.includes('credential') || raw.includes('unauthorized') || raw.includes('login')) {
+        setMessage(`Your ${label} session appears invalid. Click Connect to sign in again.`)
+      } else {
+        setMessage(String(e))
+      }
+      setStep('err')
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={step === 'busy' ? undefined : onClose}>
+      <div className="modal-panel on-device-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center gap-2 mb-4">
+          <HardDrive size={16} className="text-text-muted" />
+          <h3 className="text-base font-semibold text-text-primary">Connect {label}</h3>
+        </div>
+        <p className="text-sm text-text-secondary mb-4 leading-normal">
+          A {label} login window opens on your Mac. Your session cookies stay on this device (stored in macOS Keychain). Convolios servers never see them.
+        </p>
+
+        {step === 'idle' && (
+          <div className="flex gap-2 mt-4">
+            <button type="button" onClick={onClose} className="btn-outline flex-1">Cancel</button>
+            <button type="button" onClick={connect} className="btn-primary flex-1">Connect</button>
+          </div>
+        )}
+
+        {step === 'busy' && (
+          <p className="text-sm text-text-muted">Opening {label} login window…</p>
+        )}
+
+        {step === 'done' && (
+          <div className="flex items-center gap-2 text-success">
+            <Check size={16} /><span>Connected</span>
+          </div>
+        )}
+
+        {step === 'action_required' && (
+          <div>
+            <p className="auth-error">{message}</p>
+            <div className="flex gap-2 mt-4">
+              <button type="button" onClick={onClose} className="btn-outline flex-1">Close</button>
+              <button type="button" onClick={connect} className="btn-primary flex-1">Connect</button>
+            </div>
+          </div>
+        )}
+
+        {step === 'err' && (
+          <div>
+            <p className="auth-error">{message}</p>
+            <div className="flex gap-2 mt-4">
+              <button type="button" onClick={onClose} className="btn-outline flex-1">Close</button>
+              <button type="button" onClick={connect} className="btn-primary flex-1">Try again</button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

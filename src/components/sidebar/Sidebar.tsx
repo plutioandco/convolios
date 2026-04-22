@@ -38,6 +38,7 @@ const CHANNELS: { id: Channel; label: string }[] = [
   { id: 'email',     label: 'Email'     },
   { id: 'linkedin',  label: 'LinkedIn'  },
   { id: 'instagram', label: 'Instagram' },
+  { id: 'messenger', label: 'Messenger' },
   { id: 'telegram',  label: 'Telegram'  },
   { id: 'x',         label: 'X'         },
   { id: 'imessage',  label: 'iMessage'  },

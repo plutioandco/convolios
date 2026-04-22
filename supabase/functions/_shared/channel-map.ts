@@ -2,6 +2,7 @@ export const CHANNEL_MAP: Record<string, string> = {
   LINKEDIN: "linkedin",
   WHATSAPP: "whatsapp",
   INSTAGRAM: "instagram",
+  MESSENGER: "messenger",
   TELEGRAM: "telegram",
   MAIL: "email",
   GMAIL: "email",
@@ -13,4 +14,7 @@ export const CHANNEL_MAP: Record<string, string> = {
   MOBILE: "sms",
   SMS: "sms",
   RCS: "sms",
+  // On-device (local sidecar) provider types, posted by the desktop app.
+  ON_DEVICE_INSTAGRAM: "instagram",
+  ON_DEVICE_MESSENGER: "messenger",
 };

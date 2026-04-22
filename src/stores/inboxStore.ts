@@ -89,12 +89,30 @@ export const useInboxStore = create<InboxState>((set) => ({
     queryClient.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
 
     if (usePreferencesStore.getState().syncReadStatus) {
-      invoke('chat_action', {
-        userId, personId,
-        action: 'mark_read',
-      }).catch((e) => {
-        if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e)
-      })
+      // Length-based mark_read delay. Firing `seen` on Unipile
+      // milliseconds after the thread opens is one of the strongest
+      // automation tells on IG/WA — real users take at least a second
+      // or two to read even a short message. Derive the delay from
+      // the last inbound message length so a one-liner gets ~1.5s and
+      // a long paragraph gets several. Fire-and-forget: UI stays
+      // optimistically-read immediately; only the provider-side
+      // `seen` is delayed.
+      const convs = queryClient.getQueryData<ConversationPreview[]>(['conversations', userId])
+        ?? queryClient.getQueriesData<ConversationPreview[]>({ queryKey: ['conversations', userId] })
+          .flatMap(([, v]) => v ?? [])
+      const preview = convs?.find((c) => c.person.id === personId)
+      const charLen = preview?.lastMessage?.body_text?.length ?? 0
+      const perCharMs = 40 + Math.floor(Math.random() * 20)
+      const jitterMs = Math.floor((Math.random() - 0.5) * 800)
+      const delayMs = _.clamp(1000 + charLen * perCharMs + jitterMs, 1500, 15000)
+      setTimeout(() => {
+        invoke('chat_action', {
+          userId, personId,
+          action: 'mark_read',
+        }).catch((e) => {
+          if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e)
+        })
+      }, delayMs)
     }
   },
 

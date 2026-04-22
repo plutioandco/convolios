@@ -2,3 +2,9 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# Sidecar binaries — rebuilt by scripts/build-sidecars.sh on every
+# tauri build. Never commit the compiled artefacts.
+/binaries/
+/sidecars/*/meta-bridge
+/sidecars/*/meta-bridge-*

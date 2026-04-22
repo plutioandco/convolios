@@ -1,6 +1,13 @@
+use rand::Rng;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
+
+mod on_device;
+mod send_limiter;
+
+use send_limiter::{warmup_tier_from_age_hours, SendLimiter, WarmupTier};
 
 macro_rules! dev_log {
   ($($arg:tt)*) => {
@@ -16,7 +23,102 @@ macro_rules! err_log {
 
 struct AppState {
   http: reqwest::Client,
-  syncing: std::sync::atomic::AtomicBool,
+  /// Coalesces concurrent `startup_sync` invocations (heartbeat tick +
+  /// network-reconnect trigger + focus-after-idle trigger can all race).
+  syncing: AtomicBool,
+  /// X DM + iMessage providers don't emit Unipile webhooks, so their
+  /// backfill was running on every 2-min `startup_sync` tick. Gate each
+  /// to once per process launch; webhooks (Unipile) or provider-native
+  /// cursors (X, iMessage SQLite bridge) cover subsequent updates.
+  backfilled_x: AtomicBool,
+  backfilled_imessage: AtomicBool,
+  /// Ensures `start_sync_heartbeat` spawns the tokio interval task at
+  /// most once across the app's lifetime, even if the frontend re-mounts.
+  heartbeat_started: AtomicBool,
+  /// Cache of per-Unipile-account session creation time, populated during
+  /// `startup_sync_inner`. Read from `send_message` / `send_attachment`
+  /// to compute the warm-up tier without a Supabase round-trip on the
+  /// send hot path.
+  account_ages: parking_lot::RwLock<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+  /// Token-bucket rate limiter for outbound sends per Unipile's
+  /// provider-limits guidance.
+  limiter: SendLimiter,
+}
+
+/// Hourly heartbeat reconciliation, base interval.
+///
+/// Replaces the old 2-min JS `setInterval` — that cadence was both
+/// unreliable (WKWebView throttles timers when the window is
+/// backgrounded, creating the "massive batches on foreground" symptom)
+/// and structurally bot-like per Unipile's own guidance ("we do not
+/// recommend polling at fixed times, this pattern can easily be flagged
+/// as automation"). Event triggers (network reconnect, focus after 2h
+/// idle, manual pull) cover most reconciliation needs; this heartbeat
+/// is the sanity net that catches silently-dropped Unipile webhooks.
+const SYNC_HEARTBEAT_BASE_SECS: u64 = 3600;
+const SYNC_HEARTBEAT_JITTER_PCT: u32 = 20;
+
+/// Skip the per-chat message pull when the most recent message is newer
+/// than this — the webhook already covered it, and the 2h self-heal
+/// floor (SYNC_SELF_HEAL_HOURS) still catches silently-dropped writes.
+const SYNC_CHAT_RECENT_SKIP_MINUTES: i64 = 10;
+
+/// Inter-account / inter-chat pacing jitter ranges. Unipile's guidance
+/// is explicit: "Space out all actions randomly instead of executing
+/// them at regular intervals." These ranges break the rigid sweep
+/// pattern that a tight `for` loop would otherwise produce.
+const SYNC_INTER_ACCOUNT_DELAY_MS: std::ops::Range<u64> = 1_000..3_000;
+const SYNC_INTER_CHAT_DELAY_MS: std::ops::Range<u64> = 200..600;
+
+/// Parse Unipile's `created_at` (RFC3339-ish) on a UnipileAccount into
+/// a UTC `DateTime`. Returns None on malformed/empty values — caller
+/// should treat as "unknown age" (conservatively Fresh tier).
+fn parse_unipile_created_at(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+  if s.is_empty() { return None; }
+  chrono::DateTime::parse_from_rfc3339(s)
+    .ok()
+    .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Look up an account's warm-up tier from the `account_ages` cache
+/// populated during `startup_sync_inner`. Missing entries default to
+/// Fresh — conservative, since sending on an account we haven't seen
+/// yet is more likely a freshly-connected session than a veteran.
+fn warmup_tier_for(state: &AppState, account_id: &str) -> WarmupTier {
+  let connected_at = state.account_ages.read().get(account_id).copied();
+  match connected_at {
+    Some(dt) => {
+      let age_hours = chrono::Utc::now().signed_duration_since(dt).num_hours();
+      warmup_tier_from_age_hours(age_hours)
+    }
+    None => WarmupTier::Fresh,
+  }
+}
+
+/// Sleep for `base` seconds ± `jitter_pct` percent — used by the
+/// hourly heartbeat to avoid a fixed phase alignment across app
+/// launches.
+async fn jittered_sleep(base_secs: u64, jitter_pct: u32) {
+  let jitter = (base_secs as f64) * (jitter_pct as f64) / 100.0;
+  let low = (base_secs as f64 - jitter).max(1.0);
+  let high = base_secs as f64 + jitter;
+  let pick = rand::thread_rng().gen_range(low..=high);
+  tokio::time::sleep(Duration::from_secs_f64(pick)).await;
+}
+
+/// Synthesize a human-like `typing_duration` for Unipile's send API
+/// (seconds) based on message length. Bot-detection research
+/// specifically calls out consistent receive→typing→send intervals as
+/// a fingerprint — firing a send with no typing delay is a strong
+/// tell. Roughly 40 WPM (~50ms/char) with an initial-think jitter
+/// (400–1200ms) and ±25% per-char variance, clamped so trivial
+/// one-word replies don't block and essays don't stall for a minute.
+fn humanized_typing_duration_seconds(text: &str) -> f64 {
+  let mut rng = rand::thread_rng();
+  let per_char = rng.gen_range(0.040..0.060);
+  let initial = rng.gen_range(0.4..1.2);
+  let raw = (text.chars().count() as f64) * per_char + initial;
+  raw.clamp(0.5, 8.0)
 }
 
 /// Hours of overlap between the per-chat sync cursor (`MAX(sent_at)` in DB)
@@ -31,7 +133,11 @@ const SYNC_SELF_HEAL_HOURS: i64 = 2;
 /// Matches supabase-js v2.102.0's built-in behaviour: "up to 3 attempts with
 /// exponential backoff with jitter." See
 /// https://supabase.com/docs/guides/api/automatic-retries-in-supabase-js
-const SB_MAX_ATTEMPTS: u32 = 3;
+///
+/// 5 attempts (vs. supabase-js's default of 3) because our typical failure
+/// window is a laptop waking from sleep / flaking Wi-Fi reconnect — those
+/// take 5–10s to stabilise, longer than 3 attempts × 1.75s = 5.25s gives us.
+const SB_MAX_ATTEMPTS: u32 = 5;
 const SB_BASE_BACKOFF_MS: u64 = 250;
 
 /// HTTP status codes Supabase documents as transient / worth retrying on
@@ -52,10 +158,12 @@ fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
   err.is_timeout() || err.is_connect() || err.is_body()
 }
 
-/// Exponential backoff: 250ms, 500ms, 1000ms, 2000ms, 4000ms (capped).
+/// Exponential backoff: 250ms, 500ms, 1s, 2s, 4s (capped at 8s).
+/// Total budget across 5 attempts ≈ 7.75s, which comfortably covers the
+/// typical Wi-Fi reconnect / VPN reconnect / Supavisor warm-up window.
 async fn sb_backoff_sleep(attempt: u32) {
-  let delay = SB_BASE_BACKOFF_MS.saturating_mul(1u64 << attempt.min(4));
-  tokio::time::sleep(Duration::from_millis(delay.min(4000))).await;
+  let delay = SB_BASE_BACKOFF_MS.saturating_mul(1u64 << attempt.min(5));
+  tokio::time::sleep(Duration::from_millis(delay.min(8000))).await;
 }
 
 /// Bulk PostgREST upsert with transient-error retry.
@@ -143,8 +251,14 @@ pub fn run() {
         .expect("failed to build HTTP client");
       app.manage(AppState {
         http: client,
-        syncing: std::sync::atomic::AtomicBool::new(false),
+        syncing: AtomicBool::new(false),
+        backfilled_x: AtomicBool::new(false),
+        backfilled_imessage: AtomicBool::new(false),
+        heartbeat_started: AtomicBool::new(false),
+        account_ages: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        limiter: SendLimiter::new(),
       });
+      app.manage(on_device::BridgeManager::new());
 
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -164,6 +278,7 @@ pub fn run() {
       sync_unipile_accounts,
       disconnect_account,
       startup_sync,
+      start_sync_heartbeat,
       backfill_messages,
       sync_chat,
       send_message,
@@ -180,7 +295,11 @@ pub fn run() {
       read_dropped_files,
       chat_action,
       email_flag_action,
-      sync_email_flags
+      sync_email_flags,
+      on_device::commands::on_device_start_login,
+      on_device::commands::on_device_resume_all,
+      on_device::commands::on_device_disconnect,
+      on_device::commands::on_device_update_cookies
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -820,13 +939,53 @@ async fn ensure_webhooks(client: &reqwest::Client) -> Result<u32, String> {
 
 #[tauri::command]
 async fn startup_sync(user_id: String, state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<String, String> {
-  if state.syncing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+  if state.syncing.swap(true, Ordering::SeqCst) {
     return Ok("Already syncing".to_string());
   }
   let result = startup_sync_inner(&user_id, state.inner(), &app_handle).await;
-  state.syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+  state.syncing.store(false, Ordering::SeqCst);
   let _ = app_handle.emit("sync-status", serde_json::json!({ "phase": "idle" }));
   result
+}
+
+/// Spawn the background reconciliation heartbeat exactly once per
+/// app lifetime. Replaces the JS `setInterval` loop in `App.tsx` — the
+/// WKWebView throttles/suspends JS timers when the window is
+/// backgrounded on macOS (tauri-apps/wry#1246), which produced the
+/// "massive batches on foreground" symptom users observed.
+///
+/// The frontend calls this once from the `Authenticated` mount effect,
+/// passing the signed-in user id. Event-driven triggers (network
+/// reconnect, focus-after-idle, manual pull) cover most reconciliation
+/// work; this heartbeat is the sanity net that catches silently-dropped
+/// Unipile webhooks.
+#[tauri::command]
+async fn start_sync_heartbeat(
+  user_id: String,
+  state: State<'_, AppState>,
+  app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+  if state.heartbeat_started.swap(true, Ordering::SeqCst) {
+    return Ok(());
+  }
+  dev_log!("[sync_heartbeat] spawning — base {SYNC_HEARTBEAT_BASE_SECS}s ±{SYNC_HEARTBEAT_JITTER_PCT}%");
+  let app = app_handle.clone();
+  let uid = user_id;
+  tauri::async_runtime::spawn(async move {
+    loop {
+      jittered_sleep(SYNC_HEARTBEAT_BASE_SECS, SYNC_HEARTBEAT_JITTER_PCT).await;
+      let state: State<'_, AppState> = app.state();
+      if state.syncing.swap(true, Ordering::SeqCst) {
+        dev_log!("[sync_heartbeat] skipped — sync already in progress");
+        continue;
+      }
+      dev_log!("[sync_heartbeat] tick");
+      let _ = startup_sync_inner(&uid, state.inner(), &app).await;
+      state.syncing.store(false, Ordering::SeqCst);
+      let _ = app.emit("sync-status", serde_json::json!({ "phase": "idle" }));
+    }
+  });
+  Ok(())
 }
 
 async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
@@ -842,6 +1001,18 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       "phase": phase,
       "detail": detail,
       "account": { "idx": idx, "total": total, "channel": channel },
+    }));
+  };
+  // Same as emit_account, but adds per-chat progress within the account
+  // loop so the banner never looks frozen when a single account has many
+  // chats (e.g. LinkedIn/Telegram w/ 100+ active threads in the 72h window).
+  // Rendered as "Syncing LinkedIn (3/9) · 17/52 chats" on the frontend.
+  let emit_account_chat = |phase: &str, detail: &str, acc_idx: usize, acc_total: usize, channel: &str, chat_idx: usize, chat_total: usize| {
+    let _ = app.emit("sync-status", serde_json::json!({
+      "phase": phase,
+      "detail": detail,
+      "account": { "idx": acc_idx, "total": acc_total, "channel": channel },
+      "chat": { "idx": chat_idx, "total": chat_total },
     }));
   };
   emit("syncing", "Fetching accounts...");
@@ -915,26 +1086,82 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
-  emit("syncing", "Syncing X DMs...");
-  match backfill_x_dms(client, user_id, &supabase_url, &service_key).await {
-    Ok((m, c)) if m > 0 => dev_log!("[startup_sync] X: {m} msgs from {c} chats"),
-    Err(e) => dev_log!("[startup_sync] X DM error: {e}"),
-    _ => {}
+  // X DM + iMessage backfills ran on every 2-min tick before — wasteful
+  // and amplified the "massive batches on foreground" pattern. Gate each
+  // to once per process launch; webhook (Unipile) and provider-native
+  // cursors (Twitter API, iMessage SQLite bridge) cover subsequent updates.
+  // `compare_exchange` is the set-once idiom — only the first caller
+  // sees `Ok`.
+  if state.backfilled_x.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    emit("syncing", "Syncing X DMs...");
+    match backfill_x_dms(client, user_id, &supabase_url, &service_key).await {
+      Ok((m, c)) if m > 0 => dev_log!("[startup_sync] X: {m} msgs from {c} chats"),
+      Err(e) => dev_log!("[startup_sync] X DM error: {e}"),
+      _ => {}
+    }
   }
 
-  emit("syncing", "Syncing iMessage...");
-  match backfill_imessage(client, user_id, &supabase_url, &service_key).await {
-    Ok((m, c)) if m > 0 => dev_log!("[startup_sync] iMessage: {m} msgs from {c} chats"),
-    Err(e) => dev_log!("[startup_sync] iMessage error: {e}"),
-    _ => {}
+  if state.backfilled_imessage.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    emit("syncing", "Syncing iMessage...");
+    match backfill_imessage(client, user_id, &supabase_url, &service_key).await {
+      Ok((m, c)) if m > 0 => dev_log!("[startup_sync] iMessage: {m} msgs from {c} chats"),
+      Err(e) => dev_log!("[startup_sync] iMessage error: {e}"),
+      _ => {}
+    }
   }
 
+  // Populate the `account_ages` cache used by `send_message` /
+  // `send_attachment` to pick a warm-up tier without a Supabase
+  // round-trip. Parsing every tick is cheap (O(N) with N ~= number
+  // of connected accounts).
+  {
+    let mut ages = state.account_ages.write();
+    ages.clear();
+    for acc in &keep {
+      if let Some(dt) = parse_unipile_created_at(&acc.created_at) {
+        ages.insert(acc.id.clone(), dt);
+      }
+    }
+  }
+
+  // Fresh IG accounts (0–24h): skip Unipile pulls entirely. Unipile
+  // explicitly recommends starting with low activity and ramping up,
+  // and the connection-time "automated behavior" warning is more likely
+  // to escalate into a restriction if we hammer reads on a session
+  // that just came online. Webhooks still deliver in real time during
+  // this window.
   let active_accounts: Vec<&UnipileAccount> = keep.iter()
     .filter(|a| a.status == "OK" || a.status == "RUNNING")
+    .filter(|a| {
+      let channel = channel_from_type(&a.account_type);
+      if channel != "instagram" {
+        return true;
+      }
+      match parse_unipile_created_at(&a.created_at) {
+        Some(dt) => {
+          let age_hours = chrono::Utc::now().signed_duration_since(dt).num_hours();
+          if age_hours < 24 {
+            dev_log!("[startup_sync] fresh-account cooldown: skipping IG {} ({}h old)", a.id, age_hours);
+            false
+          } else {
+            true
+          }
+        }
+        None => true,
+      }
+    })
     .cloned()
     .collect();
 
   for (acc_idx, acc) in active_accounts.iter().enumerate() {
+    // Inter-account jitter. Unipile's explicit guidance: "Space out all
+    // actions randomly instead of executing them at regular intervals."
+    // First iteration (acc_idx == 0) doesn't need to wait.
+    if acc_idx > 0 {
+      let ms = rand::thread_rng().gen_range(SYNC_INTER_ACCOUNT_DELAY_MS);
+      tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
     let channel = channel_from_type(&acc.account_type);
     emit_account(
       "syncing",
@@ -953,9 +1180,32 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       }
     };
 
-    for chat in &chats {
+    let chats_total = chats.len();
+    for (chat_idx, chat) in chats.iter().enumerate() {
       let chat_id = chat.get("id").and_then(|v| v.as_str()).unwrap_or("");
       if chat_id.is_empty() { continue; }
+
+      // Inter-chat jitter. Short by design (hundreds of ms) so a sweep
+      // of 50 chats still completes in under a minute, but enough to
+      // break the rigid `for`-loop cadence that a detector could pick
+      // out. First chat in the list skips the wait.
+      if chat_idx > 0 {
+        let ms = rand::thread_rng().gen_range(SYNC_INTER_CHAT_DELAY_MS);
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+      }
+
+      // Per-chat progress — fires at the start of every chat so a long
+      // account (LinkedIn/Telegram w/ 100+ threads) shows visible motion
+      // instead of parking on "Syncing X (N of M)" for minutes.
+      emit_account_chat(
+        "syncing",
+        &format!("Checking {}", acc.name),
+        acc_idx + 1,
+        active_accounts.len(),
+        channel,
+        chat_idx + 1,
+        chats_total,
+      );
 
       // Per-chat sync cursor with a 2h self-heal floor.
       //
@@ -1255,9 +1505,20 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         }
       }
 
+      // Skip the message pull when the last message we have is newer
+      // than SYNC_CHAT_RECENT_SKIP_MINUTES. The webhook already covered
+      // any newer messages; the 2h self-heal floor (SYNC_SELF_HEAL_HOURS)
+      // still catches silently-dropped webhook writes on the next tick
+      // that is NOT short-circuited. Saves a Unipile call per quiet chat
+      // on every heartbeat sweep.
+      let skip_threshold = chrono::Utc::now() - chrono::Duration::minutes(SYNC_CHAT_RECENT_SKIP_MINUTES);
+      let skip_message_pull = max_sent_at.map(|t| t > skip_threshold).unwrap_or(false);
+
       let messages = if let Some(m) = pre_fetched_msgs {
         if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id} (pre-fetched)", m.len()); }
         m
+      } else if skip_message_pull {
+        Vec::new()
       } else {
         let msgs_url = match &msg_cutoff {
           Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
@@ -2222,6 +2483,7 @@ async fn send_message(
   quote_id: Option<String>,
   typing_duration: Option<String>,
   state: State<'_, AppState>,
+  bridges: State<'_, on_device::BridgeManager>,
 ) -> Result<String, String> {
   if channel == "x" {
     return send_x_dm(
@@ -2236,6 +2498,34 @@ async fn send_message(
     ).await;
   }
 
+  // On-device bridges (Instagram / Messenger via meta-bridge sidecar). The
+  // `account_id` is the local bridge id; routing is keyed by that, not the
+  // per-thread chat_id.
+  if on_device::is_on_device_channel(&channel) {
+    let bridge_account = account_id
+      .as_deref()
+      .ok_or_else(|| "on-device send requires account_id".to_string())?;
+    if chat_id.is_empty() {
+      return Err("on-device send requires thread_id (chat_id)".to_string());
+    }
+    let external_id = on_device::commands::send_via_bridge(
+      &bridges, bridge_account, &chat_id, &text,
+    ).await?;
+
+    persist_outbound(
+      &state.http, &user_id, &person_id, &channel, &message_type,
+      &text, &chat_id, &external_id, &serde_json::json!([]),
+      Some(bridge_account),
+    ).await.unwrap_or_else(|e| dev_log!("[send_message] on-device persist warning: {e}"));
+
+    log_send_audit(
+      &state.http, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      Some(bridge_account), "sent", None,
+    ).await;
+
+    return Ok(external_id);
+  }
+
   if chat_id.is_empty() {
     return Err("No chat_id provided — cannot send without a target chat".to_string());
   }
@@ -2244,13 +2534,39 @@ async fn send_message(
   let client = &state.http;
   let aid = account_id.as_deref().unwrap_or("");
 
-  dev_log!("[send_message] person={person_id} channel={channel} chat_id={chat_id} account_id={aid}");
+  // Token-bucket check against per-(account, channel) quotas from
+  // Unipile's provider-limits guidance, scaled by the session warm-up
+  // tier. Stable error codes ("rate_limit:instagram:hourly", etc.) let
+  // the frontend render friendly UI without parsing text.
+  let tier = warmup_tier_for(state.inner(), aid);
+  if let Err(code) = state.limiter.check_and_consume(aid, &channel, tier) {
+    dev_log!("[send_message] {code} account={aid} tier={tier:?}");
+    log_send_audit(
+      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      account_id.as_deref(), "error", Some(&code),
+    ).await;
+    return Err(code);
+  }
+
+  dev_log!("[send_message] person={person_id} channel={channel} chat_id={chat_id} account_id={aid} tier={tier:?}");
 
   let url = format!("{base}/api/v1/chats/{chat_id}/messages");
   let mut form = reqwest::multipart::Form::new().text("text", text.clone());
   if !aid.is_empty() { form = form.text("account_id", aid.to_string()); }
   if let Some(ref qid) = quote_id { if !qid.is_empty() { form = form.text("quote_id", qid.clone()); } }
-  if let Some(ref td) = typing_duration { if !td.is_empty() { form = form.text("typing_duration", td.clone()); } }
+
+  // Humanize typing indicator. Without this, Unipile sends with no
+  // typing delay — an obvious tell against real users who have read
+  // receipts + typing bubbles. Target channels honor Unipile's
+  // `typing_duration` (seconds). Email / X / iMessage don't, so skip.
+  let td_override = typing_duration.as_deref().filter(|s| !s.is_empty());
+  let typing_channels = matches!(channel.as_str(), "instagram" | "whatsapp" | "linkedin" | "messenger" | "telegram");
+  if let Some(td) = td_override {
+    form = form.text("typing_duration", td.to_string());
+  } else if typing_channels {
+    let seconds = humanized_typing_duration_seconds(&text);
+    form = form.text("typing_duration", format!("{seconds:.1}"));
+  }
 
   let response = client.post(url).header("X-API-KEY", &api_key).multipart(form).send()
     .await.map_err(|e| format!("Send failed: {e}"))?;
@@ -2563,12 +2879,24 @@ async fn send_attachment(
   let client = &state.http;
   let aid = account_id.as_deref().unwrap_or("");
 
+  // Same token-bucket gate as send_message — an attachment counts as
+  // one outbound action under Unipile's provider caps.
+  let tier = warmup_tier_for(state.inner(), aid);
+  if let Err(code) = state.limiter.check_and_consume(aid, &channel, tier) {
+    dev_log!("[send_attachment] {code} account={aid} tier={tier:?}");
+    log_send_audit(
+      client, &user_id, &person_id, &channel, &chat_id, &chat_id,
+      account_id.as_deref(), "error", Some(&code),
+    ).await;
+    return Err(code);
+  }
+
   let raw = base64::Engine::decode(&base64_engine(), &file_data)
     .map_err(|e| format!("base64 decode: {e}"))?;
 
   let body_text = text.clone().unwrap_or_default();
 
-  dev_log!("[send_attachment] person={person_id} channel={channel} chat_id={chat_id} file={file_name}");
+  dev_log!("[send_attachment] person={person_id} channel={channel} chat_id={chat_id} file={file_name} tier={tier:?}");
 
   let file_part = reqwest::multipart::Part::bytes(raw)
     .file_name(file_name.clone())

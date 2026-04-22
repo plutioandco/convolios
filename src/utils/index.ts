@@ -5,6 +5,7 @@ export const CHANNEL_META: Record<Channel, { label: string; color: string }> = {
   whatsapp:    { label: 'WhatsApp',    color: '#25D366' },
   linkedin:    { label: 'LinkedIn',    color: '#0A66C2' },
   instagram:   { label: 'Instagram',   color: '#E4405F' },
+  messenger:   { label: 'Messenger',   color: '#0084FF' },
   telegram:    { label: 'Telegram',    color: '#26A5E4' },
   email:       { label: 'Email',       color: '#EA4335' },
   x:           { label: 'X',           color: '#f2f3f5' },

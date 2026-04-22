@@ -780,6 +780,9 @@ button { border: none; background: none; cursor: pointer; }
 }
 .manual-merge-candidate:hover { background: var(--hover-row-subtle); }
 
+/* On-device connect modal */
+.on-device-modal { width: 420px; padding: var(--space-4); }
+
 /* ═══════════════════════════════════════════════════════════════════════════
    LIGHTBOX
    ═══════════════════════════════════════════════════════════════════════════ */

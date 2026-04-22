@@ -2,7 +2,12 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.101.1";
 import { jsonResponse } from "../_shared/cors.ts";
 import { CHANNEL_MAP } from "../_shared/channel-map.ts";
 import { verifyWebhookSecret } from "../_shared/auth.ts";
-import { validateWebhookBase, validateMessageEvent, validateEmailEvent } from "../_shared/validate.ts";
+import {
+  validateEmailEvent,
+  validateMessageEvent,
+  validateOnDeviceMessageEvent,
+  validateWebhookBase,
+} from "../_shared/validate.ts";
 import { initLogger, log } from "../_shared/logging.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
@@ -79,24 +84,81 @@ function resolveAccount(accountId: string) {
     .maybeSingle();
 }
 
+// On-device accounts are always scoped to the authenticated JWT user — never
+// match by account_id alone, which would let one user ingest into another's
+// account if they guessed the id. `provider` is enforced so the Unipile and
+// on-device namespaces stay disjoint.
+function resolveOnDeviceAccount(userId: string, accountId: string) {
+  return supabase
+    .from("connected_accounts")
+    .select("user_id, channel, account_id")
+    .eq("user_id", userId)
+    .eq("account_id", accountId)
+    .eq("provider", "on_device")
+    .limit(1)
+    .maybeSingle();
+}
+
+// CORS for the Tauri desktop app's on-device bridge. The webview fires a
+// preflight before POSTs that carry `Authorization` + `Content-Type`.
+// Authorization is always by JWT (or webhook secret) on the actual request,
+// so we can answer the preflight permissively.
+const PREFLIGHT_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "authorization, content-type, x-webhook-secret, unipile-auth",
+  "Access-Control-Max-Age": "86400",
+};
+
 Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: PREFLIGHT_HEADERS });
+  }
+  const resp = await handleRequest(req);
+  // Append ACAO to every real response so the browser accepts the body
+  // after a preflight. Harmless for server-to-server (Unipile) callers.
+  resp.headers.set("Access-Control-Allow-Origin", "*");
+  return resp;
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   initLogger("unipile-webhook");
 
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  if (!WEBHOOK_SECRET) {
-    return new Response("Unauthorized — UNIPILE_WEBHOOK_SECRET not configured", { status: 401 });
-  }
+  // Two auth modes:
+  //   1. Unipile cloud webhook     → shared secret in x-webhook-secret / Unipile-Auth
+  //   2. On-device bridge sidecar  → Supabase user JWT in Authorization: Bearer
+  // The two namespaces are disjoint: on_device.* events require JWT, everything
+  // else requires the shared secret. Mixing is rejected.
+  const authzHeader = req.headers.get("authorization") ?? "";
+  const isJwtAuth = /^Bearer\s+/i.test(authzHeader);
 
-  const authHeader =
-    req.headers.get("x-webhook-secret") ??
-    req.headers.get("Unipile-Auth") ??
-    "";
-  if (!await verifyWebhookSecret(authHeader, WEBHOOK_SECRET)) {
-    log.error("Webhook auth failed");
-    return new Response("Unauthorized", { status: 401 });
+  let onDeviceUserId: string | null = null;
+
+  if (isJwtAuth) {
+    const token = authzHeader.replace(/^Bearer\s+/i, "");
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      log.error("On-device JWT auth failed", { error: authError?.message });
+      return new Response("Unauthorized", { status: 401 });
+    }
+    onDeviceUserId = user.id;
+  } else {
+    if (!WEBHOOK_SECRET) {
+      return new Response("Unauthorized — UNIPILE_WEBHOOK_SECRET not configured", { status: 401 });
+    }
+    const secretHeader =
+      req.headers.get("x-webhook-secret") ??
+      req.headers.get("Unipile-Auth") ??
+      "";
+    if (!await verifyWebhookSecret(secretHeader, WEBHOOK_SECRET)) {
+      log.error("Webhook auth failed");
+      return new Response("Unauthorized", { status: 401 });
+    }
   }
 
   let payload: Record<string, unknown>;
@@ -112,6 +174,16 @@ Deno.serve(async (req: Request) => {
   }
 
   const event = payload.event as string;
+  const isOnDeviceEvent = event.startsWith("on_device.");
+
+  // Cross-auth enforcement: on-device events demand JWT, Unipile events demand
+  // the shared secret. A valid token of the wrong type is a 403.
+  if (isOnDeviceEvent && !onDeviceUserId) {
+    return jsonResponse({ ok: false, error: "on_device_requires_jwt" }, 403);
+  }
+  if (!isOnDeviceEvent && onDeviceUserId) {
+    return jsonResponse({ ok: false, error: "unipile_event_requires_webhook_secret" }, 403);
+  }
 
   if (event === "message_received") {
     const check = validateMessageEvent(payload);
@@ -119,9 +191,22 @@ Deno.serve(async (req: Request) => {
   } else if (event === "mail_received" || event === "mail_sent") {
     const check = validateEmailEvent(payload);
     if (!check.valid) return jsonResponse({ ok: false, error: check.error }, 400);
+  } else if (event === "on_device.message_received") {
+    const check = validateOnDeviceMessageEvent(payload);
+    if (!check.valid) return jsonResponse({ ok: false, error: check.error }, 400);
   }
 
   try {
+    if (onDeviceUserId) {
+      switch (event) {
+        case "on_device.message_received":
+          return await handleOnDeviceMessageReceived(payload, onDeviceUserId);
+        default:
+          log.warn("Unhandled on-device event", { event });
+          return jsonResponse({ ok: true, skipped: event });
+      }
+    }
+
     switch (event) {
       case "message_received":
         return await handleMessageReceived(payload);
@@ -158,7 +243,7 @@ Deno.serve(async (req: Request) => {
     log.error("Webhook handler error", { error: String(err) });
     return jsonResponse({ ok: false, error: "internal_error" }, 500);
   }
-});
+}
 
 // ─── MESSAGE RECEIVED ──────────────────────────────────────────────────────
 
@@ -522,6 +607,145 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
   if (GEMINI_API_KEY && payload.message && upserted) {
     extractMessageContext(upserted, payload.message).catch((err) => {
       log.error("Extract failed", { message_id: payload.message_id, error: String(err) });
+    });
+  }
+
+  return response;
+}
+
+// ─── ON-DEVICE MESSAGE RECEIVED ────────────────────────────────────────────
+// Posted by the desktop app's on-device bridge sidecar (e.g. the Meta bridge
+// wrapping messagix for Instagram/Messenger). The sidecar authenticates with
+// the user's Supabase JWT, so `userId` here is trusted — never read the user
+// id from the payload. The payload shape is flat and normalized (not the
+// deeply-nested Unipile webhook shape) because the sidecar has direct access
+// to the underlying protocol and does not need Unipile's attendee-API gymnastics.
+
+interface OnDeviceMessagePayload {
+  event: string;
+  account_id: string;
+  channel: string;
+  external_id: string;
+  thread_id: string;
+  direction: "inbound" | "outbound";
+  sent_at: string;
+  body_text?: string | null;
+  is_group?: boolean;
+  sender?: { handle?: string | null; name?: string | null } | null;
+  other_party: { handle: string; name?: string | null };
+  attachments?: unknown[];
+  reactions?: unknown[];
+  quoted?: { text?: string | null; sender_name?: string | null } | null;
+  provider_id?: string | null;
+}
+
+async function handleOnDeviceMessageReceived(
+  payload: Record<string, unknown>,
+  userId: string,
+): Promise<Response> {
+  const p = payload as unknown as OnDeviceMessagePayload;
+
+  // Dedup by (user_id, external_id) up front — matches the unique index and
+  // keeps retries from the sidecar idempotent.
+  const { data: existing } = await supabase
+    .from("messages")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("external_id", p.external_id)
+    .limit(1)
+    .maybeSingle();
+
+  if (existing) {
+    return jsonResponse({ ok: true, skipped: "already_persisted" });
+  }
+
+  const { data: account } = await resolveOnDeviceAccount(userId, p.account_id);
+  if (!account) {
+    log.error("Unknown on-device account", { user_id: userId, account_id: p.account_id });
+    return jsonResponse({ ok: false, error: "unknown_account" }, 400);
+  }
+
+  // Channel comes from the payload (sidecars can host multiple channels) but
+  // must match the channel the account was connected with — defends against a
+  // malicious/buggy sidecar trying to cross-contaminate channel data.
+  if (account.channel !== p.channel) {
+    log.error("Channel mismatch for on-device account", {
+      account_id: p.account_id,
+      account_channel: account.channel,
+      payload_channel: p.channel,
+    });
+    return jsonResponse({ ok: false, error: "channel_mismatch" }, 400);
+  }
+
+  const isGroup = p.is_group === true;
+  const messageType = isGroup ? "group" : "dm";
+
+  const contactHandle = p.other_party.handle;
+  const contactName = p.other_party.name ?? contactHandle;
+
+  const { personId, identityId } = await findOrCreatePerson(
+    userId,
+    p.channel,
+    contactHandle,
+    contactName,
+    p.account_id,
+    p.direction,
+  );
+
+  const senderName = isGroup
+    ? (p.sender?.name ?? p.sender?.handle ?? "Unknown")
+    : null;
+
+  const { data: upserted, error: msgError } = await supabase.from("messages").upsert(
+    {
+      user_id: userId,
+      person_id: personId,
+      identity_id: identityId,
+      external_id: p.external_id,
+      channel: p.channel,
+      direction: p.direction,
+      message_type: messageType,
+      body_text: p.body_text ?? null,
+      attachments: Array.isArray(p.attachments) ? p.attachments : [],
+      thread_id: p.thread_id,
+      sent_at: p.sent_at,
+      sender_name: senderName,
+      triage: "unclassified",
+      unipile_account_id: p.account_id,
+      reactions: Array.isArray(p.reactions) ? p.reactions : [],
+      quoted_text: p.quoted?.text ?? null,
+      quoted_sender: p.quoted?.sender_name ?? null,
+      provider_id: p.provider_id ?? null,
+    },
+    { onConflict: "user_id,external_id", ignoreDuplicates: false },
+  ).select("id, user_id, person_id, direction, sent_at").single();
+
+  if (msgError) {
+    log.error("On-device insert error", {
+      code: msgError.code,
+      message: msgError.message,
+      details: msgError.details,
+      hint: msgError.hint,
+      external_id: p.external_id,
+      channel: p.channel,
+      user_id: userId,
+    });
+    return jsonResponse(
+      { ok: false, error: "insert_failed", code: msgError.code ?? null },
+      500,
+    );
+  }
+
+  const response = jsonResponse({
+    ok: true,
+    direction: p.direction,
+    channel: p.channel,
+    person_id: personId,
+  });
+
+  if (GEMINI_API_KEY && p.body_text && upserted) {
+    extractMessageContext(upserted, p.body_text).catch((err) => {
+      log.error("On-device extract failed", { external_id: p.external_id, error: String(err) });
     });
   }
 

@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build && bash scripts/build-sidecars.sh"
   },
   "app": {
     "windows": [
@@ -16,7 +16,8 @@
         "width": 1200,
         "height": 800,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {
@@ -32,6 +33,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/meta-bridge"
     ],
     "macOS": {
       "signingIdentity": "Developer ID Application: Plutio LTD (LV436N5433)"

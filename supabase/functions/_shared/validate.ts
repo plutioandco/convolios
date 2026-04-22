@@ -45,6 +45,39 @@ export function validateEmailEvent(payload: Record<string, unknown>): Validation
   return { valid: true };
 }
 
+// Shape posted by the Convolios desktop app's on-device bridge sidecar (e.g.
+// the Meta bridge wrapping mautrix-meta's messagix for Instagram/Messenger).
+// The sidecar authenticates via a Supabase user JWT and emits normalized
+// events in this flat shape — fields mirror the Unipile webhook where
+// possible so downstream persistence logic stays shared.
+export function validateOnDeviceMessageEvent(payload: Record<string, unknown>): ValidationResult {
+  if (!isNonEmptyString(payload.account_id)) {
+    return { valid: false, error: "missing account_id" };
+  }
+  if (!isNonEmptyString(payload.channel)) {
+    return { valid: false, error: "missing channel" };
+  }
+  if (!isNonEmptyString(payload.external_id)) {
+    return { valid: false, error: "missing external_id" };
+  }
+  if (!isNonEmptyString(payload.thread_id)) {
+    return { valid: false, error: "missing thread_id" };
+  }
+  if (payload.direction !== "inbound" && payload.direction !== "outbound") {
+    return { valid: false, error: "direction must be 'inbound' or 'outbound'" };
+  }
+  if (!isNonEmptyString(payload.sent_at)) {
+    return { valid: false, error: "missing sent_at" };
+  }
+  if (!isObject(payload.other_party)) {
+    return { valid: false, error: "missing other_party object" };
+  }
+  if (!isNonEmptyString((payload.other_party as Record<string, unknown>).handle)) {
+    return { valid: false, error: "missing other_party.handle" };
+  }
+  return { valid: true };
+}
+
 export function validateAccountCallbackPayload(payload: unknown): ValidationResult {
   if (!isObject(payload)) {
     return { valid: false, error: "payload must be an object" };

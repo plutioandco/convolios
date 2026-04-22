@@ -52,6 +52,7 @@ export type Channel =
   | 'whatsapp'
   | 'linkedin'
   | 'instagram'
+  | 'messenger'
   | 'telegram'
   | 'email'
   | 'x'

@@ -12,6 +12,7 @@ import { ThreadView } from './components/thread/ThreadView'
 import { Settings } from './components/settings/Settings'
 import { useInboxStore, useFilterStore, viewToRpcParams } from './stores/inboxStore'
 import { useRealtimeMessages } from './hooks/useRealtimeMessages'
+import { useOnDeviceBridge } from './hooks/useOnDeviceBridge'
 import { useConversations } from './hooks/useConversations'
 import { useAuth, signOut } from './lib/auth'
 import { useUpdater } from './hooks/useUpdater'
@@ -38,7 +39,12 @@ const PERSIST_ALLOWED_KEYS = new Set([
 // written under a different buster value.
 const CACHE_BUSTER = 'v10'
 
-const STARTUP_SYNC_INTERVAL_MS = 120_000
+// Window-focus sync trigger threshold. If the window has been idle
+// (unfocused) for longer than this, refocus fires a reconcile — catches
+// the "laptop lid closed overnight, webhook queue may have skipped
+// events" case without hammering on every app-switch. The Rust-side
+// hourly heartbeat handles the long-term sanity net.
+const FOCUS_SYNC_IDLE_THRESHOLD_MS = 2 * 60 * 60 * 1000
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null }
@@ -279,6 +285,7 @@ function SignInScreen() {
 
 function Authenticated({ userId }: { userId: string }) {
   const { connected } = useRealtimeMessages(userId)
+  useOnDeviceBridge(userId)
   const fetchAccounts = useAccountsStore((s) => s.fetchAccounts)
   const subscribe = useAccountsStore((s) => s.subscribe)
   const unsubscribe = useAccountsStore((s) => s.unsubscribe)
@@ -293,7 +300,13 @@ function Authenticated({ userId }: { userId: string }) {
   )
 
   useEffect(() => {
-    const onOnline = () => setOffline(false)
+    const onOnline = () => {
+      setOffline(false)
+      invoke('startup_sync', { userId })
+        .finally(() => {
+          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+        })
+    }
     const onOffline = () => setOffline(true)
     window.addEventListener('online', onOnline)
     window.addEventListener('offline', onOffline)
@@ -301,7 +314,7 @@ function Authenticated({ userId }: { userId: string }) {
       window.removeEventListener('online', onOnline)
       window.removeEventListener('offline', onOffline)
     }
-  }, [])
+  }, [userId])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -314,6 +327,8 @@ function Authenticated({ userId }: { userId: string }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const lastBlurMsRef = useRef<number | null>(null)
+
   useEffect(() => {
     fetchAccounts(userId)
     subscribe(userId)
@@ -325,8 +340,28 @@ function Authenticated({ userId }: { userId: string }) {
         })
     }
 
+    // Cold start: one reconcile on mount.
     runSync()
-    const syncInterval = setInterval(runSync, STARTUP_SYNC_INTERVAL_MS)
+
+    // Sync heartbeat lives in Rust (tokio interval, immune to WKWebView
+    // throttling). Start it once; the Rust side de-dups across re-mounts.
+    invoke('start_sync_heartbeat', { userId }).catch((e) => {
+      if (import.meta.env.DEV) console.warn('[start_sync_heartbeat]', e)
+    })
+
+    // Focus-after-idle trigger. If the window has been backgrounded
+    // longer than the threshold, reconcile on refocus — catches the
+    // "lid closed overnight" case without pinging on every app-switch.
+    const onBlur = () => { lastBlurMsRef.current = Date.now() }
+    const onFocus = () => {
+      const last = lastBlurMsRef.current
+      lastBlurMsRef.current = null
+      if (last !== null && Date.now() - last >= FOCUS_SYNC_IDLE_THRESHOLD_MS) {
+        runSync()
+      }
+    }
+    window.addEventListener('blur', onBlur)
+    window.addEventListener('focus', onFocus)
 
     const unlistenDisconnect = listen<{ accountId?: string; channel?: string }>('account-disconnected', () => {
       queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
@@ -342,6 +377,7 @@ function Authenticated({ userId }: { userId: string }) {
       phase: 'syncing' | 'idle'
       detail?: string
       account?: { idx: number; total: number; channel: Channel }
+      chat?: { idx: number; total: number }
     }>('sync-status', (e) => {
       const store = useSyncStatusStore.getState()
       if (e.payload.phase === 'idle') {
@@ -351,6 +387,7 @@ function Authenticated({ userId }: { userId: string }) {
           phase: 'syncing',
           detail: _.isString(e.payload.detail) ? e.payload.detail : null,
           account: e.payload.account ?? null,
+          chat: e.payload.chat ?? null,
         })
       }
     })
@@ -363,7 +400,8 @@ function Authenticated({ userId }: { userId: string }) {
     // macOS default behaviour.
 
     return () => {
-      clearInterval(syncInterval)
+      window.removeEventListener('blur', onBlur)
+      window.removeEventListener('focus', onFocus)
       unsubscribe()
       unlistenDisconnect.then((fn) => fn())
       unlistenSync.then((fn) => fn())
@@ -373,19 +411,23 @@ function Authenticated({ userId }: { userId: string }) {
   return (
     <RealtimeContext.Provider value={connected}>
     <div className="app-shell">
-      {offline && (
+      {/* Single status row with strict priority — mirrors Slack/WhatsApp Web.
+          Only ever one of these renders at a time. `disconnectedAccounts` below
+          is a persistent action-required alert (not a transient status) and
+          therefore stays separate. */}
+      {offline ? (
         <div className="app-banner app-banner--danger">
           <WifiOff size={14} />
           <span>You are offline — messages will sync when reconnected</span>
         </div>
-      )}
-      {!offline && !connected && (
+      ) : !connected ? (
         <div className="app-banner app-banner--warning app-banner--connecting">
           <span className="pulse-dot w-1.5 h-1.5 rounded-full bg-black" />
           <span className="text-sm">Connecting...</span>
         </div>
+      ) : (
+        <SyncBanner />
       )}
-      <SyncBanner />
       {disconnectedAccounts.length > 0 && (
         <div className="app-banner app-banner--warning-subtle">
           <AlertTriangle size={13} />
@@ -536,15 +578,21 @@ function SyncBanner() {
   const phase = useSyncStatusStore((s) => s.phase)
   const detail = useSyncStatusStore((s) => s.detail)
   const account = useSyncStatusStore((s) => s.account)
+  const chat = useSyncStatusStore((s) => s.chat)
 
   if (phase !== 'syncing') return null
 
-  // Prefer structured account progress when available ("Syncing WhatsApp (3 of 9)");
-  // fall back to the raw phase detail for the pre-loop phases (fetching
-  // accounts, webhooks, iMessage/X backfill, avatar refresh).
-  const label = account
-    ? `Syncing ${channelLabel(account.channel)} (${account.idx} of ${account.total})`
-    : detail ?? 'Syncing…'
+  // Prefer structured account + chat progress when available
+  // ("Syncing WhatsApp (3/9) · 17/52 chats"); fall back to the raw phase
+  // detail for the pre-loop phases (fetching accounts, webhooks, iMessage/X
+  // backfill, avatar refresh).
+  let label: string
+  if (account) {
+    label = `Syncing ${channelLabel(account.channel)} (${account.idx}/${account.total})`
+    if (chat) label += ` · ${chat.idx}/${chat.total} chats`
+  } else {
+    label = detail ?? 'Syncing…'
+  }
 
   return (
     <div className="app-banner app-banner--warning-subtle app-banner--sync">

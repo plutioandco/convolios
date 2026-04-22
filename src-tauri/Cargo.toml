@@ -39,4 +39,21 @@ tauri-plugin-notification = "2.3.3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 aes-gcm = "0.10.3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "net", "io-util", "process", "macros", "sync", "rt-multi-thread"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+parking_lot = "0.12"
+regex = "1"
+# wry re-exports `Cookie` but we touch it directly for its `Display` impl and
+# ergonomic field accessors during the on-device login cookie grab.
+cookie = "0.18"
+
+# macOS-only: on-device login webview cookie extraction bridges directly to
+# WKHTTPCookieStore via objc2. Versions pinned to what Tauri already uses
+# transitively so we share one copy.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL", "NSHTTPCookie"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKHTTPCookieStore"] }
+block2 = "0.6"

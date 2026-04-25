@@ -1,13 +1,13 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Convolios",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "identifier": "com.plutioandco.convolios",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && bash scripts/build-sidecars.sh"
+    "beforeBuildCommand": "npm run build && bash src-tauri/scripts/build-sidecars.sh"
   },
   "app": {
     "windows": [

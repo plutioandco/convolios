@@ -9,48 +9,32 @@
 //! tolerance (can reply to a flurry of DMs after hours of silence) while
 //! sustained throughput is still capped at the daily average.
 //!
-//! ## Why token bucket (not sliding window)
-//! Industry standard for per-account outbound quotas: O(1) memory per
-//! account (two `f64`s + one `Instant`), burst-friendly, matches
-//! "10/hr, 100/day" semantics directly via refill rate. See:
-//!   - https://blog.arcjet.com/rate-limiting-algorithms-token-bucket-vs-sliding-window-vs-fixed-window/
-//!   - https://redis.io/tutorials/howtos/ratelimiting/
-//!
-//! ## Warm-up tiering
-//! Unipile explicitly recommends gradual ramp-up on fresh accounts
-//! ("start with low activity levels and gradually increase"). We scale
-//! caps by session age:
-//!   - 0–24h (Fresh):   30% of base — user sends still allowed (human
-//!                      action is legitimate) but gated to prevent an
-//!                      enthusiastic onboarding burst on a brand-new session.
-//!   - 24–72h (Warming): 30% of base — same caps, gives the account
-//!                       another 48h to look "organic" before full throughput.
-//!   - 72h+ (Normal):   full Unipile caps.
-//!
-//! ## State lifetime
-//! In-memory only — resets on app restart. For the hourly window this is
-//! fine; the daily cap becomes slightly lenient across restarts. Unipile's
-//! caps are recommendations (not enforced by Instagram), so this is
-//! acceptable.
+//! ## Warm-up scaling (7-day curve)
+//! Unipile: start low and gradually increase. We use a step curve by
+//! session age (Unipile `account.created_at`) instead of 72h on/off clifs:
+//!   0–24h → 30% | 24–72h → 50% | 72–120h → 75% | 120–168h → 90% | 7d+ → 100%
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WarmupTier {
-  Fresh,
-  Warming,
-  Normal,
-}
+/// Multiplier 0.3..=1.0 for Unipile's published (hour, day) caps.
+/// Outside tests, use `warmup_send_scale_from_age_hours` only.
+pub type WarmupScale = f64;
 
-pub fn warmup_tier_from_age_hours(age_hours: i64) -> WarmupTier {
+/// Gradual 7-day ramp. Values align with "warm up over days" in Unipile
+/// provider docs (WhatsApp / Instagram sections).
+pub fn warmup_send_scale_from_age_hours(age_hours: i64) -> f64 {
   if age_hours < 24 {
-    WarmupTier::Fresh
+    0.3
   } else if age_hours < 72 {
-    WarmupTier::Warming
+    0.5
+  } else if age_hours < 120 {
+    0.75
+  } else if age_hours < 168 {
+    0.9
   } else {
-    WarmupTier::Normal
+    1.0
   }
 }
 
@@ -101,21 +85,14 @@ impl SendLimiter {
     }
   }
 
-  /// Check and atomically consume one token from both hourly and daily
-  /// buckets for the given (account_id, channel). On over-quota, returns
-  /// a stable error code ("rate_limit:<channel>:hourly" or ":daily") that
-  /// the frontend maps to a user-facing message.
-  ///
-  /// Channels with no Unipile-published caps (X DMs, iMessage, email)
-  /// pass through without limiting — different providers have different
-  /// rules and we don't enforce a made-up one.
+  /// `warmup_scale` is 0.3..1.0 from `warmup_send_scale_from_age_hours`.
   pub fn check_and_consume(
     &self,
     account_id: &str,
     channel: &str,
-    tier: WarmupTier,
+    warmup_scale: f64,
   ) -> Result<(), String> {
-    let Some((hr_cap, day_cap)) = channel_caps(channel, tier) else {
+    let Some((hr_cap, day_cap)) = channel_caps(channel, warmup_scale) else {
       return Ok(());
     };
 
@@ -152,20 +129,17 @@ impl SendLimiter {
   }
 }
 
-/// Per-channel (hourly, daily) caps from Unipile docs, scaled by warm-up tier.
-/// Fresh and Warming tiers share the same 30% throttle to keep the first 72h
-/// safe for session reputation. Channels not listed here return None (no cap).
-fn channel_caps(channel: &str, tier: WarmupTier) -> Option<(u32, u32)> {
+/// Per-channel (hourly, daily) caps from Unipile docs, scaled by
+/// `warmup_scale` (0.3–1.0 from the 7-day session ramp). Channels with no
+/// Unipile-published caps return None (no limit).
+fn channel_caps(channel: &str, warmup_scale: f64) -> Option<(u32, u32)> {
   let base: (u32, u32) = match channel {
     "instagram" => (10, 100),
     "whatsapp" => (20, 200),
     "linkedin" => (10, 80),
     _ => return None,
   };
-  let scale = match tier {
-    WarmupTier::Fresh | WarmupTier::Warming => 0.3,
-    WarmupTier::Normal => 1.0,
-  };
+  let scale = warmup_scale.clamp(0.05, 1.0);
   let hr = ((base.0 as f64) * scale).ceil().max(1.0) as u32;
   let day = ((base.1 as f64) * scale).ceil().max(1.0) as u32;
   Some((hr, day))
@@ -179,36 +153,34 @@ mod tests {
   fn instagram_hourly_blocks_at_11() {
     let l = SendLimiter::new();
     for _ in 0..10 {
-      l.check_and_consume("acc1", "instagram", WarmupTier::Normal).unwrap();
+      l.check_and_consume("acc1", "instagram", 1.0).unwrap();
     }
-    let err = l.check_and_consume("acc1", "instagram", WarmupTier::Normal).unwrap_err();
+    let err = l.check_and_consume("acc1", "instagram", 1.0).unwrap_err();
     assert_eq!(err, "rate_limit:instagram:hourly");
   }
 
   #[test]
-  fn warming_tier_caps_at_3_per_hour() {
+  fn scale_point_five_caps_instagram_hourly() {
     let l = SendLimiter::new();
-    for _ in 0..3 {
-      l.check_and_consume("acc1", "instagram", WarmupTier::Warming).unwrap();
+    for _ in 0..5 {
+      l.check_and_consume("acc1", "instagram", 0.5).unwrap();
     }
-    assert!(l.check_and_consume("acc1", "instagram", WarmupTier::Warming).is_err());
+    assert!(l.check_and_consume("acc1", "instagram", 0.5).is_err());
   }
 
   #[test]
   fn unlimited_channels_pass_through() {
     let l = SendLimiter::new();
     for _ in 0..1000 {
-      l.check_and_consume("acc1", "x", WarmupTier::Normal).unwrap();
+      l.check_and_consume("acc1", "x", 0.3).unwrap();
     }
   }
 
   #[test]
-  fn tier_age_thresholds() {
-    assert_eq!(warmup_tier_from_age_hours(0), WarmupTier::Fresh);
-    assert_eq!(warmup_tier_from_age_hours(23), WarmupTier::Fresh);
-    assert_eq!(warmup_tier_from_age_hours(24), WarmupTier::Warming);
-    assert_eq!(warmup_tier_from_age_hours(71), WarmupTier::Warming);
-    assert_eq!(warmup_tier_from_age_hours(72), WarmupTier::Normal);
-    assert_eq!(warmup_tier_from_age_hours(1000), WarmupTier::Normal);
+  fn age_scale_boundaries() {
+    assert!((warmup_send_scale_from_age_hours(0) - 0.3).abs() < f64::EPSILON);
+    assert!((warmup_send_scale_from_age_hours(30) - 0.5).abs() < f64::EPSILON);
+    assert!((warmup_send_scale_from_age_hours(100) - 0.75).abs() < 0.01);
+    assert!((warmup_send_scale_from_age_hours(200) - 1.0).abs() < f64::EPSILON);
   }
 }

@@ -9,6 +9,8 @@ import type { ConversationPreview, Message, ThreadState } from '../types'
 import type { Channel, TriageLevel } from '../types'
 import { usePreferencesStore } from './preferencesStore'
 
+let pendingReadTimer: ReturnType<typeof setTimeout> | null = null
+
 export type ActiveView =
   | 'all'
   | 'my_turn'
@@ -40,6 +42,9 @@ interface InboxState {
   activeView: ActiveView
   activeCircleId: string | null
   readFilter: 'all' | 'unread'
+  /** Unipile `thread_id` for the selected conversation (Rust sync hint). */
+  openUnipileThreadId: string | null
+  setOpenUnipileThreadId: (id: string | null) => void
 
   setActiveChannel: (channel: Channel | 'all') => void
   setActiveView: (view: ActiveView) => void
@@ -59,6 +64,8 @@ export const useInboxStore = create<InboxState>((set) => ({
   activeView: 'all',
   activeCircleId: null,
   readFilter: 'all',
+  openUnipileThreadId: null,
+  setOpenUnipileThreadId: (openUnipileThreadId) => set({ openUnipileThreadId }),
 
   setActiveChannel: (channel) => set({ activeChannel: channel }),
   setActiveView: (activeView) => set({ activeView }),
@@ -91,12 +98,11 @@ export const useInboxStore = create<InboxState>((set) => ({
     if (usePreferencesStore.getState().syncReadStatus) {
       // Length-based mark_read delay. Firing `seen` on Unipile
       // milliseconds after the thread opens is one of the strongest
-      // automation tells on IG/WA — real users take at least a second
-      // or two to read even a short message. Derive the delay from
-      // the last inbound message length so a one-liner gets ~1.5s and
-      // a long paragraph gets several. Fire-and-forget: UI stays
-      // optimistically-read immediately; only the provider-side
-      // `seen` is delayed.
+      // automation tells on IG/WA — real users need at least a few seconds.
+      if (pendingReadTimer !== null) {
+        clearTimeout(pendingReadTimer)
+        pendingReadTimer = null
+      }
       const convs = queryClient.getQueryData<ConversationPreview[]>(['conversations', userId])
         ?? queryClient.getQueriesData<ConversationPreview[]>({ queryKey: ['conversations', userId] })
           .flatMap(([, v]) => v ?? [])
@@ -104,8 +110,11 @@ export const useInboxStore = create<InboxState>((set) => ({
       const charLen = preview?.lastMessage?.body_text?.length ?? 0
       const perCharMs = 40 + Math.floor(Math.random() * 20)
       const jitterMs = Math.floor((Math.random() - 0.5) * 800)
-      const delayMs = _.clamp(1000 + charLen * perCharMs + jitterMs, 1500, 15000)
-      setTimeout(() => {
+      const delayMs = _.clamp(2000 + charLen * perCharMs + jitterMs, 3000, 15000)
+      pendingReadTimer = setTimeout(() => {
+        pendingReadTimer = null
+        if (document.visibilityState !== 'visible' || !document.hasFocus()) return
+        if (useInboxStore.getState().selectedPersonId !== personId) return
         invoke('chat_action', {
           userId, personId,
           action: 'mark_read',

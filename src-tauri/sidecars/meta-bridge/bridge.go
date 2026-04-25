@@ -47,6 +47,20 @@ type session struct {
 	// lastCookieSnapshot is compared against the live jar to detect rotation;
 	// we only emit cookies_updated when the map actually changes.
 	lastCookieSnapshot map[string]string
+	// initialTable holds the LSTable from LoadMessagesPage. Processed once
+	// in BeginEvents (after the Rust side has set user_id) to avoid
+	// emitting messages before the webhook has a valid user_id.
+	initialTable *table.LSTable
+	// knownContacts tracks Meta contact IDs (friends / people in the user's
+	// address book) across every LSTable we see. A message whose other-party
+	// handle matches an entry here is emitted with is_known_contact=true,
+	// which tells the webhook to auto-approve the person instead of
+	// parking them in the Gate.
+	knownContactsMu sync.Mutex
+	knownContacts   map[int64]struct{}
+	// backfillRunning prevents overlapping runFullInboxSync passes when
+	// Meta fires several Ready events in quick succession.
+	backfillRunning atomic.Bool
 }
 
 func NewBridge() *Bridge {
@@ -166,12 +180,10 @@ func (b *Bridge) Login(ctx context.Context, p loginParams) (any, *rpcErr) {
 		client:             client,
 		cookies:            jar,
 		lastCookieSnapshot: cookieMapOut(jar),
+		initialTable:       initialTable,
+		knownContacts: make(map[int64]struct{}),
 	}
 	b.install(sess)
-
-	if initialTable != nil {
-		b.processLSTable(sess, initialTable)
-	}
 
 	return LoginResult{
 		Status:      "success",
@@ -225,12 +237,10 @@ func (b *Bridge) Resume(ctx context.Context, p resumeParams) (any, *rpcErr) {
 		client:             client,
 		cookies:            jar,
 		lastCookieSnapshot: cookieMapOut(jar),
+		initialTable:       initialTable,
+		knownContacts: make(map[int64]struct{}),
 	}
 	b.install(sess)
-
-	if initialTable != nil {
-		b.processLSTable(sess, initialTable)
-	}
 
 	return map[string]any{"status": "resumed"}, nil
 }
@@ -285,6 +295,11 @@ func (b *Bridge) BeginEvents(ctx context.Context, p beginEventsParams) (any, *rp
 
 	b.eventRunning.Store(true)
 
+	b.logger.Info().
+		Str("account_id", sess.accountID).
+		Bool("has_initial_table", sess.initialTable != nil).
+		Msg("BeginEvents: starting")
+
 	b.notify("event", map[string]any{
 		"type":       "account_status",
 		"account_id": sess.accountID,
@@ -292,8 +307,143 @@ func (b *Bridge) BeginEvents(ctx context.Context, p beginEventsParams) (any, *rp
 		"payload":    map[string]any{"status": "connected"},
 	})
 
+	if sess.initialTable != nil {
+		b.processLSTable(sess, sess.initialTable)
+		sess.initialTable = nil
+	}
+
+	// Thread backfill is kicked off from the Event_Ready handler, where we
+	// know the MQTT socket is connected. Starting it here would race
+	// Connect() and return "not connected" from messagix.
+
 	go b.runEventLoop(sess, stopCh)
 	return map[string]any{"status": "started"}, nil
+}
+
+// runFullInboxSync paginates every Meta inbox slice we know about. Primary
+// DMs live in SyncGroup 1; secondary surfaces (message requests, filtered
+// threads, etc.) use SyncGroup 95 — same KeyStore machinery as
+// mautrix-meta's SyncManager. Both paths must run or the phone shows
+// threads Convolios never receives.
+func (b *Bridge) runFullInboxSync(sess *session, stopCh <-chan struct{}) {
+	b.runThreadBackfillForGroup(sess, stopCh, 1)
+
+	// SyncGroup 95 is the secondary Messenger inbox (requests, filtered, …).
+	// Instagram does not use this slice — skip the wait entirely.
+	if !sess.platform.IsMessenger() {
+		return
+	}
+
+	// KeyStore for 95 is populated asynchronously via MQTT after Connect.
+	// Poll until Meta sets HasMoreBefore or we time out (no secondary pages).
+	if b.waitSyncGroupReady(sess, stopCh, 95, 18, 200*time.Millisecond) {
+		b.runThreadBackfillForGroup(sess, stopCh, 95)
+	}
+}
+
+// waitSyncGroupReady blocks until keyStore[sg].HasMoreBefore becomes true,
+// stopCh fires, or maxAttempts intervals elapse.
+func (b *Bridge) waitSyncGroupReady(sess *session, stopCh <-chan struct{}, syncGroup int64, maxAttempts int, interval time.Duration) bool {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-stopCh:
+			return false
+		default:
+		}
+		ks := sess.client.GetSyncGroupKeyStore(syncGroup)
+		if ks != nil && ks.HasMoreBefore {
+			b.logger.Info().
+				Str("account_id", sess.accountID).
+				Int64("sync_group", syncGroup).
+				Int("attempt", attempt+1).
+				Msg("sync group ready for thread backfill")
+			return true
+		}
+		select {
+		case <-stopCh:
+			return false
+		case <-time.After(interval):
+		}
+	}
+	b.logger.Debug().
+		Str("account_id", sess.accountID).
+		Int64("sync_group", syncGroup).
+		Msg("sync group never advertised more pages — skipping backfill for this group")
+	return false
+}
+
+// runThreadBackfillForGroup paginates one sync group's thread list until
+// Meta reports no further pages. Each LSTable is fed through processLSTable.
+//
+// Bail-out mirrors mautrix-meta: HasMoreBefore=false, an empty table, or
+// a MinThreadKey that did not change since the previous batch. Batch cap
+// is a safety net for pathological accounts.
+func (b *Bridge) runThreadBackfillForGroup(sess *session, stopCh <-chan struct{}, syncGroup int64) {
+	const (
+		maxBatches = 100
+		batchDelay = 250 * time.Millisecond
+	)
+
+	ctx := context.Background()
+	var prevMinThreadKey int64
+
+	for batch := 0; batch < maxBatches; batch++ {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+
+		keyStore, tbl, err := sess.client.FetchMoreThreads(ctx, syncGroup)
+		if err != nil {
+			b.logger.Warn().Err(err).
+				Str("account_id", sess.accountID).
+				Int64("sync_group", syncGroup).
+				Int("batch", batch).
+				Msg("thread backfill: FetchMoreThreads failed")
+			return
+		}
+		if tbl == nil {
+			b.logger.Info().
+				Str("account_id", sess.accountID).
+				Int64("sync_group", syncGroup).
+				Int("batches_processed", batch).
+				Msg("thread backfill complete (no more threads)")
+			return
+		}
+
+		b.processLSTable(sess, tbl)
+
+		if keyStore == nil || !keyStore.HasMoreBefore {
+			b.logger.Info().
+				Str("account_id", sess.accountID).
+				Int64("sync_group", syncGroup).
+				Int("batches_processed", batch+1).
+				Msg("thread backfill complete (has_more_before=false)")
+			return
+		}
+		if keyStore.MinThreadKey == prevMinThreadKey {
+			b.logger.Info().
+				Str("account_id", sess.accountID).
+				Int64("sync_group", syncGroup).
+				Int("batches_processed", batch+1).
+				Msg("thread backfill complete (cursor did not advance)")
+			return
+		}
+		prevMinThreadKey = keyStore.MinThreadKey
+
+		select {
+		case <-stopCh:
+			return
+		case <-time.After(batchDelay):
+		}
+	}
+
+	b.logger.Info().
+		Str("account_id", sess.accountID).
+		Int64("sync_group", syncGroup).
+		Int("batches_processed", maxBatches).
+		Msg("thread backfill: hit batch cap")
 }
 
 func (b *Bridge) runEventLoop(sess *session, stopCh <-chan struct{}) {
@@ -337,6 +487,15 @@ func (b *Bridge) handleMessagixEvent(sess *session, rawEvt any) {
 
 	case *messagix.Event_Ready:
 		b.logger.Info().Str("account_id", sess.accountID).Msg("MQTT ready")
+		// Paginate every inbox sync group (1 + 95). Each reconnect gets a
+		// fresh pass so threads that landed while offline are not skipped.
+		if sess.backfillRunning.CompareAndSwap(false, true) {
+			stopCh := b.currentStopCh()
+			go func() {
+				defer sess.backfillRunning.Store(false)
+				b.runFullInboxSync(sess, stopCh)
+			}()
+		}
 
 	case *messagix.Event_Reconnected:
 		b.logger.Info().Str("account_id", sess.accountID).Msg("MQTT reconnected")
@@ -367,6 +526,15 @@ func (b *Bridge) handleMessagixEvent(sess *session, rawEvt any) {
 	}
 }
 
+// currentStopCh returns the active session's stop channel under the bridge
+// lock. Consumed by goroutines that need to abort when the session is
+// torn down (shutdown, reinstall, disconnect).
+func (b *Bridge) currentStopCh() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.eventStopCh
+}
+
 func (b *Bridge) maybeSendCookieUpdate(sess *session) {
 	current := cookieMapOut(sess.cookies)
 	if maps.Equal(current, sess.lastCookieSnapshot) {
@@ -385,11 +553,20 @@ func (b *Bridge) processLSTable(sess *session, tbl *table.LSTable) {
 	selfID := sess.cookies.GetUserID()
 
 	b.maybeSendCookieUpdate(sess)
+	b.recordKnownContacts(sess, tbl)
 
 	upsertGroups, insertMsgs := tbl.WrapMessages()
+
+	totalMsgs := len(insertMsgs)
+	for _, g := range upsertGroups {
+		totalMsgs += len(g.Messages)
+	}
+
 	b.logger.Info().
 		Int("upsert_groups", len(upsertGroups)).
+		Int("upsert_msgs", totalMsgs-len(insertMsgs)).
 		Int("insert_msgs", len(insertMsgs)).
+		Int("total_msgs", totalMsgs).
 		Int("threads", len(tbl.LSDeleteThenInsertThread)).
 		Int("contacts", len(tbl.LSDeleteThenInsertContact)).
 		Int64("self_id", selfID).
@@ -449,15 +626,29 @@ func (b *Bridge) emitMessage(sess *session, msg *table.WrappedMessage, selfID in
 
 	otherParty := resolveOtherParty(msg.SenderId, selfID, msg.ThreadKey, isGroup, tbl)
 
+	// Known = person appears in the user's Meta contact list. 1:1 DMs with a
+	// known contact bypass the Gate (they're already someone the user talks
+	// with). Group threads stay neutral — group-level approval is a
+	// separate UX decision.
+	isKnownContact := false
+	if !isGroup {
+		if id, ok := otherParty["handle"].(string); ok {
+			if n, err := strconv.ParseInt(id, 10, 64); err == nil {
+				isKnownContact = b.isKnownContact(sess, n)
+			}
+		}
+	}
+
 	payload := map[string]any{
-		"external_id": msg.MessageId,
-		"thread_id":   threadID,
-		"direction":   direction,
-		"body_text":   msg.Text,
-		"sent_at":     time.UnixMilli(msg.TimestampMs).UTC().Format(time.RFC3339),
-		"is_group":    isGroup,
-		"other_party": otherParty,
-		"provider_id": msg.MessageId,
+		"external_id":      msg.MessageId,
+		"thread_id":        threadID,
+		"direction":        direction,
+		"body_text":        msg.Text,
+		"sent_at":          time.UnixMilli(msg.TimestampMs).UTC().Format(time.RFC3339),
+		"is_group":         isGroup,
+		"other_party":      otherParty,
+		"provider_id":      msg.MessageId,
+		"is_known_contact": isKnownContact,
 	}
 
 	if msg.ReplySourceId != "" && msg.ReplyMessageText != "" {
@@ -472,6 +663,36 @@ func (b *Bridge) emitMessage(sess *session, msg *table.WrappedMessage, selfID in
 		"channel":    sess.channel,
 		"payload":    payload,
 	})
+}
+
+// recordKnownContacts merges every contact ID Meta tells us about into the
+// session's known-contact set. LSDeleteThenInsertContact is the user's Meta
+// contact / friends list (our gold signal). LSVerifyContactRowExists
+// contains contacts referenced by threads — still a strong signal since
+// it only shows up for people the user already has a thread with.
+func (b *Bridge) recordKnownContacts(sess *session, tbl *table.LSTable) {
+	if len(tbl.LSDeleteThenInsertContact) == 0 && len(tbl.LSVerifyContactRowExists) == 0 {
+		return
+	}
+	sess.knownContactsMu.Lock()
+	defer sess.knownContactsMu.Unlock()
+	for _, c := range tbl.LSDeleteThenInsertContact {
+		if c.Id != 0 {
+			sess.knownContacts[c.Id] = struct{}{}
+		}
+	}
+	for _, c := range tbl.LSVerifyContactRowExists {
+		if c.ContactId != 0 {
+			sess.knownContacts[c.ContactId] = struct{}{}
+		}
+	}
+}
+
+func (b *Bridge) isKnownContact(sess *session, id int64) bool {
+	sess.knownContactsMu.Lock()
+	defer sess.knownContactsMu.Unlock()
+	_, ok := sess.knownContacts[id]
+	return ok
 }
 
 func resolveOtherParty(senderID, selfID, threadKey int64, isGroup bool, tbl *table.LSTable) map[string]any {
@@ -527,7 +748,7 @@ func (b *Bridge) SendMessage(ctx context.Context, p sendParams) (any, *rpcErr) {
 		return nil, invalidParams(errors.New("thread_id and text required"))
 	}
 
-	// TODO(t8): sess.client.ExecuteTasks(ctx, &socket.SendMessageTask{...})
+	// TODO(t8): ExecuteTasks with messagix/socket.SendMessageTask
 	return nil, internalError(fmt.Errorf("send_message for %s not yet implemented (step t8)", sess.channel))
 }
 

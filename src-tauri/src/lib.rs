@@ -1,13 +1,14 @@
+use chrono::Timelike;
 use rand::Rng;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 
 mod on_device;
 mod send_limiter;
 
-use send_limiter::{warmup_tier_from_age_hours, SendLimiter, WarmupTier};
+use send_limiter::{warmup_send_scale_from_age_hours, SendLimiter, WarmupScale};
 
 macro_rules! dev_log {
   ($($arg:tt)*) => {
@@ -21,28 +22,68 @@ macro_rules! err_log {
   };
 }
 
+struct SyncLiveness {
+  /// From `document.visibilityState` + tauri `focus` / `blur` proxy.
+  window_visible: bool,
+  /// Bumped on pointer, key, scroll, visibility.
+  last_user_activity: chrono::DateTime<chrono::Utc>,
+  /// Unipile `thread_id` / `chat_id` for the open thread (when any).
+  open_chat_id: Option<String>,
+}
+
+impl Default for SyncLiveness {
+  fn default() -> Self {
+    Self {
+      window_visible: true,
+      last_user_activity: chrono::Utc::now(),
+      open_chat_id: None,
+    }
+  }
+}
+
 struct AppState {
   http: reqwest::Client,
   /// Coalesces concurrent `startup_sync` invocations (heartbeat tick +
   /// network-reconnect trigger + focus-after-idle trigger can all race).
   syncing: AtomicBool,
-  /// X DM + iMessage providers don't emit Unipile webhooks, so their
-  /// backfill was running on every 2-min `startup_sync` tick. Gate each
-  /// to once per process launch; webhooks (Unipile) or provider-native
-  /// cursors (X, iMessage SQLite bridge) cover subsequent updates.
+  /// X DM providers don't emit Unipile webhooks, so X backfill was running
+  /// on every 2-min `startup_sync` tick. Gate to once per process launch;
+  /// webhooks (Unipile) cover subsequent updates. iMessage uses the same
+  /// gate for the *initial* heavy pull in `startup_sync_inner`; ongoing
+  /// macOS `chat.db` sync is handled by `spawn_imessage_watcher`.
   backfilled_x: AtomicBool,
   backfilled_imessage: AtomicBool,
   /// Ensures `start_sync_heartbeat` spawns the tokio interval task at
   /// most once across the app's lifetime, even if the frontend re-mounts.
   heartbeat_started: AtomicBool,
+  /// `ensure_webhooks` once per process — not every heartbeat.
+  webhooks_ensured_this_launch: AtomicBool,
+  /// Avatar catch-up: full scan at most once per process.
+  avatar_catchup_once_per_launch: AtomicBool,
+  /// `chat_id` → (attendee `items` json, `Instant` fetched at); 24h TTL.
+  chat_attendees_cache: parking_lot::Mutex<std::collections::HashMap<String, (Vec<serde_json::Value>, std::time::Instant)>>,
+  /// `account_id` → pause `Utc` (HTTP 403 / `account_restricted` cool-down).
+  unipile_account_paused_until: parking_lot::Mutex<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+  /// Drives "heartbeat only when the user is present" (no hidden AFK).
+  sync_liveness: parking_lot::RwLock<SyncLiveness>,
   /// Cache of per-Unipile-account session creation time, populated during
   /// `startup_sync_inner`. Read from `send_message` / `send_attachment`
-  /// to compute the warm-up tier without a Supabase round-trip on the
-  /// send hot path.
+  /// to compute the 7-day warm-up scale.
   account_ages: parking_lot::RwLock<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
   /// Token-bucket rate limiter for outbound sends per Unipile's
   /// provider-limits guidance.
   limiter: SendLimiter,
+  /// Currently signed-in user id, refreshed by every `start_sync_heartbeat`
+  /// call. The heartbeat and iMessage watcher tasks run once per process,
+  /// so they must re-read this each iteration to survive sign-out / user
+  /// switches without writing to the wrong user's rows.
+  active_user_id: parking_lot::RwLock<Option<String>>,
+  /// Highest `message.ROWID` seen in `~/Library/Messages/chat.db` by the
+  /// iMessage watcher. Lets us skip both the SQLite scan and the Supabase
+  /// upsert when nothing has advanced, and — crucially — only emit the
+  /// `imessage-synced` event when there is a *real* delta. `i64::MIN` is
+  /// the unset sentinel; any valid rowid is > 0.
+  imessage_last_rowid: AtomicI64,
 }
 
 /// Hourly heartbeat reconciliation, base interval.
@@ -57,6 +98,14 @@ struct AppState {
 /// is the sanity net that catches silently-dropped Unipile webhooks.
 const SYNC_HEARTBEAT_BASE_SECS: u64 = 3600;
 const SYNC_HEARTBEAT_JITTER_PCT: u32 = 20;
+
+/// macOS-only: poll `~/Library/Messages/chat.db` while iMessage is connected.
+/// Read-only SQLite on the same machine — separate from the hourly Unipile
+/// heartbeat (which intentionally avoids tight remote polling).
+const IMESSAGE_POLL_BASE_SECS: u64 = 90;
+const IMESSAGE_POLL_JITTER_PCT: u32 = 10;
+/// Delay before the first `chat.db` poll so cold `startup_sync` can finish.
+const IMESSAGE_WATCHER_STAGGER_SECS: u64 = 20;
 
 /// Skip the per-chat message pull when the most recent message is newer
 /// than this — the webhook already covered it, and the 2h self-heal
@@ -80,19 +129,60 @@ fn parse_unipile_created_at(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
-/// Look up an account's warm-up tier from the `account_ages` cache
-/// populated during `startup_sync_inner`. Missing entries default to
-/// Fresh — conservative, since sending on an account we haven't seen
-/// yet is more likely a freshly-connected session than a veteran.
-fn warmup_tier_for(state: &AppState, account_id: &str) -> WarmupTier {
+/// 7-day ramp: send scale from `account_ages` (missing → 30% fresh).
+fn warmup_scale_for(state: &AppState, account_id: &str) -> WarmupScale {
   let connected_at = state.account_ages.read().get(account_id).copied();
   match connected_at {
     Some(dt) => {
       let age_hours = chrono::Utc::now().signed_duration_since(dt).num_hours();
-      warmup_tier_from_age_hours(age_hours)
+      warmup_send_scale_from_age_hours(age_hours)
     }
-    None => WarmupTier::Fresh,
+    None => 0.3,
   }
+}
+
+const SYNC_IDLE_MAX_SECS: i64 = 10 * 60;
+const QUIET_HOURS_LOCAL: std::ops::Range<u32> = 2..6;
+const QUIET_HOURS_MAX_IDLE_SECS: i64 = 5 * 60;
+
+/// Hourly `startup_sync` tick only if the app is focused and the user
+/// is not AFK, with extra idle limits during local 02:00–06:00.
+fn should_run_heartbeat_unipile_sweep(state: &AppState) -> bool {
+  let s = state.sync_liveness.read();
+  if !s.window_visible {
+    return false;
+  }
+  let now = chrono::Utc::now();
+  let idle = now
+    .signed_duration_since(s.last_user_activity)
+    .num_seconds();
+  if idle > SYNC_IDLE_MAX_SECS {
+    return false;
+  }
+  let h = chrono::Local::now().time().hour() as u32;
+  if QUIET_HOURS_LOCAL.contains(&h) && idle > QUIET_HOURS_MAX_IDLE_SECS {
+    return false;
+  }
+  true
+}
+
+fn unipile_account_is_paused(state: &AppState, account_id: &str) -> bool {
+  if account_id.is_empty() {
+    return false;
+  }
+  let m = state.unipile_account_paused_until.lock();
+  m.get(account_id)
+    .is_some_and(|t| *t > chrono::Utc::now())
+}
+
+fn record_unipile_403_cooldown(state: &AppState, account_id: &str) {
+  if account_id.is_empty() {
+    return;
+  }
+  err_log!("[unipile] 403 on account {account_id} — pausing remote actions 6h");
+  let until = chrono::Utc::now() + chrono::Duration::hours(6);
+  let mut m = state.unipile_account_paused_until.lock();
+  m.insert(account_id.to_string(), until);
 }
 
 /// Sleep for `base` seconds ± `jitter_pct` percent — used by the
@@ -127,6 +217,11 @@ fn humanized_typing_duration_seconds(text: &str) -> f64 {
 /// self-heals without requiring manual intervention. Matches Unipile's own
 /// guidance: "fetch a larger period than your cron delay".
 const SYNC_SELF_HEAL_HOURS: i64 = 2;
+
+/// Max Unipile `/messages` pages for a one-time full history pull per chat
+/// (`chat_sync_state.backfilled_at` not yet set). `fetch_paginated` stops as
+/// soon as the API omits `cursor`; this is only a safety ceiling.
+const HISTORY_FETCH_MAX_PAGES: usize = 1000;
 
 /// Supabase / PostgREST transient-failure retry budget.
 ///
@@ -255,8 +350,15 @@ pub fn run() {
         backfilled_x: AtomicBool::new(false),
         backfilled_imessage: AtomicBool::new(false),
         heartbeat_started: AtomicBool::new(false),
+        webhooks_ensured_this_launch: AtomicBool::new(false),
+        avatar_catchup_once_per_launch: AtomicBool::new(false),
+        chat_attendees_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        unipile_account_paused_until: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        sync_liveness: parking_lot::RwLock::new(SyncLiveness::default()),
         account_ages: parking_lot::RwLock::new(std::collections::HashMap::new()),
         limiter: SendLimiter::new(),
+        active_user_id: parking_lot::RwLock::new(None),
+        imessage_last_rowid: AtomicI64::new(i64::MIN),
       });
       app.manage(on_device::BridgeManager::new());
 
@@ -278,6 +380,7 @@ pub fn run() {
       sync_unipile_accounts,
       disconnect_account,
       startup_sync,
+      update_sync_liveness,
       start_sync_heartbeat,
       backfill_messages,
       sync_chat,
@@ -360,6 +463,8 @@ async fn fetch_paginated(
   base_url: &str,
   api_key: &str,
   max_pages: usize,
+  state: Option<&AppState>,
+  account_id_for_403: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, String> {
   let mut all_items = Vec::new();
   let mut cursor: Option<String> = None;
@@ -396,6 +501,11 @@ async fn fetch_paginated(
 
     if !resp.status().is_success() {
       let status = resp.status();
+      if status == reqwest::StatusCode::FORBIDDEN {
+        if let (Some(s), Some(aid)) = (state, account_id_for_403) {
+          if !aid.is_empty() { record_unipile_403_cooldown(s, aid); }
+        }
+      }
       let body = resp.text().await.unwrap_or_default();
       return Err(format!("HTTP {status}: {body}"));
     }
@@ -416,6 +526,78 @@ async fn fetch_paginated(
   }
 
   Ok(all_items)
+}
+
+/// `true` when we have never recorded a successful full-history pull for this
+/// thread (no row, or `backfilled_at` is null).
+async fn chat_sync_history_pending(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  user_id: &str,
+  thread_id: &str,
+) -> bool {
+  let url = format!(
+    "{supabase_url}/rest/v1/chat_sync_state?user_id=eq.{user_id}&thread_id=eq.{thread_id}&select=backfilled_at"
+  );
+  let Ok(resp) = client
+    .get(&url)
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .send()
+    .await
+  else {
+    return true;
+  };
+  if !resp.status().is_success() {
+    dev_log!("[chat_sync_state] GET pending {} → {}", thread_id, resp.status());
+    return true;
+  }
+  let Ok(rows) = resp.json::<Vec<serde_json::Value>>().await else {
+    return true;
+  };
+  match rows.first() {
+    None => true,
+    Some(r) => match r.get("backfilled_at") {
+      None | Some(serde_json::Value::Null) => true,
+      Some(v) => v.as_str().map(|s| s.is_empty()).unwrap_or(true),
+    },
+  }
+}
+
+async fn chat_sync_mark_backfilled(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  user_id: &str,
+  thread_id: &str,
+  channel: &str,
+  unipile_account_id: &str,
+) {
+  let now = chrono::Utc::now().to_rfc3339();
+  let body = serde_json::json!({
+    "user_id": user_id,
+    "thread_id": thread_id,
+    "channel": channel,
+    "unipile_account_id": unipile_account_id,
+    "backfilled_at": &now,
+    "updated_at": &now,
+  });
+  let url = format!("{supabase_url}/rest/v1/chat_sync_state?on_conflict=user_id,thread_id");
+  match client
+    .post(&url)
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .header("Prefer", "resolution=merge-duplicates,return=minimal")
+    .json(&body)
+    .send()
+    .await
+  {
+    Ok(r) if r.status().is_success() => {}
+    Ok(r) => dev_log!("[chat_sync_state] upsert {} → HTTP {}", thread_id, r.status()),
+    Err(e) => dev_log!("[chat_sync_state] upsert {}: {e}", thread_id),
+  }
 }
 
 #[tauri::command]
@@ -937,12 +1119,42 @@ async fn ensure_webhooks(client: &reqwest::Client) -> Result<u32, String> {
   Ok(created)
 }
 
+/// Drives heartbeat gating: window visibility, user-activity bump, and which
+/// Unipile thread is open (empty / absent = no thread hint).
 #[tauri::command]
-async fn startup_sync(user_id: String, state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<String, String> {
+async fn update_sync_liveness(
+  window_visible: bool,
+  open_chat_id: Option<String>,
+  bump_activity: bool,
+  state: State<'_, AppState>,
+) -> Result<(), String> {
+  let mut s = state.sync_liveness.write();
+  s.window_visible = window_visible;
+  s.open_chat_id = open_chat_id.filter(|id| !id.is_empty());
+  if bump_activity {
+    s.last_user_activity = chrono::Utc::now();
+  }
+  Ok(())
+}
+
+/// `open_chat_id`: Unipile `chat_id` / `thread_id` for the active thread (if any).
+/// `mode` `"light"` = accounts + at most this chat (or none). `"full"` = 72h per-account
+/// sweep (Re-sync in settings).
+#[tauri::command]
+async fn startup_sync(
+  user_id: String,
+  mode: Option<String>,
+  open_chat_id: Option<String>,
+  state: State<'_, AppState>,
+  app_handle: tauri::AppHandle,
+) -> Result<String, String> {
   if state.syncing.swap(true, Ordering::SeqCst) {
     return Ok("Already syncing".to_string());
   }
-  let result = startup_sync_inner(&user_id, state.inner(), &app_handle).await;
+  let full_sweep = mode.as_deref() == Some("full");
+  let result = startup_sync_inner(
+    &user_id, state.inner(), &app_handle, full_sweep, open_chat_id, false,
+  ).await;
   state.syncing.store(false, Ordering::SeqCst);
   let _ = app_handle.emit("sync-status", serde_json::json!({ "phase": "idle" }));
   result
@@ -965,30 +1177,157 @@ async fn start_sync_heartbeat(
   state: State<'_, AppState>,
   app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+  // Refresh the active user on every call so the already-running background
+  // tasks (heartbeat + iMessage watcher) pick up sign-outs and user switches
+  // without requiring an app restart — both tasks are set-once-per-process.
+  *state.active_user_id.write() = Some(user_id);
+
   if state.heartbeat_started.swap(true, Ordering::SeqCst) {
     return Ok(());
   }
   dev_log!("[sync_heartbeat] spawning — base {SYNC_HEARTBEAT_BASE_SECS}s ±{SYNC_HEARTBEAT_JITTER_PCT}%");
   let app = app_handle.clone();
-  let uid = user_id;
   tauri::async_runtime::spawn(async move {
     loop {
       jittered_sleep(SYNC_HEARTBEAT_BASE_SECS, SYNC_HEARTBEAT_JITTER_PCT).await;
       let state: State<'_, AppState> = app.state();
+      // Scope the read guard so it doesn't cross an await and break `Send`.
+      let active_uid = state.active_user_id.read().clone();
+      let uid = match active_uid {
+        Some(u) => u,
+        None => {
+          dev_log!("[sync_heartbeat] skipped — no active user");
+          continue;
+        }
+      };
       if state.syncing.swap(true, Ordering::SeqCst) {
         dev_log!("[sync_heartbeat] skipped — sync already in progress");
         continue;
       }
-      dev_log!("[sync_heartbeat] tick");
-      let _ = startup_sync_inner(&uid, state.inner(), &app).await;
+      if !should_run_heartbeat_unipile_sweep(state.inner()) {
+        state.syncing.store(false, Ordering::SeqCst);
+        dev_log!("[sync_heartbeat] skipped — liveness (hidden / AFK / quiet hours)");
+        continue;
+      }
+      let open = state.inner().sync_liveness.read().open_chat_id.clone();
+      dev_log!("[sync_heartbeat] tick (light, open={:?})", open);
+      let _ = startup_sync_inner(
+        &uid, state.inner(), &app, false, open, true,
+      ).await;
       state.syncing.store(false, Ordering::SeqCst);
       let _ = app.emit("sync-status", serde_json::json!({ "phase": "idle" }));
     }
   });
+  #[cfg(target_os = "macos")]
+  spawn_imessage_watcher(app_handle);
+  #[cfg(not(target_os = "macos"))]
+  let _ = app_handle;
   Ok(())
 }
 
-async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
+/// Background poller for new iMessages on macOS.
+///
+/// Why an explicit rowid watermark: `backfill_imessage` → `supabase_upsert_batch`
+/// uses `Prefer: resolution=ignore-duplicates,return=minimal`, which returns
+/// no body on success. `supabase_upsert_batch` therefore reports
+/// `rows.len()` — the batch size, not the number of *new* rows. Emitting
+/// `imessage-synced` based on that count would fire every poll cycle (~90s)
+/// as long as any iMessage history exists, triggering pointless React Query
+/// invalidations.
+///
+/// Instead we read `MAX(ROWID)` from `chat.db` (a single B-tree lookup) and
+/// only run the backfill + emit the event when the rowid has advanced past
+/// our stored watermark. The watermark advances only after a successful
+/// upsert, so transient failures are retried on the next tick.
+#[cfg(target_os = "macos")]
+fn spawn_imessage_watcher(app: tauri::AppHandle) {
+  tauri::async_runtime::spawn(async move {
+    // Stagger after cold `startup_sync` so we do not contend on `chat.db`
+    // during the first gated `backfill_imessage` pass.
+    tokio::time::sleep(Duration::from_secs(IMESSAGE_WATCHER_STAGGER_SECS)).await;
+    loop {
+      let state: State<'_, AppState> = app.state();
+      // Scope the read guard so it doesn't cross an await and break `Send`.
+      let active_uid = state.active_user_id.read().clone();
+      let user_id = match active_uid {
+        Some(u) => u,
+        None => {
+          jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+          continue;
+        }
+      };
+      if state.syncing.load(Ordering::SeqCst) {
+        jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+        continue;
+      }
+      let db_path = match imessage_db_path() {
+        Ok(p) => p,
+        Err(_) => {
+          jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+          continue;
+        }
+      };
+      let current_rowid = match imessage_max_rowid(&db_path) {
+        Ok(v) => v,
+        Err(e) => {
+          dev_log!("[imessage_watch] rowid probe: {e}");
+          jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+          continue;
+        }
+      };
+      let prev_rowid = state.imessage_last_rowid.load(Ordering::SeqCst);
+      if current_rowid <= prev_rowid {
+        jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+        continue;
+      }
+      let supabase_url = match std::env::var("VITE_SUPABASE_URL") {
+        Ok(v) => v,
+        Err(_) => {
+          err_log!("[imessage_watch] VITE_SUPABASE_URL missing — pausing watcher");
+          jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+          continue;
+        }
+      };
+      let service_key = match std::env::var("SUPABASE_SERVICE_ROLE_KEY") {
+        Ok(v) => v,
+        Err(_) => {
+          err_log!("[imessage_watch] SUPABASE_SERVICE_ROLE_KEY missing — pausing watcher");
+          jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+          continue;
+        }
+      };
+      match backfill_imessage(&state.inner().http, &user_id, &supabase_url, &service_key).await {
+        Ok((m, _)) => {
+          state.imessage_last_rowid.store(current_rowid, Ordering::SeqCst);
+          // First poll after launch just seeds the watermark against the
+          // `chat.db` state that `startup_sync_inner` has already pushed to
+          // Supabase, so suppress the emit to avoid a redundant UI refresh.
+          let was_seeding = prev_rowid == i64::MIN;
+          if !was_seeding {
+            dev_log!("[imessage_watch] rowid {prev_rowid}→{current_rowid}, upserted {m} row(s)");
+            let _ = app.emit("imessage-synced", serde_json::json!({}));
+          } else {
+            dev_log!("[imessage_watch] seeded watermark at rowid {current_rowid}");
+          }
+        }
+        Err(e) => dev_log!("[imessage_watch] {e}"),
+      }
+      jittered_sleep(IMESSAGE_POLL_BASE_SECS, IMESSAGE_POLL_JITTER_PCT).await;
+    }
+  });
+}
+
+async fn startup_sync_inner(
+  user_id: &str,
+  state: &AppState,
+  app: &tauri::AppHandle,
+  full_sweep: bool,
+  open_chat_id: Option<String>,
+  from_heartbeat: bool,
+) -> Result<String, String> {
+  if from_heartbeat && !should_run_heartbeat_unipile_sweep(state) {
+    return Ok("skipped: heartbeat liveness".to_string());
+  }
   // Simple emit for phase transitions without per-account progress.
   let emit = |phase: &str, detail: &str| {
     let _ = app.emit("sync-status", serde_json::json!({ "phase": phase, "detail": detail }));
@@ -1029,11 +1368,16 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     Err(e) => { dev_log!("[startup_sync] account fetch failed: {e}"); return Err(format!("Account fetch failed: {e}")); }
   };
 
-  emit("syncing", "Ensuring webhooks…");
-  match ensure_webhooks(client).await {
-    Ok(n) if n > 0 => dev_log!("[startup_sync] registered {n} missing webhooks"),
-    Err(e) => dev_log!("[startup_sync] webhook check failed: {e}"),
-    _ => {}
+  if state.webhooks_ensured_this_launch
+    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+    .is_ok()
+  {
+    emit("syncing", "Ensuring webhooks…");
+    match ensure_webhooks(client).await {
+      Ok(n) if n > 0 => dev_log!("[startup_sync] registered {n} missing webhooks"),
+      Err(e) => dev_log!("[startup_sync] webhook check failed: {e}"),
+      _ => {}
+    }
   }
 
   emit("syncing", &format!("Found {} accounts, checking recent activity...", accounts.len()));
@@ -1086,10 +1430,10 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
-  // X DM + iMessage backfills ran on every 2-min tick before — wasteful
-  // and amplified the "massive batches on foreground" pattern. Gate each
-  // to once per process launch; webhook (Unipile) and provider-native
-  // cursors (Twitter API, iMessage SQLite bridge) cover subsequent updates.
+  // X DM backfill ran on every 2-min tick before — wasteful. Gate to once
+  // per process launch; Twitter API cursors cover subsequent updates.
+  // iMessage: first pull here only; macOS `spawn_imessage_watcher` polls
+  // `chat.db` periodically (see `IMESSAGE_POLL_*`).
   // `compare_exchange` is the set-once idiom — only the first caller
   // sees `Ok`.
   if state.backfilled_x.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -1153,7 +1497,51 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     .cloned()
     .collect();
 
+  let open_req = open_chat_id.clone();
+  let (single_chat_json, single_acc_id) = if full_sweep {
+    (None, None)
+  } else if let Some(ref cid) = open_req {
+    if cid.is_empty() {
+      (None, None)
+    } else {
+      let u = format!("{base}/api/v1/chats/{cid}");
+      match client.get(&u).header("X-API-KEY", &api_key).send().await {
+        Ok(r) if r.status() == reqwest::StatusCode::FORBIDDEN => {
+          err_log!("[startup_sync] single-chat GET {cid}: 403 (account may be restricted)");
+          (None, None)
+        }
+        Ok(r) if r.status().is_success() => {
+          let j: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
+          let a = j.get("account_id").and_then(|v| v.as_str()).map(String::from);
+          (Some(j), a)
+        }
+        Ok(r) => {
+          let status = r.status();
+          let body = r.text().await.unwrap_or_default();
+          err_log!("[startup_sync] single-chat GET {cid} failed: HTTP {status}: {body}");
+          (None, None)
+        }
+        Err(e) => {
+          err_log!("[startup_sync] single-chat GET {cid} error: {e}");
+          (None, None)
+        }
+      }
+    }
+  } else {
+    (None, None)
+  };
+
+  let do_unipile_chats = full_sweep || (single_chat_json.is_some() && single_acc_id.is_some());
+
+  if do_unipile_chats {
   for (acc_idx, acc) in active_accounts.iter().enumerate() {
+    if unipile_account_is_paused(state, &acc.id) { continue; }
+    if !full_sweep {
+      if let Some(w) = &single_acc_id {
+        if w != &acc.id { continue; }
+      }
+    }
+
     // Inter-account jitter. Unipile's explicit guidance: "Space out all
     // actions randomly instead of executing them at regular intervals."
     // First iteration (acc_idx == 0) doesn't need to wait.
@@ -1163,20 +1551,29 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
     }
 
     let channel = channel_from_type(&acc.account_type);
+    let acc_disp_idx = if full_sweep { acc_idx + 1 } else { 1 };
+    let acc_disp_total = if full_sweep { active_accounts.len() } else { 1 };
     emit_account(
       "syncing",
       &format!("Checking {}", acc.name),
-      acc_idx + 1,
-      active_accounts.len(),
+      acc_disp_idx,
+      acc_disp_total,
       channel,
     );
 
-    let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
-    let chats = match fetch_paginated(client, &chats_url, &api_key, 10).await {
-      Ok(c) => c,
-      Err(e) => {
-        err_log!("[startup_sync] chats fetch failed for {} ({}): {e}", acc.name, acc.id);
-        continue;
+    let chats: Vec<serde_json::Value> = if full_sweep {
+      let chats_url = format!("{base}/api/v1/chats?account_id={}&limit=50&after={cutoff}", acc.id);
+      match fetch_paginated(client, &chats_url, &api_key, 10, Some(state), Some(&acc.id)).await {
+        Ok(c) => c,
+        Err(e) => {
+          err_log!("[startup_sync] chats fetch failed for {} ({}): {e}", acc.name, acc.id);
+          continue;
+        }
+      }
+    } else {
+      match single_chat_json.as_ref() {
+        Some(sj) => vec![sj.clone()],
+        None => continue,
       }
     };
 
@@ -1200,8 +1597,8 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       emit_account_chat(
         "syncing",
         &format!("Checking {}", acc.name),
-        acc_idx + 1,
-        active_accounts.len(),
+        acc_disp_idx,
+        acc_disp_total,
         channel,
         chat_idx + 1,
         chats_total,
@@ -1251,20 +1648,43 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
       });
 
+      let needs_initial_history_backfill = chat_sync_history_pending(
+        client,
+        &supabase_url,
+        &service_key,
+        user_id,
+        chat_id,
+      )
+      .await;
+
       let is_group = chat.get("type").and_then(|v| v.as_u64()).unwrap_or(0) >= 1;
       let msg_type = if is_group { "group" } else { "dm" };
       let chat_name = chat.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-      // For DMs, fetch chat_attendees upfront — used for identity resolution AND avatar sync.
-      // For groups, this is fetched later for the attendee_map.
+      // For DMs, chat_attendees — used for identity + avatar. Cache 24h per
+      // chat to avoid a GET on every light sync / heartbeat tick.
+      const ATT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
       let dm_attendees: Vec<serde_json::Value> = if !is_group {
-        let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
-        match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
-          Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
-          }
-          _ => Vec::new(),
+        let now = std::time::Instant::now();
+        let hit = {
+          let c = state.chat_attendees_cache.lock();
+          c.get(chat_id)
+            .filter(|(_, t)| now.duration_since(*t) < ATT_TTL)
+            .map(|(v, _)| v.clone())
+        };
+        if let Some(v) = hit {
+          v
+        } else {
+          let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+          let fetched = match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
+            Ok(r) if r.status().is_success() => {
+              let body: serde_json::Value = r.json().await.unwrap_or_default();
+              body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
+            }
+            _ => Vec::new(),
+          };
+          state.chat_attendees_cache.lock().insert(chat_id.to_string(), (fetched.clone(), now));
+          fetched
         }
       } else {
         Vec::new()
@@ -1340,7 +1760,7 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       // Reused later to avoid a redundant API call.
       let pre_fetched_msgs: Option<Vec<serde_json::Value>> = if !chat_exists_in_db && !is_group {
         let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=50");
-        fetch_paginated(client, &msgs_url, &api_key, 3).await.ok()
+        fetch_paginated(client, &msgs_url, &api_key, 3, Some(state), Some(&acc.id)).await.ok()
       } else {
         None
       };
@@ -1478,8 +1898,19 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         std::collections::HashMap::new()
       };
 
-      // Inbound pin sync: read pinned status from the external chat
-      if channel == "whatsapp" {
+      // Skip the message pull when the last message we have is newer
+      // than SYNC_CHAT_RECENT_SKIP_MINUTES. The webhook already covered
+      // any newer messages; the 2h self-heal floor (SYNC_SELF_HEAL_HOURS)
+      // still catches silently-dropped webhook writes on the next tick
+      // that is NOT short-circuited. Saves a Unipile call per quiet chat
+      // on every heartbeat sweep.
+      let skip_threshold = chrono::Utc::now() - chrono::Duration::minutes(SYNC_CHAT_RECENT_SKIP_MINUTES);
+      let skip_message_pull = !needs_initial_history_backfill
+        && max_sent_at.map(|t| t > skip_threshold).unwrap_or(false);
+
+      // Inbound pin sync: only when we are not short-circuiting a recent
+      // thread (avoids an RPC on every hourly sweep for idle chats).
+      if channel == "whatsapp" && !skip_message_pull {
         let is_pinned = chat.get("pinned")
           .and_then(|v| v.as_bool())
           .or_else(|| chat.get("is_pinned").and_then(|v| v.as_bool()))
@@ -1505,16 +1936,30 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         }
       }
 
-      // Skip the message pull when the last message we have is newer
-      // than SYNC_CHAT_RECENT_SKIP_MINUTES. The webhook already covered
-      // any newer messages; the 2h self-heal floor (SYNC_SELF_HEAL_HOURS)
-      // still catches silently-dropped webhook writes on the next tick
-      // that is NOT short-circuited. Saves a Unipile call per quiet chat
-      // on every heartbeat sweep.
-      let skip_threshold = chrono::Utc::now() - chrono::Duration::minutes(SYNC_CHAT_RECENT_SKIP_MINUTES);
-      let skip_message_pull = max_sent_at.map(|t| t > skip_threshold).unwrap_or(false);
-
-      let messages = if let Some(m) = pre_fetched_msgs {
+      let messages = if needs_initial_history_backfill {
+        let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=100");
+        match fetch_paginated(
+          client,
+          &msgs_url,
+          &api_key,
+          HISTORY_FETCH_MAX_PAGES,
+          Some(state),
+          Some(&acc.id),
+        )
+        .await
+        {
+          Ok(m) => {
+            if !m.is_empty() {
+              dev_log!("[startup_sync] history backfill {} msgs for {chat_id}", m.len());
+            }
+            m
+          }
+          Err(e) => {
+            dev_log!("[startup_sync] history backfill FAIL {chat_id}: {e}");
+            continue;
+          }
+        }
+      } else if let Some(m) = pre_fetched_msgs {
         if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id} (pre-fetched)", m.len()); }
         m
       } else if skip_message_pull {
@@ -1524,11 +1969,20 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
           Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
           None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
         };
-        match fetch_paginated(client, &msgs_url, &api_key, 3).await {
+        match fetch_paginated(client, &msgs_url, &api_key, 3, Some(state), Some(&acc.id)).await {
           Ok(m) => { if !m.is_empty() { dev_log!("[startup_sync] {} msgs for {chat_id}", m.len()); } m }
           Err(e) => { dev_log!("[startup_sync] FAIL {chat_id}: {e}"); continue; }
         }
       };
+
+      let email_sender_map: std::collections::HashMap<String, (String, String)> =
+        if channel == "email" && !is_group && needs_initial_history_backfill {
+          unipile_email_attendee_index(&dm_attendees)
+        } else {
+          std::collections::HashMap::new()
+        };
+      let mut email_resolved_senders: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
 
       let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
       for msg in &messages {
@@ -1586,6 +2040,73 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
         let chat_folder = chat.get("folder").and_then(|v| v.as_str()).unwrap_or("");
 
+        let (msg_person_id, msg_identity_id) = if channel == "email"
+          && !is_group
+          && needs_initial_history_backfill
+          && !is_sender
+        {
+          let sender_att_id = msg
+            .get("sender_attendee_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          let from_pub = msg
+            .get("sender_public_identifier")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+          let mut peer: Option<(String, String)> = None;
+          if let Some(t) = email_sender_map.get(sender_att_id) {
+            peer = Some((t.0.clone(), t.1.clone()));
+          } else if let Some(frm) = from_pub {
+            let nfrm = normalize_handle(frm, channel);
+            for a in &dm_attendees {
+              if let Some(rh) = unipile_attendee_handle_raw(a) {
+                if normalize_handle(&rh, channel) == nfrm {
+                  let name = unipile_attendee_display_name(a, &rh);
+                  peer = Some((rh, name));
+                  break;
+                }
+              }
+            }
+            if peer.is_none() {
+              let disp = sender_name
+                .clone()
+                .unwrap_or_else(|| frm.to_string());
+              peer = Some((frm.to_string(), disp));
+            }
+          }
+
+          match &peer {
+            None => (person_id.clone(), identity_id.clone()),
+            Some((raw_handle, display)) => {
+              let sender_h = normalize_handle(raw_handle, channel);
+              if sender_h == sender_handle || sender_h.is_empty() {
+                (person_id.clone(), identity_id.clone())
+              } else if let Some(cached) = email_resolved_senders.get(&sender_h) {
+                cached.clone()
+              } else if let Some(pair) = unipile_resolve_inbound_email_identity(
+                client,
+                &supabase_url,
+                &service_key,
+                user_id,
+                channel,
+                &acc.id,
+                &sender_h,
+                display,
+              )
+              .await
+              {
+                email_resolved_senders.insert(sender_h, pair.clone());
+                pair
+              } else {
+                (person_id.clone(), identity_id.clone())
+              }
+            }
+          }
+        } else {
+          (person_id.clone(), identity_id.clone())
+        };
+
         // PGRST102 requires identical keys across every row in a bulk
         // upsert, so `read_at` and `flagged_at` are always present. Both
         // are only meaningful on insert (ignore-duplicates) — existing
@@ -1617,8 +2138,8 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
         };
 
         let row = serde_json::json!({
-          "user_id": user_id, "person_id": person_id,
-          "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
+          "user_id": user_id, "person_id": msg_person_id,
+          "identity_id": if msg_identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(msg_identity_id.clone()) },
           "external_id": external_id, "channel": channel,
           "direction": direction, "message_type": msg_type,
           "body_text": body_text, "attachments": attachments,
@@ -1658,18 +2179,66 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       // Bulk POST with a JSON-array body per PostgREST's PGRST003 guidance
       // ("reduce write requests. Do Bulk Insert instead of inserting rows
       // one by one.") and with documented transient-error retry.
-      match supabase_upsert_batch(
-        client,
-        &supabase_url,
-        &service_key,
-        "messages",
-        "user_id,external_id",
-        "resolution=ignore-duplicates",
-        &rows_to_upsert,
-        "startup_sync",
-      ).await {
-        Ok(n) => msgs_synced += n as u32,
-        Err(e) => err_log!("{e}"),
+      let history_upsert_ok = if rows_to_upsert.is_empty() {
+        true
+      } else if needs_initial_history_backfill {
+        let mut ok = true;
+        for chunk in rows_to_upsert.chunks(100) {
+          match supabase_upsert_batch(
+            client,
+            &supabase_url,
+            &service_key,
+            "messages",
+            "user_id,external_id",
+            "resolution=ignore-duplicates",
+            chunk,
+            "startup_sync",
+          )
+          .await
+          {
+            Ok(n) => msgs_synced += n as u32,
+            Err(e) => {
+              err_log!("{e}");
+              ok = false;
+              break;
+            }
+          }
+        }
+        ok
+      } else {
+        match supabase_upsert_batch(
+          client,
+          &supabase_url,
+          &service_key,
+          "messages",
+          "user_id,external_id",
+          "resolution=ignore-duplicates",
+          &rows_to_upsert,
+          "startup_sync",
+        )
+        .await
+        {
+          Ok(n) => {
+            msgs_synced += n as u32;
+            true
+          }
+          Err(e) => {
+            err_log!("{e}");
+            false
+          }
+        }
+      };
+      if needs_initial_history_backfill && history_upsert_ok {
+        chat_sync_mark_backfilled(
+          client,
+          &supabase_url,
+          &service_key,
+          user_id,
+          chat_id,
+          channel,
+          &acc.id,
+        )
+        .await;
       }
 
       if !is_group {
@@ -1693,8 +2262,13 @@ async fn startup_sync_inner(user_id: &str, state: &AppState, app: &tauri::AppHan
       }
     }
   }
+  }
 
-  // Avatar catch-up: refresh avatars for persons with missing/stale ones
+  // Avatar catch-up: full scan at most once per app process.
+  if state
+    .avatar_catchup_once_per_launch
+    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+    .is_ok()
   {
     let avatar_q = format!(
       "{supabase_url}/rest/v1/persons?user_id=eq.{user_id}&or=(avatar_url.is.null,avatar_stale.eq.true)&select=id&limit=100"
@@ -1863,6 +2437,114 @@ fn normalize_handle(raw: &str, channel: &str) -> String {
   h.to_lowercase()
 }
 
+/// Unipile `chat_attendees` item: same field precedence as the DM
+/// `other_handle` in backfill (`public_identifier` → `identifier` →
+/// `provider_id`).
+fn unipile_attendee_handle_raw(att: &serde_json::Value) -> Option<String> {
+  att.get("public_identifier")
+    .and_then(|v| v.as_str())
+    .filter(|s| !s.is_empty())
+    .or_else(|| {
+      att
+        .get("identifier")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    })
+    .or_else(|| {
+      att
+        .get("provider_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    })
+    .map(std::string::ToString::to_string)
+}
+
+fn unipile_attendee_display_name(att: &serde_json::Value, handle_fallback: &str) -> String {
+  att
+    .get("name")
+    .and_then(|v| v.as_str())
+    .filter(|s| !s.is_empty() && *s != "Unknown")
+    .map(std::string::ToString::to_string)
+    .or_else(|| unipile_attendee_handle_raw(att))
+    .unwrap_or_else(|| handle_fallback.to_string())
+}
+
+/// Map `chat_attendees[].id` → (raw email handle, display) for per-message
+/// person resolution in Gmail-style threads.
+fn unipile_email_attendee_index(
+  all_attendees: &[serde_json::Value],
+) -> std::collections::HashMap<String, (String, String)> {
+  all_attendees
+    .iter()
+    .filter_map(|a| {
+      let id = a.get("id").and_then(|v| v.as_str())?.to_string();
+      let handle = unipile_attendee_handle_raw(a)?;
+      if handle.is_empty() {
+        return None;
+      }
+      let name = unipile_attendee_display_name(a, &handle);
+      Some((id, (handle, name)))
+    })
+    .collect()
+}
+
+async fn unipile_resolve_inbound_email_identity(
+  client: &reqwest::Client,
+  supabase_url: &str,
+  service_key: &str,
+  user_id: &str,
+  channel: &str,
+  unipile_account_id: &str,
+  normalized_handle: &str,
+  display_name: &str,
+) -> Option<(String, String)> {
+  if normalized_handle.is_empty() {
+    return None;
+  }
+  let mut md = serde_json::Map::new();
+  md.insert(
+    "email".to_string(),
+    serde_json::Value::String(normalized_handle.to_string()),
+  );
+  let person_resp = client
+    .post(format!("{supabase_url}/rest/v1/rpc/backfill_find_or_create_person"))
+    .header("apikey", service_key)
+    .header("Authorization", format!("Bearer {service_key}"))
+    .header("Content-Type", "application/json")
+    .json(&serde_json::json!({
+      "p_user_id": user_id,
+      "p_channel": channel,
+      "p_handle": normalized_handle,
+      "p_display_name": display_name,
+      "p_unipile_account_id": unipile_account_id,
+      "p_metadata": serde_json::Value::Object(md),
+      "p_direction": "inbound"
+    }))
+    .send()
+    .await;
+  match person_resp {
+    Ok(r) if r.status().is_success() => {
+      let body: serde_json::Value = r.json().await.unwrap_or_default();
+      let pid = body
+        .get("person_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      let iid = body
+        .get("identity_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      if pid.is_empty() {
+        None
+      } else {
+        Some((pid, iid))
+      }
+    }
+    _ => None,
+  }
+}
+
 #[tauri::command]
 async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Result<String, String> {
   let (api_key, base) = unipile_config()?;
@@ -1882,7 +2564,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
     let channel = channel_from_type(&acc.account_type);
 
     let chats_base_url = format!("{base}/api/v1/chats?account_id={}&limit=100", acc.id);
-    let chats = match fetch_paginated(client, &chats_base_url, &api_key, 50).await {
+    let chats = match fetch_paginated(client, &chats_base_url, &api_key, 50, Some(state.inner()), Some(&acc.id)).await {
       Ok(c) => c,
       Err(e) => { errors.push(format!("chats fetch: {e}")); continue; }
     };
@@ -1902,6 +2584,24 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let mut att_phone = String::new();
       let mut pub_id = String::new();
 
+      let attendees_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
+      let all_attendees: Vec<serde_json::Value> = match client
+        .get(&attendees_url)
+        .header("X-API-KEY", &api_key)
+        .send()
+        .await
+      {
+        Ok(r) if r.status().is_success() => {
+          let body: serde_json::Value = r.json().await.unwrap_or_default();
+          body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+      };
+
       if is_group {
         display_name = if chat_name.is_empty() { "Group Chat".to_string() } else { chat_name.to_string() };
         sender_handle = normalize_handle(
@@ -1911,15 +2611,6 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
           channel
         );
       } else {
-        let attendees_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
-        let all_attendees: Vec<serde_json::Value> = match client.get(&attendees_url).header("X-API-KEY", &api_key).send().await {
-          Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
-          }
-          _ => Vec::new(),
-        };
-
         let other_attendee = all_attendees.iter()
           .find(|a| {
             let is_self = a.get("is_self")
@@ -1972,17 +2663,9 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         // self-detection workaround is no longer needed since we use chat_attendees
         // for all channels now.
         if let Some(other) = other_attendee {
-          let other_handle = other.get("public_identifier")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or_else(|| other.get("identifier")
-              .and_then(|v| v.as_str())
-              .filter(|s| !s.is_empty()))
-            .or_else(|| other.get("provider_id")
-              .and_then(|v| v.as_str())
-              .filter(|s| !s.is_empty()))
-            .unwrap_or(chat_id);
-          sender_handle = normalize_handle(other_handle, channel);
+          let other_handle = unipile_attendee_handle_raw(other)
+            .unwrap_or_else(|| chat_id.to_string());
+          sender_handle = normalize_handle(&other_handle, channel);
         } else {
           // Fallback: no attendees, use chat object fields
           sender_handle = normalize_handle(
@@ -2092,30 +2775,52 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
       let msgs_base_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=100");
 
       let attendee_map: std::collections::HashMap<String, String> = if is_group {
-        let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
-        match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
-          Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            body.get("items").and_then(|v| v.as_array()).map(|arr| {
-              arr.iter().filter_map(|a| {
-                let id = a.get("id").and_then(|v| v.as_str())?;
-                let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-                  .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
-                  .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
-                Some((id.to_string(), name.to_string()))
-              }).collect()
-            }).unwrap_or_default()
-          }
-          _ => std::collections::HashMap::new(),
-        }
+        all_attendees
+          .iter()
+          .filter_map(|a| {
+            let id = a.get("id").and_then(|v| v.as_str())?;
+            let name = a
+              .get("name")
+              .and_then(|v| v.as_str())
+              .filter(|s| !s.is_empty())
+              .or_else(|| {
+                a.get("public_identifier")
+                  .and_then(|v| v.as_str())
+                  .filter(|s| !s.is_empty())
+              })
+              .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
+            Some((id.to_string(), name.to_string()))
+          })
+          .collect()
       } else {
         std::collections::HashMap::new()
       };
 
-      let messages = match fetch_paginated(client, &msgs_base_url, &api_key, 20).await {
+      let messages = match fetch_paginated(
+        client,
+        &msgs_base_url,
+        &api_key,
+        HISTORY_FETCH_MAX_PAGES,
+        Some(state.inner()),
+        Some(&acc.id),
+      )
+      .await
+      {
         Ok(m) => m,
         Err(e) => { errors.push(format!("msgs fetch {chat_id}: {e}")); continue; }
       };
+
+      // Gmail threads legitimately contain multiple senders. For email we
+      // resolve the sender per-message (not per-chat) so senders in one
+      // thread do not collapse onto a single person.
+      let email_sender_map: std::collections::HashMap<String, (String, String)> =
+        if channel == "email" && !is_group {
+          unipile_email_attendee_index(&all_attendees)
+        } else {
+          std::collections::HashMap::new()
+        };
+      let mut resolved_senders: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
 
       for msg in &messages {
         let external_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2172,10 +2877,78 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         let quoted_sender = msg.get("quoted").and_then(|q| q.get("sender_name")).and_then(|v| v.as_str());
         let reactions = msg.get("reactions").filter(|v| v.is_array()).cloned().unwrap_or(serde_json::json!([]));
 
+        // Per-message sender resolution for email. For IM DMs the chat-level
+        // person is correct. For inbound email we look up the actual sender
+        // in the thread attendees and find/create the right person. If
+        // Unipile omits `sender_attendee_id`, we fall back to `from` +
+        // `sender_public_identifier` matching the attendee list.
+        let (msg_person_id, msg_identity_id) = if channel == "email" && !is_group && !is_sender {
+          let sender_att_id = msg
+            .get("sender_attendee_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          let from_pub = msg
+            .get("sender_public_identifier")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+          let mut peer: Option<(String, String)> = None;
+          if let Some(t) = email_sender_map.get(sender_att_id) {
+            peer = Some((t.0.clone(), t.1.clone()));
+          } else if let Some(frm) = from_pub {
+            let nfrm = normalize_handle(frm, channel);
+            for a in &all_attendees {
+              if let Some(rh) = unipile_attendee_handle_raw(a) {
+                if normalize_handle(&rh, channel) == nfrm {
+                  let name = unipile_attendee_display_name(a, &rh);
+                  peer = Some((rh, name));
+                  break;
+                }
+              }
+            }
+            if peer.is_none() {
+              let disp = sender_name
+                .clone()
+                .unwrap_or_else(|| frm.to_string());
+              peer = Some((frm.to_string(), disp));
+            }
+          }
+
+          match &peer {
+            None => (person_id.clone(), identity_id.clone()),
+            Some((raw_handle, display)) => {
+              let sender_h = normalize_handle(raw_handle, channel);
+              if sender_h == sender_handle || sender_h.is_empty() {
+                (person_id.clone(), identity_id.clone())
+              } else if let Some(cached) = resolved_senders.get(&sender_h) {
+                cached.clone()
+              } else if let Some(pair) = unipile_resolve_inbound_email_identity(
+                client,
+                &supabase_url,
+                &service_key,
+                &user_id,
+                channel,
+                &acc.id,
+                &sender_h,
+                display,
+              )
+              .await
+              {
+                resolved_senders.insert(sender_h, pair.clone());
+                pair
+              } else {
+                (person_id.clone(), identity_id.clone())
+              }
+            }
+          }
+        } else {
+          (person_id.clone(), identity_id.clone())
+        };
+
         let mut row = serde_json::json!({
           "user_id": user_id,
-          "person_id": person_id,
-          "identity_id": if identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(identity_id.clone()) },
+          "person_id": msg_person_id,
+          "identity_id": if msg_identity_id.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(msg_identity_id.clone()) },
           "external_id": external_id,
           "channel": channel,
           "direction": direction,
@@ -2249,6 +3022,17 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         }
       }
 
+      chat_sync_mark_backfilled(
+        client,
+        &supabase_url,
+        &service_key,
+        &user_id,
+        chat_id,
+        channel,
+        &acc.id,
+      )
+      .await;
+
       total_chats += 1;
     }
   }
@@ -2304,60 +3088,123 @@ async fn sync_chat(
     .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
   let client = &state.http;
 
-  let last_resp = client
-    .get(format!(
-      "{supabase_url}/rest/v1/messages?thread_id=eq.{chat_id}&user_id=eq.{user_id}&select=sent_at&order=sent_at.desc&limit=1"
-    ))
-    .header("apikey", &service_key)
-    .header("Authorization", format!("Bearer {service_key}"))
-    .send().await;
+  let needs_initial_history_backfill =
+    chat_sync_history_pending(client, &supabase_url, &service_key, &user_id, &chat_id).await;
 
-  let after_ts = match last_resp {
-    Ok(r) if r.status().is_success() => {
-      let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-      rows.first()
-        .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
-        .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
-          .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
-        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+  let messages = if needs_initial_history_backfill {
+    let msgs_url = format!("{base}/api/v1/chats/{chat_id}/messages?limit=100");
+    match fetch_paginated(
+      client,
+      &msgs_url,
+      &api_key,
+      HISTORY_FETCH_MAX_PAGES,
+      Some(state.inner()),
+      Some(&account_id),
+    )
+    .await
+    {
+      Ok(m) => m,
+      Err(e) => return Err(format!("sync_chat fetch: {e}")),
     }
-    _ => None,
-  };
+  } else {
+    let last_resp = client
+      .get(format!(
+        "{supabase_url}/rest/v1/messages?thread_id=eq.{chat_id}&user_id=eq.{user_id}&select=sent_at&order=sent_at.desc&limit=1"
+      ))
+      .header("apikey", &service_key)
+      .header("Authorization", format!("Bearer {service_key}"))
+      .send().await;
 
-  let msgs_url = match &after_ts {
-    Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
-    None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
-  };
-  let messages = match fetch_paginated(client, &msgs_url, &api_key, 3).await {
-    Ok(m) => m,
-    Err(e) => return Err(format!("sync_chat fetch: {e}")),
+    let after_ts = match last_resp {
+      Ok(r) if r.status().is_success() => {
+        let rows: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+        rows.first()
+          .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
+          .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
+            .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
+          .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+      }
+      _ => None,
+    };
+
+    let msgs_url = match &after_ts {
+      Some(ts) => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50&after={ts}"),
+      None => format!("{base}/api/v1/chats/{chat_id}/messages?limit=50"),
+    };
+    match fetch_paginated(client, &msgs_url, &api_key, 3, Some(state.inner()), Some(&account_id)).await {
+      Ok(m) => m,
+      Err(e) => return Err(format!("sync_chat fetch: {e}")),
+    }
   };
 
   if messages.is_empty() {
+    if needs_initial_history_backfill {
+      chat_sync_mark_backfilled(
+        client,
+        &supabase_url,
+        &service_key,
+        &user_id,
+        &chat_id,
+        &channel,
+        &account_id,
+      )
+      .await;
+    }
     return Ok("0".to_string());
   }
 
   let is_group = message_type == "group";
-  let attendee_map: std::collections::HashMap<String, String> = if is_group {
+  let needs_attendees = is_group || channel == "email";
+  let all_attendees: Vec<serde_json::Value> = if needs_attendees {
     let att_url = format!("{base}/api/v1/chat_attendees?chat_id={chat_id}");
     match client.get(&att_url).header("X-API-KEY", &api_key).send().await {
       Ok(r) if r.status().is_success() => {
         let body: serde_json::Value = r.json().await.unwrap_or_default();
-        body.get("items").and_then(|v| v.as_array()).map(|arr| {
-          arr.iter().filter_map(|a| {
-            let id = a.get("id").and_then(|v| v.as_str())?;
-            let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-              .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
-              .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
-            Some((id.to_string(), name.to_string()))
-          }).collect()
-        }).unwrap_or_default()
+        body.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default()
       }
-      _ => std::collections::HashMap::new(),
+      _ => Vec::new(),
     }
+  } else {
+    Vec::new()
+  };
+
+  let attendee_map: std::collections::HashMap<String, String> = if is_group {
+    all_attendees.iter().filter_map(|a| {
+      let id = a.get("id").and_then(|v| v.as_str())?;
+      let name = a.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        .or_else(|| a.get("public_identifier").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .or_else(|| a.get("provider_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))?;
+      Some((id.to_string(), name.to_string()))
+    }).collect()
   } else {
     std::collections::HashMap::new()
   };
+
+  // See backfill_messages: email threads can contain multiple senders, so
+  // resolve per-message rather than reusing the chat-level person.
+  let email_sender_map: std::collections::HashMap<String, (String, String)> =
+    if channel == "email" && !is_group {
+      unipile_email_attendee_index(&all_attendees)
+    } else {
+      std::collections::HashMap::new()
+    };
+  let thread_peer_handle = if channel == "email" && !is_group {
+    all_attendees
+      .iter()
+      .find(|a| {
+        !a
+          .get("is_self")
+          .map(|v| v.as_bool().unwrap_or(v.as_u64().unwrap_or(0) == 1))
+          .unwrap_or(false)
+      })
+      .and_then(unipile_attendee_handle_raw)
+      .map(|h| normalize_handle(&h, &channel))
+      .unwrap_or_default()
+  } else {
+    String::new()
+  };
+  let mut resolved_senders: std::collections::HashMap<String, (String, String)> =
+    std::collections::HashMap::new();
 
   let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
 
@@ -2416,10 +3263,103 @@ async fn sync_chat(
       serde_json::Value::String(chrono::Utc::now().to_rfc3339())
     };
 
+    // Per-message sender resolution for inbound email (see backfill_messages).
+    let (msg_person_id, msg_identity_id) = if channel == "email" && !is_group && !is_sender {
+      let id_fallback = || {
+        (
+          person_id.clone(),
+          identity_id
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+        )
+      };
+      let sender_att_id = msg
+        .get("sender_attendee_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+      let from_pub = msg
+        .get("sender_public_identifier")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+      let mut peer: Option<(String, String)> = None;
+      if let Some(t) = email_sender_map.get(sender_att_id) {
+        peer = Some((t.0.clone(), t.1.clone()));
+      } else if let Some(frm) = from_pub {
+        let nfrm = normalize_handle(frm, &channel);
+        for a in &all_attendees {
+          if let Some(rh) = unipile_attendee_handle_raw(a) {
+            if normalize_handle(&rh, &channel) == nfrm {
+              let name = unipile_attendee_display_name(a, &rh);
+              peer = Some((rh, name));
+              break;
+            }
+          }
+        }
+        if peer.is_none() {
+          let disp = sender_name
+            .clone()
+            .unwrap_or_else(|| frm.to_string());
+          peer = Some((frm.to_string(), disp));
+        }
+      }
+
+      match &peer {
+        None => id_fallback(),
+        Some((raw_handle, display)) => {
+          let sender_h = normalize_handle(raw_handle, &channel);
+          if sender_h == thread_peer_handle || sender_h.is_empty() {
+            id_fallback()
+          } else if let Some(cached) = resolved_senders.get(&sender_h) {
+            (
+              cached.0.clone(),
+              if cached.1.is_empty() {
+                serde_json::Value::Null
+              } else {
+                serde_json::Value::String(cached.1.clone())
+              },
+            )
+          } else if let Some((pid, iid)) = unipile_resolve_inbound_email_identity(
+            client,
+            &supabase_url,
+            &service_key,
+            &user_id,
+            &channel,
+            &account_id,
+            &sender_h,
+            display,
+          )
+          .await
+          {
+            resolved_senders.insert(sender_h, (pid.clone(), iid.clone()));
+            (
+              pid,
+              if iid.is_empty() {
+                serde_json::Value::Null
+              } else {
+                serde_json::Value::String(iid)
+              },
+            )
+          } else {
+            id_fallback()
+          }
+        }
+      }
+    } else {
+      (
+        person_id.clone(),
+        identity_id
+          .clone()
+          .map(serde_json::Value::String)
+          .unwrap_or(serde_json::Value::Null),
+      )
+    };
+
     let row = serde_json::json!({
       "user_id": user_id,
-      "person_id": person_id,
-      "identity_id": identity_id,
+      "person_id": msg_person_id,
+      "identity_id": msg_identity_id,
       "external_id": external_id,
       "channel": channel,
       "direction": direction,
@@ -2454,19 +3394,66 @@ async fn sync_chat(
   // Bulk upsert — merge-duplicates because sync_chat is the on-demand
   // refresh path: the user explicitly asked to resync, so newer provider
   // state (reactions, read, edits) should overwrite the existing row.
-  let synced = match supabase_upsert_batch(
-    client,
-    &supabase_url,
-    &service_key,
-    "messages",
-    "user_id,external_id",
-    "resolution=merge-duplicates",
-    &rows_to_upsert,
-    "sync_chat",
-  ).await {
-    Ok(n) => n as u32,
-    Err(e) => { err_log!("{e}"); 0 }
+  let (synced, upsert_ok) = if rows_to_upsert.is_empty() {
+    (0u32, true)
+  } else if needs_initial_history_backfill {
+    let mut n = 0u32;
+    let mut ok = true;
+    for chunk in rows_to_upsert.chunks(100) {
+      match supabase_upsert_batch(
+        client,
+        &supabase_url,
+        &service_key,
+        "messages",
+        "user_id,external_id",
+        "resolution=merge-duplicates",
+        chunk,
+        "sync_chat",
+      )
+      .await
+      {
+        Ok(c) => n += c as u32,
+        Err(e) => {
+          err_log!("{e}");
+          ok = false;
+          break;
+        }
+      }
+    }
+    (n, ok)
+  } else {
+    match supabase_upsert_batch(
+      client,
+      &supabase_url,
+      &service_key,
+      "messages",
+      "user_id,external_id",
+      "resolution=merge-duplicates",
+      &rows_to_upsert,
+      "sync_chat",
+    )
+    .await
+    {
+      Ok(n) => (n as u32, true),
+      Err(e) => {
+        err_log!("{e}");
+        (0u32, false)
+      }
+    }
   };
+
+  if needs_initial_history_backfill && upsert_ok {
+    chat_sync_mark_backfilled(
+      client,
+      &supabase_url,
+      &service_key,
+      &user_id,
+      &chat_id,
+      &channel,
+      &account_id,
+    )
+    .await;
+  }
 
   Ok(format!("{synced}"))
 }
@@ -2534,13 +3521,14 @@ async fn send_message(
   let client = &state.http;
   let aid = account_id.as_deref().unwrap_or("");
 
-  // Token-bucket check against per-(account, channel) quotas from
-  // Unipile's provider-limits guidance, scaled by the session warm-up
-  // tier. Stable error codes ("rate_limit:instagram:hourly", etc.) let
-  // the frontend render friendly UI without parsing text.
-  let tier = warmup_tier_for(state.inner(), aid);
-  if let Err(code) = state.limiter.check_and_consume(aid, &channel, tier) {
-    dev_log!("[send_message] {code} account={aid} tier={tier:?}");
+  if unipile_account_is_paused(state.inner(), aid) {
+    return Err("unipile_account_paused:remote actions cool-down after 403 — try again later".to_string());
+  }
+
+  // Token-bucket check — scaled by 7-day session ramp.
+  let scale = warmup_scale_for(state.inner(), aid);
+  if let Err(code) = state.limiter.check_and_consume(aid, &channel, scale) {
+    dev_log!("[send_message] {code} account={aid} scale={scale}");
     log_send_audit(
       client, &user_id, &person_id, &channel, &chat_id, &chat_id,
       account_id.as_deref(), "error", Some(&code),
@@ -2548,7 +3536,7 @@ async fn send_message(
     return Err(code);
   }
 
-  dev_log!("[send_message] person={person_id} channel={channel} chat_id={chat_id} account_id={aid} tier={tier:?}");
+  dev_log!("[send_message] person={person_id} channel={channel} chat_id={chat_id} account_id={aid} scale={scale}");
 
   let url = format!("{base}/api/v1/chats/{chat_id}/messages");
   let mut form = reqwest::multipart::Form::new().text("text", text.clone());
@@ -2575,6 +3563,9 @@ async fn send_message(
   let body = response.text().await.unwrap_or_default();
 
   if !status.is_success() {
+    if status == reqwest::StatusCode::FORBIDDEN && !aid.is_empty() {
+      record_unipile_403_cooldown(state.inner(), aid);
+    }
     log_send_audit(
       client, &user_id, &person_id, &channel, &chat_id, &chat_id,
       account_id.as_deref(), "error", Some(&format!("{status}: {body}")),
@@ -2712,7 +3703,11 @@ async fn chat_action(
       Ok(r) => {
         let status = r.status();
         let text = r.text().await.unwrap_or_default();
-        dev_log!("[chat_action] Unipile {channel} {unipile_action} failed: {status} {text}");
+        if status == reqwest::StatusCode::FORBIDDEN {
+          dev_log!("[chat_action] Unipile 403 (account may be restricted): {text}");
+        } else {
+          dev_log!("[chat_action] Unipile {channel} {unipile_action} failed: {status} {text}");
+        }
       }
       Err(e) => {
         dev_log!("[chat_action] Unipile {channel} request error: {e}");
@@ -2783,7 +3778,7 @@ async fn sync_email_flags(user_id: String, state: State<'_, AppState>) -> Result
   let mut starred_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
   for acc in &email_accs {
     let url = format!("{base}/api/v1/emails?account_id={}&folder=STARRED&limit=100", acc.id);
-    match fetch_paginated(client, &url, &api_key, 3).await {
+    match fetch_paginated(client, &url, &api_key, 3, Some(state.inner()), Some(&acc.id)).await {
       Ok(emails) => {
         for em in &emails {
           if let Some(id) = em.get("id").and_then(|v| v.as_str()) {
@@ -2879,11 +3874,13 @@ async fn send_attachment(
   let client = &state.http;
   let aid = account_id.as_deref().unwrap_or("");
 
-  // Same token-bucket gate as send_message — an attachment counts as
-  // one outbound action under Unipile's provider caps.
-  let tier = warmup_tier_for(state.inner(), aid);
-  if let Err(code) = state.limiter.check_and_consume(aid, &channel, tier) {
-    dev_log!("[send_attachment] {code} account={aid} tier={tier:?}");
+  if unipile_account_is_paused(state.inner(), aid) {
+    return Err("unipile_account_paused:remote actions cool-down after 403 — try again later".to_string());
+  }
+
+  let scale = warmup_scale_for(state.inner(), aid);
+  if let Err(code) = state.limiter.check_and_consume(aid, &channel, scale) {
+    dev_log!("[send_attachment] {code} account={aid} scale={scale}");
     log_send_audit(
       client, &user_id, &person_id, &channel, &chat_id, &chat_id,
       account_id.as_deref(), "error", Some(&code),
@@ -2896,7 +3893,7 @@ async fn send_attachment(
 
   let body_text = text.clone().unwrap_or_default();
 
-  dev_log!("[send_attachment] person={person_id} channel={channel} chat_id={chat_id} file={file_name} tier={tier:?}");
+  dev_log!("[send_attachment] person={person_id} channel={channel} chat_id={chat_id} file={file_name} scale={scale}");
 
   let file_part = reqwest::multipart::Part::bytes(raw)
     .file_name(file_name.clone())
@@ -2916,6 +3913,9 @@ async fn send_attachment(
   let body = response.text().await.unwrap_or_default();
 
   if !status.is_success() {
+    if status == reqwest::StatusCode::FORBIDDEN && !aid.is_empty() {
+      record_unipile_403_cooldown(state.inner(), aid);
+    }
     log_send_audit(
       client, &user_id, &person_id, &channel, &chat_id, &chat_id,
       account_id.as_deref(), "error", Some(&format!("attachment {status}: {body}")),
@@ -3666,6 +4666,53 @@ fn apple_date_to_rfc3339(date: i64) -> String {
     .unwrap_or_default()
 }
 
+/// Extract plain text from an `attributedBody` typedstream blob.
+///
+/// macOS Messages stores message text as an `NSAttributedString` archived via
+/// Apple's typedstream format ("NeXT/Apple typedstream data, little endian,
+/// version 4, system 1000"). The plain-text payload sits after the `NSString`
+/// class definition, prefixed by a `+` (0x2b) marker and a length-encoded
+/// byte sequence. Modern macOS often leaves `message.text` NULL and only
+/// populates this blob.
+///
+/// Length encoding after the `0x2b` marker (little-endian per the stream
+/// signature):
+/// - byte `n < 0x80` — direct 1-byte length
+/// - `0x81` then 1 byte — length ≤ 255
+/// - `0x82` then 2 bytes (LE) — length ≤ 65535
+/// - `0x83` then 3 bytes (LE) — length ≤ 16_777_215
+fn decode_attributed_body(blob: &[u8]) -> Option<String> {
+  let ns_str = b"NSString";
+  let start = blob.windows(ns_str.len()).position(|w| w == ns_str)?;
+  let search = &blob[start + ns_str.len()..];
+
+  let marker_rel = search.iter().position(|&b| b == 0x2b)?;
+  let after_marker = marker_rel + 1;
+  if after_marker >= search.len() { return None; }
+
+  let (length, data_start) = match search[after_marker] {
+    n if n < 0x80 => (n as usize, after_marker + 1),
+    0x81 if after_marker + 1 < search.len() => {
+      (search[after_marker + 1] as usize, after_marker + 2)
+    }
+    0x82 if after_marker + 2 < search.len() => {
+      let len = u16::from_le_bytes([search[after_marker + 1], search[after_marker + 2]]) as usize;
+      (len, after_marker + 3)
+    }
+    0x83 if after_marker + 3 < search.len() => {
+      let len = (search[after_marker + 1] as usize)
+        | ((search[after_marker + 2] as usize) << 8)
+        | ((search[after_marker + 3] as usize) << 16);
+      (len, after_marker + 4)
+    }
+    _ => return None,
+  };
+
+  let end = data_start.checked_add(length)?;
+  if end > search.len() { return None; }
+  String::from_utf8(search[data_start..end].to_vec()).ok()
+}
+
 #[derive(Debug)]
 struct IMsg {
   guid: String,
@@ -3679,27 +4726,48 @@ struct IMsg {
   chat_identifier: String,
 }
 
+/// Cheap watermark read: `message.ROWID` is the primary key, so `MAX` is a
+/// single B-tree lookup. Used by `spawn_imessage_watcher` to skip an entire
+/// poll cycle (SQLite scan + Supabase round-trip) when `chat.db` has not
+/// advanced since the last tick. Returns `0` for an empty table — callers
+/// should compare against their stored watermark, not rely on absence.
+fn imessage_max_rowid(db_path: &str) -> Result<i64, String> {
+  let conn = open_imessage_db(db_path)?;
+  let max: Option<i64> = conn
+    .query_row("SELECT MAX(ROWID) FROM message", [], |r| r.get(0))
+    .map_err(|e| format!("SQL query: {e}"))?;
+  Ok(max.unwrap_or(0))
+}
+
 fn read_imessage_db(db_path: &str, limit: u32) -> Result<Vec<IMsg>, String> {
   let conn = open_imessage_db(db_path)?;
 
   let mut stmt = conn.prepare(
     "SELECT m.guid, m.text, m.date, m.is_from_me, m.service,
             COALESCE(h.id, '') as sender_handle,
-            c.guid as chat_guid, c.display_name, c.chat_identifier
+            c.guid as chat_guid, c.display_name, c.chat_identifier,
+            m.attributedBody
      FROM message m
      JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
      JOIN chat c ON c.ROWID = cmj.chat_id
      LEFT JOIN handle h ON h.ROWID = m.handle_id
-     WHERE m.text IS NOT NULL AND m.text != ''
-       AND m.associated_message_type = 0
+     WHERE m.associated_message_type = 0
+       AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
      ORDER BY m.date DESC
      LIMIT ?1"
   ).map_err(|e| format!("SQL prepare: {e}"))?;
 
   let rows = stmt.query_map([limit], |row| {
+    let text_col: Option<String> = row.get(1)?;
+    let ab_blob: Option<Vec<u8>> = row.get(9)?;
+    let text = text_col
+      .filter(|t| !t.is_empty())
+      .or_else(|| ab_blob.as_deref().and_then(decode_attributed_body))
+      .unwrap_or_default();
+
     Ok(IMsg {
       guid: row.get(0)?,
-      text: row.get(1)?,
+      text,
       date: row.get(2)?,
       is_from_me: row.get::<_, i32>(3)? != 0,
       _service: row.get::<_, String>(4).unwrap_or_default(),
@@ -3712,7 +4780,9 @@ fn read_imessage_db(db_path: &str, limit: u32) -> Result<Vec<IMsg>, String> {
 
   let mut messages = Vec::new();
   for row in rows {
-    if let Ok(msg) = row { messages.push(msg); }
+    if let Ok(msg) = row {
+      if !msg.text.is_empty() { messages.push(msg); }
+    }
   }
   Ok(messages)
 }
@@ -3727,7 +4797,7 @@ async fn connect_imessage(
   let (handle_count, msg_count) = {
     let conn = open_imessage_db(&db_path)?;
     let handles: i64 = conn.query_row("SELECT COUNT(*) FROM handle", [], |r| r.get(0)).unwrap_or(0);
-    let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM message WHERE text IS NOT NULL AND text != ''", [], |r| r.get(0)).unwrap_or(0);
+    let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM message WHERE associated_message_type = 0 AND (text IS NOT NULL OR attributedBody IS NOT NULL)", [], |r| r.get(0)).unwrap_or(0);
     (handles, msgs)
   };
 
@@ -3808,21 +4878,21 @@ async fn imessage_status() -> Result<serde_json::Value, String> {
     .unwrap_or(0);
   let message_count: i64 = conn
     .query_row(
-      "SELECT COUNT(*) FROM message WHERE text IS NOT NULL AND text != ''",
+      "SELECT COUNT(*) FROM message WHERE associated_message_type = 0 AND (text IS NOT NULL OR attributedBody IS NOT NULL)",
       [],
       |r| r.get(0),
     )
     .unwrap_or(0);
   let oldest: Option<i64> = conn
     .query_row(
-      "SELECT MIN(date) FROM message WHERE text IS NOT NULL AND text != ''",
+      "SELECT MIN(date) FROM message WHERE associated_message_type = 0 AND (text IS NOT NULL OR attributedBody IS NOT NULL)",
       [],
       |r| r.get(0),
     )
     .ok();
   let newest: Option<i64> = conn
     .query_row(
-      "SELECT MAX(date) FROM message WHERE text IS NOT NULL AND text != ''",
+      "SELECT MAX(date) FROM message WHERE associated_message_type = 0 AND (text IS NOT NULL OR attributedBody IS NOT NULL)",
       [],
       |r| r.get(0),
     )
@@ -4426,7 +5496,7 @@ async fn reconcile_chats(
     if account_id.is_empty() { continue; }
 
     let chats_url = format!("{base}/api/v1/chats?account_id={account_id}&limit=50");
-    let remote_chats = match fetch_paginated(client, &chats_url, &api_key, 100).await {
+    let remote_chats = match fetch_paginated(client, &chats_url, &api_key, 100, Some(state.inner()), Some(account_id)).await {
       Ok(c) => c,
       Err(e) => {
         err_log!("[reconcile_unipile] chats fetch failed for {account_id}: {e}");
@@ -4701,4 +5771,115 @@ fn base64_engine() -> base64::engine::GeneralPurpose {
     &base64::alphabet::STANDARD,
     base64::engine::general_purpose::PAD,
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Build a minimal `attributedBody`-like blob: some garbage, then the
+  /// `NSString` class marker, a class-ref gap, the `+` (0x2b) marker, a
+  /// length prefix in the requested form, and the payload bytes.
+  fn make_ab_blob(payload: &[u8], length_form: u8) -> Vec<u8> {
+    let mut out: Vec<u8> = b"\x04\x0bstreamtyped\x81\xe8\x03\x84\x01\x40".to_vec();
+    out.extend_from_slice(b"NSString");
+    out.extend_from_slice(&[0x01, 0x95, 0x84, 0x01]);
+    out.push(0x2b);
+    match length_form {
+      // Direct length, payload must be < 0x80 bytes.
+      0 => out.push(payload.len() as u8),
+      // 0x81: next byte is length (0..=255).
+      0x81 => { out.push(0x81); out.push(payload.len() as u8); }
+      // 0x82: next 2 bytes little-endian.
+      0x82 => {
+        out.push(0x82);
+        let len = payload.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+      }
+      // 0x83: next 3 bytes little-endian.
+      0x83 => {
+        out.push(0x83);
+        let len = payload.len() as u32;
+        out.extend_from_slice(&len.to_le_bytes()[..3]);
+      }
+      _ => unreachable!("unsupported length_form in test helper"),
+    }
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&[0x86, 0x84, 0x02]);
+    out
+  }
+
+  #[test]
+  fn decodes_direct_length_ascii() {
+    let payload = b"998117 is your Emirates one-time passcode.";
+    let blob = make_ab_blob(payload, 0);
+    assert_eq!(
+      decode_attributed_body(&blob).as_deref(),
+      Some("998117 is your Emirates one-time passcode."),
+    );
+  }
+
+  #[test]
+  fn decodes_direct_length_utf8() {
+    // Arabic: the payload is multi-byte UTF-8 but still under 128 bytes.
+    let payload = "Vercel هو 8855".as_bytes();
+    let blob = make_ab_blob(payload, 0);
+    assert_eq!(
+      decode_attributed_body(&blob).as_deref(),
+      Some("Vercel هو 8855"),
+    );
+  }
+
+  #[test]
+  fn decodes_0x81_length_over_127_bytes() {
+    // 200-char ASCII message exceeds the single-byte-direct threshold and
+    // forces the 0x81 length-prefix branch.
+    let payload: Vec<u8> = std::iter::repeat(b'A').take(200).collect();
+    let blob = make_ab_blob(&payload, 0x81);
+    let out = decode_attributed_body(&blob).expect("should decode");
+    assert_eq!(out.len(), 200);
+    assert!(out.chars().all(|c| c == 'A'));
+  }
+
+  #[test]
+  fn decodes_0x82_little_endian_length() {
+    // 1000 bytes forces the 2-byte little-endian length prefix.
+    let payload: Vec<u8> = (0..1000).map(|i| b'a' + (i % 26) as u8).collect();
+    let blob = make_ab_blob(&payload, 0x82);
+    let out = decode_attributed_body(&blob).expect("should decode");
+    assert_eq!(out.len(), 1000);
+    assert_eq!(out.as_bytes(), payload.as_slice());
+  }
+
+  #[test]
+  fn returns_none_when_length_runs_off_end() {
+    // Claim a 200-byte payload but only provide 10 bytes of data.
+    let mut blob: Vec<u8> = b"NSString\x01\x95\x84\x01".to_vec();
+    blob.push(0x2b);
+    blob.push(0x81);
+    blob.push(200);
+    blob.extend_from_slice(b"too-short!");
+    assert_eq!(decode_attributed_body(&blob), None);
+  }
+
+  #[test]
+  fn returns_none_without_nsstring_marker() {
+    let blob = b"garbage without the class marker \x2b\x05hello";
+    assert_eq!(decode_attributed_body(blob), None);
+  }
+
+  #[test]
+  fn returns_none_on_empty_blob() {
+    assert_eq!(decode_attributed_body(&[]), None);
+  }
+
+  #[test]
+  fn returns_none_on_unknown_length_marker() {
+    let mut blob: Vec<u8> = b"NSString\x01\x95\x84\x01".to_vec();
+    blob.push(0x2b);
+    blob.push(0x84);
+    blob.push(0x05);
+    blob.extend_from_slice(b"hello");
+    assert_eq!(decode_attributed_body(&blob), None);
+  }
 }

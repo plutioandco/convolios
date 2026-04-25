@@ -159,6 +159,14 @@ async function handleRequest(req: Request): Promise<Response> {
       log.error("Webhook auth failed");
       return new Response("Unauthorized", { status: 401 });
     }
+    // The desktop app's Rust backend can forward on-device events with
+    // x-webhook-secret + x-on-device-user-id instead of a user JWT.
+    // The webhook secret proves the caller is trusted; the user id header
+    // identifies the account owner.
+    const userIdHeader = req.headers.get("x-on-device-user-id");
+    if (userIdHeader) {
+      onDeviceUserId = userIdHeader;
+    }
   }
 
   let payload: Record<string, unknown>;
@@ -631,6 +639,11 @@ interface OnDeviceMessagePayload {
   sent_at: string;
   body_text?: string | null;
   is_group?: boolean;
+  // is_known_contact is set by on-device bridges when the other party is
+  // already in the user's contact book on that platform (e.g. a Meta friend
+  // on Messenger). Used to bypass the Gate — these are people the user
+  // already talks to, not strangers.
+  is_known_contact?: boolean;
   sender?: { handle?: string | null; name?: string | null } | null;
   other_party: { handle: string; name?: string | null };
   attachments?: unknown[];
@@ -690,6 +703,7 @@ async function handleOnDeviceMessageReceived(
     contactName,
     p.account_id,
     p.direction,
+    p.is_known_contact === true,
   );
 
   const senderName = isGroup
@@ -1215,7 +1229,8 @@ async function findOrCreatePerson(
   handle: string,
   displayName: string,
   unipileAccountId: string,
-  direction: "inbound" | "outbound" = "inbound"
+  direction: "inbound" | "outbound" = "inbound",
+  isKnownContact = false,
 ): Promise<{ personId: string; identityId: string }> {
   const normalizedHandle = normalizeHandle(handle, channel);
 
@@ -1229,12 +1244,26 @@ async function findOrCreatePerson(
     .maybeSingle();
 
   if (existingIdentity) {
+    const patch: Record<string, unknown> = {};
     if (displayName && displayName !== "Unknown" && displayName !== "unknown") {
+      patch.display_name = displayName;
+    }
+    if (Object.keys(patch).length > 0) {
       await supabase
         .from("persons")
-        .update({ display_name: displayName })
+        .update(patch)
         .eq("id", existingIdentity.person_id)
         .eq("display_name", "Unknown");
+    }
+    // Retroactive promotion: a later backfill batch can flag an already-
+    // created person as a known contact. Lift them out of the Gate without
+    // touching already-approved / rejected / archived records.
+    if (isKnownContact) {
+      await supabase
+        .from("persons")
+        .update({ status: "approved" })
+        .eq("id", existingIdentity.person_id)
+        .eq("status", "pending");
     }
     return {
       personId: existingIdentity.person_id,
@@ -1267,18 +1296,28 @@ async function findOrCreatePerson(
         .eq("id", variantIdentity.person_id)
         .eq("display_name", "Unknown");
     }
+    if (isKnownContact) {
+      await supabase
+        .from("persons")
+        .update({ status: "approved" })
+        .eq("id", variantIdentity.person_id)
+        .eq("status", "pending");
+    }
     return {
       personId: variantIdentity.person_id,
       identityId: variantIdentity.id,
     };
   }
 
+  const initialStatus =
+    direction === "outbound" || isKnownContact ? "approved" : "pending";
+
   const { data: person, error: personError } = await supabase
     .from("persons")
     .insert({
       user_id: userId,
       display_name: displayName,
-      status: direction === "outbound" ? "approved" : "pending",
+      status: initialStatus,
     })
     .select("id")
     .single();

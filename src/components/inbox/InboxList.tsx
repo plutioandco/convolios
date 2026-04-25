@@ -17,6 +17,7 @@ import {
   cleanPreviewText, circleGradient, isLightBrandColor,
 } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
+import { AvatarImage } from '../AvatarImage'
 import type { ConversationPreview, FlaggedMessage, ThreadState, Channel } from '../../types'
 
 const REACTION_PREVIEW_RE = /^\{\{[^}]+\}\}\s*reacted\s+/
@@ -345,10 +346,11 @@ function CircleAddPeoplePanel({ userId, circleId, rtConnected, onClose }: {
           const isMember = inCircleIds.has(c.person.id) || addedIds.has(c.person.id)
           return (
             <div key={c.person.id} className="conv-row" onClick={() => handleToggle(c.person.id)}>
-              {c.person.avatar_url
-                ? <img src={c.person.avatar_url} alt="" className="w-8 h-8 rounded-full object-cover shrink-0" />
-                : <div className={`avatar avatar--lg ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>
-              }
+              <AvatarImage
+                src={c.person.avatar_url}
+                className="w-8 h-8 rounded-full object-cover shrink-0"
+                fallback={<div className={`avatar avatar--lg ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>}
+              />
               <span className="flex-1 text-base text-text-body truncate">{c.person.display_name}</span>
               {isMember
                 ? <Check size={14} className="text-success shrink-0" />
@@ -424,11 +426,15 @@ function ConversationRow({ c, active, onSelect, onContextMenu, circleColors, act
         className={`relative w-[42px] h-[42px] shrink-0${gradient ? ` circle-ring${isGroup ? ' circle-ring--square' : ''}` : ''}`}
         style={gradient ? { '--circle-gradient': gradient } as React.CSSProperties : undefined}
       >
-        {c.person.avatar_url
-          ? <img src={c.person.avatar_url} alt="" className="w-[42px] h-[42px] rounded-full object-cover" />
-          : <div className={`avatar avatar--2xl ${avatarCls(c.person.id)} ${isGroup ? 'avatar--group' : ''}`}>
+        <AvatarImage
+          src={c.person.avatar_url}
+          className="w-[42px] h-[42px] rounded-full object-cover"
+          fallback={
+            <div className={`avatar avatar--2xl ${avatarCls(c.person.id)} ${isGroup ? 'avatar--group' : ''}`}>
               {isGroup ? <Users size={18} /> : initials(c.person.display_name)}
-            </div>}
+            </div>
+          }
+        />
         <span className="channel-chip channel-chip--md" style={{ background: clr }}>
           <ChannelLogo channel={c.lastMessage.channel} size={10} color={isLightBrandColor(clr) ? 'var(--color-black)' : 'var(--color-white)'} />
         </span>
@@ -488,9 +494,11 @@ function GatekeeperCard({ c, active, onSelect, userId }: {
   return (
     <div className="gatekeeper-card" data-active={active} onClick={() => onSelect(c.person.id)}>
       <div className="relative w-9 h-9 shrink-0">
-        {c.person.avatar_url
-          ? <img src={c.person.avatar_url} alt="" className="w-9 h-9 rounded-full object-cover" />
-          : <div className={`avatar w-9 h-9 text-md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>}
+        <AvatarImage
+          src={c.person.avatar_url}
+          className="w-9 h-9 rounded-full object-cover"
+          fallback={<div className={`avatar w-9 h-9 text-md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>}
+        />
         <span className="channel-chip channel-chip--sm" style={{ background: clr }}>
           <ChannelLogo channel={c.lastMessage.channel} size={8} color={isLightBrandColor(clr) ? 'var(--color-black)' : 'var(--color-white)'} />
         </span>
@@ -523,9 +531,11 @@ function BlockedRow({ c, userId }: { c: ConversationPreview; userId?: string }) 
   return (
     <div className="blocked-row">
       <div className="relative w-9 h-9 shrink-0 opacity-60">
-        {c.person.avatar_url
-          ? <img src={c.person.avatar_url} alt="" className="w-9 h-9 rounded-full object-cover grayscale" />
-          : <div className={`avatar w-9 h-9 text-md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>}
+        <AvatarImage
+          src={c.person.avatar_url}
+          className="w-9 h-9 rounded-full object-cover grayscale"
+          fallback={<div className={`avatar w-9 h-9 text-md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</div>}
+        />
         <span className="channel-chip channel-chip--sm" style={{ background: clr }}>
           <ChannelLogo channel={c.lastMessage.channel} size={8} color={isLightBrandColor(clr) ? 'var(--color-black)' : 'var(--color-white)'} />
         </span>
@@ -560,9 +570,11 @@ function FlaggedRow({ f, active, onSelect, circleColors }: {
         className={`relative w-[42px] h-[42px] shrink-0${gradient ? ' circle-ring' : ''}`}
         style={gradient ? { '--circle-gradient': gradient } as React.CSSProperties : undefined}
       >
-        {f.avatarUrl
-          ? <img src={f.avatarUrl} alt="" className="w-[42px] h-[42px] rounded-full object-cover" />
-          : <div className={`avatar avatar--2xl ${avatarCls(f.personId)}`}>{initials(f.displayName)}</div>}
+        <AvatarImage
+          src={f.avatarUrl}
+          className="w-[42px] h-[42px] rounded-full object-cover"
+          fallback={<div className={`avatar avatar--2xl ${avatarCls(f.personId)}`}>{initials(f.displayName)}</div>}
+        />
         <span className="channel-chip channel-chip--md" style={{ background: clr }}>
           <ChannelLogo channel={f.channel} size={10} color={isLightBrandColor(clr) ? 'var(--color-black)' : 'var(--color-white)'} />
         </span>

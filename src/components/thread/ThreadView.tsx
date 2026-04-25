@@ -12,7 +12,6 @@ import {
 import { useAuth } from '../../lib/auth'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInboxStore } from '../../stores/inboxStore'
-import { usePreferencesStore } from '../../stores/preferencesStore'
 import { useRealtimeConnected } from '../../lib/realtimeContext'
 import { useConversations } from '../../hooks/useConversations'
 import { useThread, addPendingMessage, markPendingFailed, removePending, patchPendingExternalId, useCancelThreadQueries } from '../../hooks/useThread'
@@ -21,6 +20,7 @@ import { usePersonCircleColors } from '../../hooks/useCircles'
 import { supabase } from '../../lib/supabase'
 import { channelColor, formatTimestamp, shortTime, dateDivider, initials, avatarCls, cleanPreviewText, cleanSenderName, REACTION_RE, circleGradient, relativeTime } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
+import { AvatarImage } from '../AvatarImage'
 import { ThreadBanner } from './ThreadBanner'
 import * as S from './threadStyles'
 import type { Message, Channel, Identity } from '../../types'
@@ -930,6 +930,7 @@ export function ThreadView() {
 
 function ThreadViewInner() {
   const pid = useInboxStore((s) => s.selectedPersonId)
+  const inboxChannel = useInboxStore((s) => s.activeChannel)
   const focusMessageId = useInboxStore((s) => s.focusMessageId)
   const markRead = useInboxStore((s) => s.markConversationRead)
   const clearUnread = useInboxStore((s) => s.markPersonUnread)
@@ -950,6 +951,15 @@ function ThreadViewInner() {
   const dragCounterRef = useRef(0)
 
   const qc = useQueryClient()
+
+  useEffect(() => {
+    if (!pid) return
+    if (inboxChannel === 'all') {
+      setThreadChannelFilter('all')
+    } else {
+      setThreadChannelFilter(inboxChannel)
+    }
+  }, [pid, inboxChannel])
 
   useEffect(() => {
     let cancelled = false
@@ -1243,11 +1253,15 @@ function ThreadViewInner() {
                       className={`relative w-20 h-20${heroGradient ? ' circle-ring circle-ring--hero' : ''}`}
                       style={heroGradient ? { '--circle-gradient': heroGradient } as React.CSSProperties : undefined}
                     >
-                      {person.avatar_url
-                        ? <img src={person.avatar_url} alt="" className="w-20 h-20 rounded-full object-cover" />
-                        : <div className={`${avatarCls(person.id)} avatar avatar--hero`}>
+                      <AvatarImage
+                        src={person.avatar_url}
+                        className="w-20 h-20 rounded-full object-cover"
+                        fallback={
+                          <div className={`${avatarCls(person.id)} avatar avatar--hero`}>
                             {initials(person.display_name)}
-                          </div>}
+                          </div>
+                        }
+                      />
                     </div>}
                 <h3 className="text-2xl font-bold text-text-primary mt-2 flex items-center gap-2">
                   {person.display_name}
@@ -1362,6 +1376,7 @@ function ThreadViewInner() {
       <ComposeBox
         personId={pid}
         thread={thread}
+        channelScope={threadChannelFilter}
         convoLastMessage={convo?.lastMessage}
         personName={person?.display_name}
         replyTo={replyTo}
@@ -1491,13 +1506,15 @@ function ManualMergeDialog({ personId, personName, userId, allConvos, onClose }:
                 onClick={() => setSelectedTarget(c)}
                 className="manual-merge-candidate"
               >
-                {_.isString(c.person.avatar_url) ? (
-                  <img src={c.person.avatar_url} alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" />
-                ) : (
-                  <div className={`avatar avatar--lg ${avatarCls(c.person.id)}`}>
-                    {initials(c.person.display_name)}
-                  </div>
-                )}
+                <AvatarImage
+                  src={c.person.avatar_url}
+                  className="h-8 w-8 shrink-0 rounded-full object-cover"
+                  fallback={
+                    <div className={`avatar avatar--lg ${avatarCls(c.person.id)}`}>
+                      {initials(c.person.display_name)}
+                    </div>
+                  }
+                />
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium text-text-primary">{c.person.display_name}</div>
                   <div className="mt-0.5 flex gap-1">
@@ -1669,11 +1686,15 @@ function MsgFull({ msg, person, memberAvatars, isMe, onReply, onEdit, onFlag }: 
   return (
     <div className="msg-row msg-row--full">
       <MessageActions msg={msg} onReply={onReply} onEdit={onEdit ? () => onEdit(msg) : undefined} onFlag={onFlag} />
-      {senderPic
-        ? <img src={senderPic} alt="" className="msg-avatar" />
-        : <div className={`${av} msg-avatar-initial`}>
+      <AvatarImage
+        src={senderPic}
+        className="msg-avatar"
+        fallback={
+          <div className={`${av} msg-avatar-initial`}>
             {out ? 'Y' : initials(name)}
-          </div>}
+          </div>
+        }
+      />
 
       <div className="msg-name-row">
         <span className={`msg-name ${out ? 'text-success' : 'text-text-primary'}`}>
@@ -1714,8 +1735,8 @@ function MsgCompact({ msg, onReply, onEdit, onFlag }: { msg: Message; onReply: (
   )
 }
 
-function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, onClearReply, personIdentities, pendingDropFiles, onDropFilesConsumed, onComposeDropDismiss }: {
-  personId: string; thread: Message[]; convoLastMessage?: Message; personName?: string
+function ComposeBox({ personId, thread, channelScope, convoLastMessage, personName, replyTo, onClearReply, personIdentities, pendingDropFiles, onDropFilesConsumed, onComposeDropDismiss }: {
+  personId: string; thread: Message[]; channelScope: Channel | 'all'; convoLastMessage?: Message; personName?: string
   replyTo: Message | null; onClearReply: () => void; personIdentities?: Identity[]
   pendingDropFiles?: PendingFile[]
   onDropFilesConsumed?: () => void
@@ -1750,7 +1771,10 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
   const replyInKindChannel = (lastInbound?.channel ?? last?.channel) as Channel | undefined
 
   const identityChannels = _.uniqBy(personIdentities ?? [], (i) => i.channel)
-  const activeChannel = selectedChannel ?? replyInKindChannel ?? 'whatsapp'
+  const activeChannel = selectedChannel
+    ?? (channelScope !== 'all' ? channelScope : null)
+    ?? replyInKindChannel
+    ?? 'whatsapp'
   const activeIdentity = personIdentities?.find((i) => i.channel === activeChannel)
 
   const channelThread = useMemo(
@@ -1888,10 +1912,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
         const extId = await invoke<string>('send_message', { chatId: resolvedChatId, text: body, ...meta })
         if (extId) patchPendingExternalId(personId, optId, extId)
         invalidateThread()
-        if (usePreferencesStore.getState().syncReadStatus) {
-          invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
-            .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
-        }
+        void useInboxStore.getState().markConversationRead(meta.userId, personId)
       } catch (e) {
         const reason = describeError(e)
         console.error('[send_message] failed:', reason, e)
@@ -1989,10 +2010,7 @@ function ComposeBox({ personId, thread, convoLastMessage, personName, replyTo, o
           if (extId) patchPendingExternalId(personId, optId, extId)
         }
         invalidateThread()
-        if (usePreferencesStore.getState().syncReadStatus) {
-          invoke('chat_action', { userId: meta.userId, personId, action: 'mark_read' })
-            .catch((e) => { if (import.meta.env.DEV) console.warn('[chat_action] read sync:', e) })
-        }
+        void useInboxStore.getState().markConversationRead(meta.userId, personId)
       } catch (e) {
         const reason = describeError(e)
         console.error('[send] failed:', reason, e)

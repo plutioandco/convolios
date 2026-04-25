@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Lock, Plus, Trash2, Undo2, Link2, Check, X, AlertTriangle, RefreshCw, HardDrive } from 'lucide-react'
 import { useAuth } from '../../lib/auth'
+import { supabase } from '../../lib/supabase'
 import { invoke } from '@tauri-apps/api/core'
 import { getVersion } from '@tauri-apps/api/app'
 import { open } from '@tauri-apps/plugin-shell'
@@ -12,6 +13,7 @@ import { useDismissMerge, useMergeLog, useUndoMerge, useMergeClusters, useMergeC
 import { usePreferencesStore } from '../../stores/preferencesStore'
 import { channelLabel, channelColor, relativeTime, initials, avatarCls, CIRCLE_COLORS } from '../../utils'
 import { ChannelLogo } from '../icons/ChannelLogo'
+import { AvatarImage } from '../AvatarImage'
 import type { ConnectedAccount, MergeCluster } from '../../types'
 import _ from 'lodash'
 
@@ -54,6 +56,8 @@ export function Settings() {
   const [syncMsg, setSyncMsg] = useState('')
   const [pulling, setPulling] = useState(false)
   const [pullMsg, setPullMsg] = useState('')
+  const [resettingEmail, setResettingEmail] = useState(false)
+  const [resetEmailMsg, setResetEmailMsg] = useState('')
   const [disconnecting, setDisconnecting] = useState<string | null>(null)
   const [disconnectErr, setDisconnectErr] = useState('')
   const [activeTab, setActiveTab] = useState<'connections' | 'circles' | 'suggestions' | 'merges' | 'preferences' | 'about'>('connections')
@@ -74,7 +78,11 @@ export function Settings() {
     if (!user?.id) return
     setSyncing(true); setSyncMsg('')
     try {
-      const result = await invoke<string>('startup_sync', { userId: user.id })
+      const result = await invoke<string>('startup_sync', {
+        userId: user.id,
+        mode: 'full',
+        openChatId: null,
+      })
       setSyncMsg(result)
       refresh()
       queryClient.invalidateQueries({ queryKey: ['conversations', user.id] })
@@ -92,6 +100,31 @@ export function Settings() {
     }
     catch (e) { setPullMsg(String(e)) }
     finally { setPulling(false) }
+  }
+
+  const resetEmail = async () => {
+    if (!user?.id) return
+    const ok = window.confirm(
+      'Delete all email data stored in Convolios and re-import from the provider?\n\n' +
+      'Your mailbox is not deleted — only history in this app is cleared. ' +
+      'Use this if two email contacts were wrongly merged into one person.'
+    )
+    if (!ok) return
+    setResettingEmail(true); setResetEmailMsg('')
+    try {
+      const { data, error } = await supabase.rpc('reset_email_ingestion', { p_user_id: user.id })
+      if (error) throw error
+      const counts = data as { messages_deleted: number; identities_deleted: number; persons_deleted: number } | null
+      const cleared = counts
+        ? `Cleared ${counts.messages_deleted} messages, ${counts.identities_deleted} identities, ${counts.persons_deleted} persons. Re-pulling…`
+        : 'Cleared. Re-pulling…'
+      setResetEmailMsg(cleared)
+      const result = await invoke<string>('backfill_messages', { userId: user.id })
+      setResetEmailMsg(result)
+      queryClient.invalidateQueries({ queryKey: ['conversations', user.id] })
+    }
+    catch (e) { setResetEmailMsg(String(e)) }
+    finally { setResettingEmail(false) }
   }
 
   const disconnect = async (accountId: string) => {
@@ -174,6 +207,20 @@ export function Settings() {
               <Btn onClick={pull} busy={pulling}>{pulling ? 'Pulling...' : 'Pull History'}</Btn>
             </div>
             {pullMsg && <Hint>{pullMsg}</Hint>}
+
+            <div className="settings-card">
+              <div className="settings-card-body">
+                <p className="settings-card-name">Reset Email Sync</p>
+                <p className="settings-card-desc">
+                  Removes email messages and email identities from Convolios and
+                  re-imports from the provider. Does not delete your mailbox.
+                </p>
+              </div>
+              <Btn onClick={resetEmail} busy={resettingEmail}>
+                {resettingEmail ? 'Resetting...' : 'Reset Email'}
+              </Btn>
+            </div>
+            {resetEmailMsg && <Hint>{resetEmailMsg}</Hint>}
 
             <div className="h-px bg-border my-10" />
 
@@ -638,6 +685,11 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
   const sub = accountSubline(a)
   const isDisconnecting = disconnecting === a.account_id
   const color = channelColor(a.channel)
+  const messengerInboxNotReady =
+    a.provider === 'on_device' &&
+    a.channel === 'messenger' &&
+    a.status === 'active' &&
+    _.get(a.connection_params, 'receive_inbox_ready') !== true
   const synced = _.isString(a.last_synced_at) ? relativeTime(a.last_synced_at) : null
   const connected = _.isString(a.created_at) ? relativeTime(a.created_at) : null
   const accountLogo = (a.channel === 'email' && _.isString(a.provider_type) && a.provider_type.toUpperCase() === 'MICROSOFT')
@@ -681,8 +733,22 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
             <span className="text-lg font-semibold text-text-primary">
               {channelLabel(a.channel)}
             </span>
-            <span className={`text-xs font-semibold py-px px-1.5 rounded-chip capitalize ${a.status === 'active' ? 'bg-[var(--hover-success-subtle)] text-success' : 'bg-[var(--hover-danger-strong)] text-danger'}`}>
-              {needsReconnect ? 'Reconnect required' : a.status}
+            <span
+              className={`text-xs font-semibold py-px px-1.5 rounded-chip capitalize ${
+                needsReconnect
+                  ? 'bg-[var(--hover-danger-strong)] text-danger'
+                  : messengerInboxNotReady
+                    ? 'bg-[var(--hover-warning-subtle)] text-warning'
+                    : a.status === 'active'
+                      ? 'bg-[var(--hover-success-subtle)] text-success'
+                      : 'bg-[var(--hover-danger-strong)] text-danger'
+              }`}
+            >
+              {needsReconnect
+                ? 'Reconnect required'
+                : messengerInboxNotReady
+                  ? 'Setting up'
+                  : a.status}
             </span>
           </div>
           {detail && (
@@ -713,7 +779,10 @@ function AccountCard({ account: a, disconnecting, onDisconnect }: {
 
       <div className="flex gap-4 pr-4 pb-2.5 pl-[68px] text-xs text-text-pending">
         {connected && <span>Connected {connected}</span>}
-        {synced && <span>Synced {synced}</span>}
+        {messengerInboxNotReady && (
+          <span>Still setting up — incoming messages are not available in this app yet</span>
+        )}
+        {!messengerInboxNotReady && synced && <span>Synced {synced}</span>}
       </div>
 
       {a.channel === 'imessage' && a.status === 'active' && user?.id && (
@@ -1131,13 +1200,11 @@ function MergeSuggestionsView({ userId }: { userId?: string }) {
 function SuggestionAvatar({ name, avatar, id }: { name: string; avatar: string | null; id?: string }) {
   return (
     <div className={`${id ? avatarCls(id) : 'bg-[var(--color-accent)]'} flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full`}>
-      {_.isString(avatar) ? (
-        <img src={avatar} alt="" className="h-full w-full object-cover" />
-      ) : (
-        <span className="text-base font-semibold text-white">
-          {initials(name)}
-        </span>
-      )}
+      <AvatarImage
+        src={avatar}
+        className="h-full w-full object-cover"
+        fallback={<span className="text-base font-semibold text-white">{initials(name)}</span>}
+      />
     </div>
   )
 }

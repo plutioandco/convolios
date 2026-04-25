@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.14"
+version = "0.2.15"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -48,6 +48,7 @@ regex = "1"
 # wry re-exports `Cookie` but we touch it directly for its `Display` impl and
 # ergonomic field accessors during the on-device login cookie grab.
 cookie = "0.18"
+dirs = "6.0.0"
 
 # macOS-only: on-device login webview cookie extraction bridges directly to
 # WKHTTPCookieStore via objc2. Versions pinned to what Tauri already uses

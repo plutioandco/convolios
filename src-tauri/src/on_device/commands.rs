@@ -262,6 +262,7 @@ async fn finalize_login(
   .await?;
 
   handle.set_account_id(account_id.clone()).await;
+  handle.set_user_id(user_id.clone()).await;
 
   handle
     .call("begin_events", json!({ "account_id": account_id }))
@@ -288,7 +289,13 @@ pub async fn on_device_resume_all(
   manager: State<'_, BridgeManager>,
   state: State<'_, AppState>,
 ) -> Result<u32, String> {
-  let accounts = fetch_connected_accounts(&state.http, &user_id).await?;
+  let accounts = match fetch_connected_accounts(&state.http, &user_id).await {
+    Ok(a) => a,
+    Err(e) => {
+      eprintln!("[on_device] resume_all: fetch failed: {e}");
+      return Err(e);
+    }
+  };
   let mut resumed = 0u32;
 
   for acc in accounts {
@@ -312,6 +319,7 @@ pub async fn on_device_resume_all(
     let binary = resolve_sidecar_path(&app, META_BRIDGE_BIN)?;
     let handle = BridgeHandle::spawn(app.clone(), &binary, &[]).await?;
     handle.set_account_id(account_id.clone()).await;
+    handle.set_user_id(user_id.clone()).await;
 
     if let Err(e) = handle
       .call(
@@ -547,7 +555,12 @@ async fn extract_required_cookies(
 
 fn cookie_domain_allowed(domain: &str, suffixes: &[&str]) -> bool {
   let d = domain.trim_start_matches('.');
-  suffixes.iter().any(|s| d.ends_with(s))
+  suffixes.iter().any(|s| {
+    d == *s
+      || (d.len() > s.len()
+        && d.as_bytes().get(d.len() - s.len() - 1) == Some(&b'.')
+        && d.ends_with(s))
+  })
 }
 
 /// When several cookies share a name (common for `xs` across messenger.com vs
@@ -675,6 +688,7 @@ async fn fetch_connected_accounts(
     ))
     .header("apikey", &service_key)
     .header("Authorization", format!("Bearer {service_key}"))
+    .timeout(std::time::Duration::from_secs(8))
     .send()
     .await
     .map_err(|e| format!("fetch accounts: {e}"))?;
@@ -705,6 +719,13 @@ async fn store_connected_account(
     .map_err(|_| "SUPABASE_SERVICE_ROLE_KEY not set".to_string())?;
 
   let now = chrono::Utc::now().to_rfc3339();
+  // Messenger: inbound `message_received` / inbox pipeline is tracked separately; keep UI honest
+  // until `receive_inbox_ready` is set true (see AccountCard in Settings).
+  let connection_params = if channel == "messenger" {
+    json!({ "bridge": "meta-bridge", "receive_inbox_ready": false })
+  } else {
+    json!({ "bridge": "meta-bridge" })
+  };
   let row = json!({
     "user_id": user_id,
     "provider": ON_DEVICE_PROVIDER,
@@ -719,7 +740,7 @@ async fn store_connected_account(
       "messenger" => "Messenger (on device)",
       _ => channel,
     },
-    "connection_params": { "bridge": "meta-bridge" },
+    "connection_params": connection_params,
     "last_synced_at": now,
     "updated_at": now,
   });

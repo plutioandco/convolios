@@ -67,6 +67,8 @@ struct BridgeInner {
   /// Sidecar-reported account id. May be empty during the login flow, before
   /// the sidecar has resolved the user's provider account id.
   account_id: Mutex<String>,
+  /// User id of the Convolios user who owns this bridge session.
+  user_id: Mutex<String>,
   /// Outbound queue — RPC requests and a shutdown signal.
   tx: mpsc::Sender<Outbound>,
   /// Active in-flight requests, keyed by RPC id.
@@ -167,6 +169,7 @@ impl BridgeHandle {
     let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(64);
     let inner = Arc::new(BridgeInner {
       account_id: Mutex::new(String::new()),
+      user_id: Mutex::new(String::new()),
       tx: outbound_tx,
       pending: Mutex::new(HashMap::new()),
       next_id: std::sync::atomic::AtomicU64::new(1),
@@ -240,6 +243,11 @@ impl BridgeHandle {
   /// Record the provider account id the sidecar resolved for this session.
   pub async fn set_account_id(&self, id: String) {
     let mut guard = self.inner.account_id.lock().await;
+    *guard = id;
+  }
+
+  pub async fn set_user_id(&self, id: String) {
+    let mut guard = self.inner.user_id.lock().await;
     *guard = id;
   }
 
@@ -356,6 +364,11 @@ async fn reader_task<R>(
 ) where
   R: tokio::io::AsyncRead + Unpin,
 {
+  let http = app.state::<crate::AppState>().http.clone();
+  let supabase_url = std::env::var("VITE_SUPABASE_URL").unwrap_or_default();
+  let webhook_secret = std::env::var("UNIPILE_WEBHOOK_SECRET").unwrap_or_default();
+  let webhook_url = format!("{supabase_url}/functions/v1/unipile-webhook");
+
   let mut line = String::new();
   loop {
     line.clear();
@@ -392,6 +405,34 @@ async fn reader_task<R>(
         serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null));
       match event {
         Ok(ev) => {
+          // Forward message_received events directly to the webhook from
+          // Rust — bypasses the fragile frontend → fetch → webhook hop
+          // that can lose messages during HMR or cold starts.
+          if ev.kind == "message_received" && !webhook_secret.is_empty() {
+            let user_id = inner.user_id.lock().await.clone();
+            if user_id.is_empty() {
+              eprintln!("[on_device] dropping message_received — user_id not set yet (account={})", ev.account_id);
+            } else {
+            let body = serde_json::json!({
+              "event": "on_device.message_received",
+              "account_id": ev.account_id,
+              "channel": ev.channel,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+            let mut merged = body;
+            if let Value::Object(payload_map) = &ev.payload {
+              for (k, v) in payload_map {
+                merged.insert(k.clone(), v.clone());
+              }
+            }
+
+            post_event_to_webhook(&http, &webhook_url, &webhook_secret, &user_id, Value::Object(merged)).await;
+            }
+          }
+
           if let Some(window) = app.get_webview_window("main") {
             let _ = window.emit("on_device:event", &ev);
           } else {
@@ -416,6 +457,45 @@ async fn reader_task<R>(
       }),
     });
   }
+}
+
+async fn post_event_to_webhook(
+  http: &reqwest::Client,
+  url: &str,
+  webhook_secret: &str,
+  user_id: &str,
+  body: Value,
+) {
+  let delays = [0u64, 2000, 4000, 8000];
+  for (i, delay) in delays.iter().enumerate() {
+    if *delay > 0 {
+      tokio::time::sleep(std::time::Duration::from_millis(*delay)).await;
+    }
+    match http
+      .post(url)
+      .header("x-webhook-secret", webhook_secret)
+      .header("x-on-device-user-id", user_id)
+      .json(&body)
+      .timeout(std::time::Duration::from_secs(30))
+      .send()
+      .await
+    {
+      Ok(resp) if resp.status().is_success() => return,
+      Ok(resp) if resp.status().as_u16() < 500 && resp.status().as_u16() != 429 => {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        eprintln!("[on_device] webhook {status} (non-retryable): {text}");
+        return;
+      }
+      Ok(resp) => {
+        eprintln!("[on_device] webhook {} — retrying ({}/{})", resp.status(), i + 1, delays.len());
+      }
+      Err(e) => {
+        eprintln!("[on_device] webhook failed — retrying ({}/{}): {e:?}", i + 1, delays.len());
+      }
+    }
+  }
+  eprintln!("[on_device] webhook delivery failed after all retries");
 }
 
 /// Resolve the path to a bridged sidecar binary.

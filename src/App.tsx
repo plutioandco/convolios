@@ -22,6 +22,7 @@ import { useAccountsStore } from './stores/accountsStore'
 import { useSyncStatusStore } from './stores/syncStatusStore'
 import { channelLabel, channelColor, accountDisplayLabel, initials, avatarCls, relativeTime, cleanPreviewText } from './utils'
 import { ChannelLogo } from './components/icons/ChannelLogo'
+import { AvatarImage } from './components/AvatarImage'
 import { RealtimeContext, useRealtimeConnected } from './lib/realtimeContext'
 import type { ConnectedAccount, Channel } from './types'
 import _ from 'lodash'
@@ -45,6 +46,8 @@ const CACHE_BUSTER = 'v10'
 // events" case without hammering on every app-switch. The Rust-side
 // hourly heartbeat handles the long-term sanity net.
 const FOCUS_SYNC_IDLE_THRESHOLD_MS = 2 * 60 * 60 * 1000
+
+const LIVENESS_ACTIVITY_BUMP_THROTTLE_MS = 60_000
 
 class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null }
@@ -299,13 +302,65 @@ function Authenticated({ userId }: { userId: string }) {
     [accounts],
   )
 
+  const lastActivityBumpRef = useRef(0)
+  const openUnipileThreadId = useInboxStore((s) => s.openUnipileThreadId)
+
+  const pushLiveness = useCallback((bumpActivity: boolean) => {
+    if (bumpActivity) {
+      const t = Date.now()
+      if (t - lastActivityBumpRef.current < LIVENESS_ACTIVITY_BUMP_THROTTLE_MS) {
+        return
+      }
+      lastActivityBumpRef.current = t
+    }
+    const windowVisible = !document.hidden && document.hasFocus()
+    const raw = useInboxStore.getState().openUnipileThreadId
+    const openChatId = _.isString(raw) && raw.length > 0 ? raw : null
+    void invoke('update_sync_liveness', { windowVisible, openChatId, bumpActivity })
+      .catch((e) => { if (import.meta.env.DEV) console.warn('[update_sync_liveness]', e) })
+  }, [])
+
+  const runLightSync = useCallback(() => {
+    const raw = useInboxStore.getState().openUnipileThreadId
+    return invoke('startup_sync', {
+      userId,
+      mode: 'light',
+      openChatId: _.isString(raw) && raw.length > 0 ? raw : null,
+    }).finally(() => {
+      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+    })
+  }, [userId])
+
+  useEffect(() => {
+    pushLiveness(false)
+  }, [openUnipileThreadId, pushLiveness])
+
+  useEffect(() => {
+    pushLiveness(false)
+    const onVis = () => pushLiveness(false)
+    const onWinFocus = () => pushLiveness(false)
+    const onWinBlur = () => pushLiveness(false)
+    const onAct = () => pushLiveness(true)
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('focus', onWinFocus, true)
+    window.addEventListener('blur', onWinBlur, true)
+    for (const ev of ['pointerdown', 'keydown', 'wheel', 'scroll'] as const) {
+      window.addEventListener(ev, onAct, { passive: true, capture: true })
+    }
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.removeEventListener('focus', onWinFocus, true)
+      window.removeEventListener('blur', onWinBlur, true)
+      for (const ev of ['pointerdown', 'keydown', 'wheel', 'scroll'] as const) {
+        window.removeEventListener(ev, onAct, true)
+      }
+    }
+  }, [pushLiveness])
+
   useEffect(() => {
     const onOnline = () => {
       setOffline(false)
-      invoke('startup_sync', { userId })
-        .finally(() => {
-          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-        })
+      void runLightSync()
     }
     const onOffline = () => setOffline(true)
     window.addEventListener('online', onOnline)
@@ -314,7 +369,7 @@ function Authenticated({ userId }: { userId: string }) {
       window.removeEventListener('online', onOnline)
       window.removeEventListener('offline', onOffline)
     }
-  }, [userId])
+  }, [runLightSync])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -333,15 +388,8 @@ function Authenticated({ userId }: { userId: string }) {
     fetchAccounts(userId)
     subscribe(userId)
 
-    const runSync = () => {
-      invoke('startup_sync', { userId })
-        .finally(() => {
-          queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
-        })
-    }
-
-    // Cold start: one reconcile on mount.
-    runSync()
+    // Cold start: one reconcile on mount (light — 72h sweep is Settings Re-sync only).
+    runLightSync()
 
     // Sync heartbeat lives in Rust (tokio interval, immune to WKWebView
     // throttling). Start it once; the Rust side de-dups across re-mounts.
@@ -357,7 +405,7 @@ function Authenticated({ userId }: { userId: string }) {
       const last = lastBlurMsRef.current
       lastBlurMsRef.current = null
       if (last !== null && Date.now() - last >= FOCUS_SYNC_IDLE_THRESHOLD_MS) {
-        runSync()
+        runLightSync()
       }
     }
     window.addEventListener('blur', onBlur)
@@ -392,6 +440,14 @@ function Authenticated({ userId }: { userId: string }) {
       }
     })
 
+    // The Rust watcher only emits after a successful backfill where the
+    // `chat.db` rowid has actually advanced past the last watermark, so any
+    // event here means new iMessage rows landed in Supabase.
+    const unlistenImessageSynced = listen('imessage-synced', () => {
+      queryClient.invalidateQueries({ queryKey: ['conversations', userId] })
+      queryClient.invalidateQueries({ queryKey: ['sidebar-unread', userId] })
+    })
+
     // NOTE: notification-click → conversation routing is not implementable
     // with @tauri-apps/plugin-notification on macOS desktop — `onAction` and
     // `registerActionTypes` are mobile-only commands. A desktop bridge
@@ -405,8 +461,9 @@ function Authenticated({ userId }: { userId: string }) {
       unsubscribe()
       unlistenDisconnect.then((fn) => fn())
       unlistenSync.then((fn) => fn())
+      unlistenImessageSynced.then((fn) => fn())
     }
-  }, [userId, fetchAccounts, subscribe, unsubscribe])
+  }, [userId, fetchAccounts, subscribe, unsubscribe, runLightSync])
 
   return (
     <RealtimeContext.Provider value={connected}>
@@ -477,6 +534,7 @@ function InboxRoute({ userId, realtimeConnected }: { userId: string; realtimeCon
   const accounts = useAccountsStore((s) => s.accounts)
   const accountsLoading = useAccountsStore((s) => s.loading)
   const selectedConvo = useMemo(() => convos.find((c) => c.person.id === pid), [convos, pid])
+  const setOpenUnipileThread = useInboxStore((s) => s.setOpenUnipileThreadId)
   const person = selectedConvo?.person
   const nav = useNavigate()
 
@@ -516,6 +574,13 @@ function InboxRoute({ userId, realtimeConnected }: { userId: string; realtimeCon
     return () => window.removeEventListener('keydown', handleKeyNav)
   }, [handleKeyNav])
 
+  useEffect(() => {
+    const tid = selectedConvo?.lastMessage?.thread_id
+    setOpenUnipileThread(
+      _.isString(tid) && tid.length > 0 ? tid : null,
+    )
+  }, [selectedConvo, setOpenUnipileThread])
+
   if (!accountsLoading && accounts.length === 0) {
     return <WelcomeOnboarding onGoToSettings={() => nav('/settings')} />
   }
@@ -529,9 +594,11 @@ function InboxRoute({ userId, realtimeConnected }: { userId: string; realtimeCon
         <TopBar>
           {person ? (
             <>
-              {person.avatar_url
-                ? <img src={person.avatar_url} alt="" className="w-6 h-6 rounded-full object-cover" />
-                : <span className="avatar avatar--sm av-1">{person.display_name?.charAt(0)?.toUpperCase()}</span>}
+              <AvatarImage
+                src={person.avatar_url}
+                className="w-6 h-6 rounded-full object-cover"
+                fallback={<span className="avatar avatar--sm av-1">{person.display_name?.charAt(0)?.toUpperCase()}</span>}
+              />
               <span className="top-bar-title">{person.display_name}</span>
               {channelAccount && <ConnectionPill account={channelAccount} />}
             </>
@@ -749,9 +816,11 @@ function SearchModal({ userId, onClose, onSelectPerson }: {
                   active={activeIdx === i}
                   onClick={() => onSelectPerson(c.person.id)}
                 >
-                  {c.person.avatar_url
-                    ? <img src={c.person.avatar_url} alt="" className="w-7 h-7 rounded-full object-cover" />
-                    : <span className={`avatar avatar--md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</span>}
+                  <AvatarImage
+                    src={c.person.avatar_url}
+                    className="w-7 h-7 rounded-full object-cover"
+                    fallback={<span className={`avatar avatar--md ${avatarCls(c.person.id)}`}>{initials(c.person.display_name)}</span>}
+                  />
                   <span className="text-base text-text-primary">{c.person.display_name}</span>
                   <span className="text-sm text-text-pending ml-auto">
                     {channelLabel(c.lastMessage.channel)}
@@ -773,9 +842,11 @@ function SearchModal({ userId, onClose, onSelectPerson }: {
                     active={activeIdx === idx}
                     onClick={() => onSelectPerson(r.person_id)}
                   >
-                    {r.avatar_url
-                      ? <img src={r.avatar_url} alt="" className="w-7 h-7 rounded-full object-cover" />
-                      : <span className={`avatar avatar--md ${avatarCls(r.person_id)}`}>{initials(r.display_name)}</span>}
+                    <AvatarImage
+                      src={r.avatar_url}
+                      className="w-7 h-7 rounded-full object-cover"
+                      fallback={<span className={`avatar avatar--md ${avatarCls(r.person_id)}`}>{initials(r.display_name)}</span>}
+                    />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span className="text-md font-medium text-text-primary">{r.display_name}</span>

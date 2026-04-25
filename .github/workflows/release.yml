@@ -24,6 +24,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src-tauri/sidecars/meta-bridge/go.mod
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 

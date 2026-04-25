@@ -939,7 +939,7 @@ function ThreadViewInner() {
   const rtConnected = useRealtimeConnected()
   const { data: convos = [] } = useConversations(user?.id, rtConnected, 'approved')
   const { data: pendingConvos = [] } = useConversations(user?.id, rtConnected, 'pending')
-  const { data: thread = [], isLoading: threadLoading, hasMore, loadMore, isLoadingMore } = useThread(pid, user?.id, rtConnected)
+  const { data: thread = [], isLoading: threadLoading, isError: threadIsError, error: threadError, hasMore, loadMore, isLoadingMore } = useThread(pid, user?.id, rtConnected)
   const { data: circleColors } = usePersonCircleColors(user?.id)
   const [memberAvatars, setMemberAvatars] = useState<Record<string, string>>({})
   const [replyTo, setReplyTo] = useState<Message | null>(null)
@@ -951,15 +951,7 @@ function ThreadViewInner() {
   const dragCounterRef = useRef(0)
 
   const qc = useQueryClient()
-
-  useEffect(() => {
-    if (!pid) return
-    if (inboxChannel === 'all') {
-      setThreadChannelFilter('all')
-    } else {
-      setThreadChannelFilter(inboxChannel)
-    }
-  }, [pid, inboxChannel])
+  const effectiveThreadChannelFilter = inboxChannel === 'all' ? threadChannelFilter : inboxChannel
 
   useEffect(() => {
     let cancelled = false
@@ -1035,9 +1027,9 @@ function ThreadViewInner() {
     return map
   })()
 
-  const filteredThread = threadChannelFilter === 'all'
+  const filteredThread = effectiveThreadChannelFilter === 'all'
     ? thread
-    : thread.filter((m) => m.channel === threadChannelFilter)
+    : thread.filter((m) => m.channel === effectiveThreadChannelFilter)
 
   const mySenderNames = isGroup
     ? new Set([
@@ -1195,6 +1187,8 @@ function ThreadViewInner() {
 
   if (!pid) return <EmptyState />
 
+  if (threadIsError) throw threadError
+
   if (threadLoading && thread.length === 0) return <ThreadSkeleton />
 
   return (
@@ -1310,10 +1304,10 @@ function ThreadViewInner() {
 
           {availableChannels.length > 1 && (
             <div className="flex gap-1 px-4 pt-2 pb-1 flex-wrap">
-              <ChannelFilterPill active={threadChannelFilter === 'all'} onClick={() => setThreadChannelFilter('all')}>All</ChannelFilterPill>
+              <ChannelFilterPill active={effectiveThreadChannelFilter === 'all'} onClick={() => setThreadChannelFilter('all')}>All</ChannelFilterPill>
               {availableChannels.map((ch) => (
-                <ChannelFilterPill key={ch} active={threadChannelFilter === ch} onClick={() => setThreadChannelFilter(ch as Channel)}>
-                  <ChannelLogo channel={ch} size={11} color={threadChannelFilter === ch ? 'var(--color-white)' : channelColor(ch)} className="mr-1" />
+                <ChannelFilterPill key={ch} active={effectiveThreadChannelFilter === ch} onClick={() => setThreadChannelFilter(ch as Channel)}>
+                  <ChannelLogo channel={ch} size={11} color={effectiveThreadChannelFilter === ch ? 'var(--color-white)' : channelColor(ch)} className="mr-1" />
                   {ch.charAt(0).toUpperCase() + ch.slice(1)}
                 </ChannelFilterPill>
               ))}
@@ -1376,7 +1370,7 @@ function ThreadViewInner() {
       <ComposeBox
         personId={pid}
         thread={thread}
-        channelScope={threadChannelFilter}
+        channelScope={effectiveThreadChannelFilter}
         convoLastMessage={convo?.lastMessage}
         personName={person?.display_name}
         replyTo={replyTo}

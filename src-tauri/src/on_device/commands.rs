@@ -302,8 +302,11 @@ pub async fn on_device_resume_all(
     let account_id = acc.account_id.clone();
     let channel = acc.channel.clone();
 
-    if manager.get_active(&account_id).await.is_some() {
-      continue;
+    if let Some(active) = manager.get_active(&account_id).await {
+      if !active.is_closed() {
+        continue;
+      }
+      manager.remove_active(&account_id).await;
     }
 
     let cookies = match keychain::get_secret(ON_DEVICE_PROVIDER, &user_id, &account_id)? {

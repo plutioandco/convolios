@@ -178,6 +178,8 @@ export function useThread(personId: string | null, userId?: string, realtimeConn
   return {
     data: merged,
     isLoading: query.isLoading,
+    isError: query.isError,
+    error: query.error,
     hasMore: query.hasNextPage ?? false,
     loadMore: query.fetchNextPage,
     isLoadingMore: query.isFetchingNextPage,

@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, type InfiniteData } from '@tanstack/react-query'
 import _ from 'lodash'
 import { supabase } from '../lib/supabase'
 import { queryClient } from '../lib/queryClient'
@@ -74,9 +74,9 @@ function enrichPrevInbound(previews: ConversationPreview[], userId: string, batc
   return previews.map((c) => {
     if (c.lastMessage.direction !== 'outbound') return c
 
-    const cached = queryClient.getQueryData<Message[]>(['thread', c.person.id, userId])
-    if (cached) {
-      const inbound = _.findLast(cached, (m) => m.direction === 'inbound')
+    const cached = queryClient.getQueryData<InfiniteData<Message[]>>(['thread', c.person.id, userId])
+    if (cached?.pages) {
+      const inbound = _.findLast(cached.pages.flatMap((page) => page), (m) => m.direction === 'inbound')
       if (inbound?.body_text) {
         return { ...c, prevInboundBody: inbound.body_text, prevInboundSender: inbound.sender_name }
       }

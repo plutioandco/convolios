@@ -13,6 +13,7 @@
 //! recompile because the binary identity changes. We fall back to a JSON
 //! file in the platform data directory.
 
+#[cfg(not(debug_assertions))]
 use super::KEYCHAIN_SERVICE;
 
 fn account_key(provider: &str, supabase_user_id: &str, account_id: &str) -> String {

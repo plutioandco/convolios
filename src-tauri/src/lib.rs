@@ -1430,13 +1430,13 @@ async fn startup_sync_inner(
     .format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
   let mut msgs_synced = 0u32;
 
-  // X DM backfill ran on every 2-min tick before — wasteful. Gate to once
-  // per process launch; Twitter API cursors cover subsequent updates.
-  // iMessage: first pull here only; macOS `spawn_imessage_watcher` polls
-  // `chat.db` periodically (see `IMESSAGE_POLL_*`).
-  // `compare_exchange` is the set-once idiom — only the first caller
-  // sees `Ok`.
-  if state.backfilled_x.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+  // X has no webhook path here, so keep it on the hourly/focused heartbeat.
+  // The first launch also runs it immediately; later heartbeat ticks rely on
+  // the same self-heal cursor used inside `backfill_x_dms`.
+  let should_sync_x = from_heartbeat
+    || full_sweep
+    || state.backfilled_x.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+  if should_sync_x {
     emit("syncing", "Syncing X DMs...");
     match backfill_x_dms(client, user_id, &supabase_url, &service_key).await {
       Ok((m, c)) if m > 0 => dev_log!("[startup_sync] X: {m} msgs from {c} chats"),
@@ -2796,6 +2796,7 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         std::collections::HashMap::new()
       };
 
+      let chat_error_start = errors.len();
       let messages = match fetch_paginated(
         client,
         &msgs_base_url,
@@ -3022,18 +3023,21 @@ async fn backfill_messages(user_id: String, state: State<'_, AppState>) -> Resul
         }
       }
 
-      chat_sync_mark_backfilled(
-        client,
-        &supabase_url,
-        &service_key,
-        &user_id,
-        chat_id,
-        channel,
-        &acc.id,
-      )
-      .await;
-
-      total_chats += 1;
+      if errors.len() == chat_error_start {
+        chat_sync_mark_backfilled(
+          client,
+          &supabase_url,
+          &service_key,
+          &user_id,
+          chat_id,
+          channel,
+          &acc.id,
+        )
+        .await;
+        total_chats += 1;
+      } else {
+        dev_log!("[backfill_messages] not marking {chat_id} backfilled after write errors");
+      }
     }
   }
 
@@ -3122,7 +3126,12 @@ async fn sync_chat(
           .and_then(|r| r.get("sent_at").and_then(|v| v.as_str()))
           .and_then(|ts| chrono::DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z").ok()
             .or_else(|| chrono::DateTime::parse_from_rfc3339(ts).ok()))
-          .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+          .map(|dt| {
+            let self_heal_floor = chrono::Utc::now() - chrono::Duration::hours(SYNC_SELF_HEAL_HOURS);
+            std::cmp::min(dt.with_timezone(&chrono::Utc), self_heal_floor)
+              .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+              .to_string()
+          })
       }
       _ => None,
     };
@@ -4410,9 +4419,15 @@ async fn backfill_x_dms(
 
   let mut events: Vec<serde_json::Value> = Vec::new();
   let mut next_url = base_dm_url.to_string();
-  let max_pages = 5;
+  const X_DM_MAX_PAGES: usize = 50;
+  let mut pages_seen = 0usize;
 
-  for _ in 0..max_pages {
+  loop {
+    if pages_seen >= X_DM_MAX_PAGES {
+      return Err(format!("X DM pagination exceeded {X_DM_MAX_PAGES} pages before reaching cursor"));
+    }
+    pages_seen += 1;
+
     let dm_body = x_authed_get(client, &next_url, sb_url, sb_key, user_id).await?;
     let page: Vec<serde_json::Value> = dm_body.get("data")
       .and_then(|v| v.as_array())
@@ -4506,6 +4521,7 @@ async fn backfill_x_dms(
 
   let mut total_msgs = 0u32;
   let convo_count = convos.len() as u32;
+  let mut errors: Vec<String> = Vec::new();
 
   for (convo_id, msgs) in &convos {
     let other_id = match convo_other.get(convo_id) {
@@ -4621,8 +4637,12 @@ async fn backfill_x_dms(
       "backfill_x_dms",
     ).await {
       Ok(n) => total_msgs += n as u32,
-      Err(e) => err_log!("{e}"),
+      Err(e) => errors.push(e),
     }
+  }
+
+  if !errors.is_empty() {
+    return Err(errors.join("; "));
   }
 
   Ok((total_msgs, convo_count))
@@ -4942,6 +4962,7 @@ async fn backfill_imessage(
 
   let mut total_msgs = 0u32;
   let convo_count = convos.len() as u32;
+  let mut errors: Vec<String> = Vec::new();
 
   for (chat_guid, msgs) in &convos {
     let first = msgs.first().unwrap();
@@ -4998,10 +5019,22 @@ async fn backfill_imessage(
       Ok(r) if r.status().is_success() => {
         let b: serde_json::Value = r.json().await.unwrap_or_default();
         let pid = b.get("person_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if pid.is_empty() { continue; }
+        if pid.is_empty() {
+          errors.push(format!("iMessage person RPC returned empty person_id for {chat_guid}"));
+          continue;
+        }
         pid
       }
-      _ => continue,
+      Ok(r) => {
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        errors.push(format!("iMessage person RPC {status} for {chat_guid}: {body}"));
+        continue;
+      }
+      Err(e) => {
+        errors.push(format!("iMessage person RPC error for {chat_guid}: {e}"));
+        continue;
+      }
     };
 
     let mut rows_to_upsert: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
@@ -5053,8 +5086,12 @@ async fn backfill_imessage(
       "backfill_imessage",
     ).await {
       Ok(n) => total_msgs += n as u32,
-      Err(e) => err_log!("{e}"),
+      Err(e) => errors.push(e),
     }
+  }
+
+  if !errors.is_empty() {
+    return Err(errors.join("; "));
   }
 
   Ok((total_msgs, convo_count))
@@ -5312,12 +5349,29 @@ async fn open_attachment(message_id: String, attachment_id: String, channel: Opt
       return Err("Attachment not found".to_string());
     }
 
+    if let Some(len) = response.content_length() {
+      if len > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+        return Err(format!(
+          "Attachment is {:.1}MB — exceeds {}MB limit",
+          len as f64 / (1024.0 * 1024.0),
+          MAX_ATTACHMENT_DOWNLOAD_BYTES / (1024 * 1024)
+        ));
+      }
+    }
+
     let content_type = response.headers().get("content-type")
       .and_then(|v| v.to_str().ok())
       .unwrap_or("application/octet-stream")
       .to_string();
 
     let data = response.bytes().await.map_err(|e| format!("Read error: {e}"))?.to_vec();
+    if data.len() as u64 > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+      return Err(format!(
+        "Attachment is {:.1}MB — exceeds {}MB limit",
+        data.len() as f64 / (1024.0 * 1024.0),
+        MAX_ATTACHMENT_DOWNLOAD_BYTES / (1024 * 1024)
+      ));
+    }
     if data.is_empty() {
       return Err("Empty attachment".to_string());
     }

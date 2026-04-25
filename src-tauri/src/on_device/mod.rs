@@ -81,4 +81,5 @@ pub fn is_on_device_channel(channel: &str) -> bool {
 /// Keychain service label. Each secret also includes the Supabase user id
 /// and the on-device account id so multiple accounts / multiple logged-in
 /// users on the same Mac don't collide.
+#[cfg(not(debug_assertions))]
 pub(crate) const KEYCHAIN_SERVICE: &str = "com.plutioandco.convolios.on_device";

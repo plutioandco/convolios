@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,6 +81,8 @@ struct BridgeInner {
   child: Mutex<Option<Child>>,
   /// Socket path — cleaned up on shutdown.
   socket_path: PathBuf,
+  /// Set when the RPC reader exits so stale handles can be replaced.
+  closed: AtomicBool,
 }
 
 enum Outbound {
@@ -175,6 +178,7 @@ impl BridgeHandle {
       next_id: std::sync::atomic::AtomicU64::new(1),
       child: Mutex::new(Some(child)),
       socket_path: socket_path.clone(),
+      closed: AtomicBool::new(false),
     });
 
     // Writer task: drains outbound queue onto the socket.
@@ -249,6 +253,10 @@ impl BridgeHandle {
   pub async fn set_user_id(&self, id: String) {
     let mut guard = self.inner.user_id.lock().await;
     *guard = id;
+  }
+
+  pub fn is_closed(&self) -> bool {
+    self.inner.closed.load(Ordering::SeqCst)
   }
 
   #[allow(dead_code)]
@@ -447,6 +455,7 @@ async fn reader_task<R>(
   }
 
   // Socket closed — drop all pending waiters with an error.
+  inner.closed.store(true, Ordering::SeqCst);
   let mut pending = inner.pending.lock().await;
   for (_, tx) in pending.drain() {
     let _ = tx.send(RpcResponse {

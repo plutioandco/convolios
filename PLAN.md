@@ -165,6 +165,29 @@ Before a meeting with a person:
 
 ## Risks & Mitigations
 
+### Reliability Hardening
+
+Current focus: make the inbox resilient to missed webhooks, transient Supabase write failures, sleep/wake gaps, and provider-side sync delays.
+
+Completed in this hardening pass:
+- Unipile backfill no longer marks a chat history as complete when message writes fail.
+- `sync_chat` uses the same 2-hour self-heal overlap as `startup_sync`.
+- iMessage polling no longer advances the local rowid watermark when Supabase persistence fails.
+- X DM sync runs beyond first launch through the focused heartbeat and fails loudly if pagination cannot reach the cursor.
+- Webhook mutation events scope message updates by resolved `user_id`, matching the `(user_id, external_id)` database uniqueness model.
+- On-device bridge handles can be replaced after the sidecar RPC reader closes.
+- Thread preview enrichment now reads TanStack infinite-query cache using `pages`.
+- Thread query failures surface through the section error boundary instead of looking like empty threads.
+- Attachment open/download paths share the 200 MB guard.
+
+Still required before declaring realtime fully verified:
+- Implement or explicitly gate Meta on-device outbound send until `meta-bridge` supports `SendMessage`.
+- Replay real Unipile webhook events for message insert/update/read/delete/mail-moved idempotency.
+- Simulate Supabase write failure during iMessage and Unipile backfill to confirm retry behavior.
+- Verify X DM heartbeat sync with a live account and enough pagination to cross the cursor.
+- Kill and restart the Meta sidecar during a session to confirm stale handles are replaced.
+- Sleep/wake the app and verify realtime reconnect plus catch-up sync.
+
 ### WhatsApp Ban Risk
 Unipile uses WhatsApp Web protocol (unofficial). Meta's ToS prohibits third-party clients.
 - **Reality:** Beeper ran 200k+ users for years with minimal bans

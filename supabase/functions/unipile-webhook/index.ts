@@ -84,6 +84,13 @@ function resolveAccount(accountId: string) {
     .maybeSingle();
 }
 
+async function resolveWebhookAccount(payload: Record<string, unknown>) {
+  const accountId = (payload.account_id ?? "") as string;
+  if (!accountId) return null;
+  const { data } = await resolveAccount(accountId);
+  return data;
+}
+
 // On-device accounts are always scoped to the authenticated JWT user — never
 // match by account_id alone, which would let one user ingest into another's
 // account if they guessed the id. `provider` is enforced so the Unipile and
@@ -272,10 +279,18 @@ function resolveSenderDirection(
 
 async function handleMessageReceived(payload: UnipileWebhook): Promise<Response> {
   const channel = CHANNEL_MAP[payload.account_type] ?? payload.account_type.toLowerCase();
+  const accountResult = await resolveAccount(payload.account_id);
+  const account = accountResult.data;
+  if (!account) {
+    log.error("No connected account found", { account_id: payload.account_id });
+    return jsonResponse({ ok: false, error: "unknown_account" }, 400);
+  }
+  const userId = account.user_id;
 
   const { data: existing } = await supabase
     .from("messages")
     .select("id")
+    .eq("user_id", userId)
     .eq("external_id", payload.message_id)
     .maybeSingle();
 
@@ -296,19 +311,10 @@ async function handleMessageReceived(payload: UnipileWebhook): Promise<Response>
     return jsonResponse({ ok: true, skipped: "already_persisted" });
   }
 
-  const [chatInfo, accountResult, fullMsg] = await Promise.all([
+  const [chatInfo, fullMsg] = await Promise.all([
     fetchChatInfo(payload.chat_id),
-    resolveAccount(payload.account_id),
     fetchFullMessage(payload.message_id),
   ]);
-
-  const account = accountResult.data;
-  if (!account) {
-    log.error("No connected account found", { account_id: payload.account_id });
-    return jsonResponse({ ok: false, error: "unknown_account" }, 400);
-  }
-
-  const userId = account.user_id;
   const isGroup = chatInfo.isGroup || (payload.attendees?.length ?? 0) >= 3;
 
   const threadLookup = await resolvePersonFromThread(userId, payload.chat_id);
@@ -899,6 +905,8 @@ async function handleEmailEvent(payload: Record<string, unknown>): Promise<Respo
 async function handleMessageReaction(payload: Record<string, unknown>): Promise<Response> {
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   // GET /messages/{id} is the source of truth — the webhook event may lose
   // reactions that were merged server-side before we processed it.
@@ -909,6 +917,7 @@ async function handleMessageReaction(payload: Record<string, unknown>): Promise<
   const { error } = await supabase
     .from("messages")
     .update({ reactions })
+    .eq("user_id", account.user_id)
     .eq("external_id", messageId);
 
   if (error) {
@@ -925,25 +934,35 @@ async function handleMessageRead(payload: Record<string, unknown>): Promise<Resp
   const messageId = (payload.message_id ?? "") as string;
   const chatId = (payload.chat_id ?? "") as string;
   const accountId = (payload.account_id ?? "") as string;
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   if (messageId) {
-    await supabase
+    const { error } = await supabase
       .from("messages")
       .update({ seen: true })
+      .eq("user_id", account.user_id)
       .eq("external_id", messageId);
+    if (error) {
+      log.error("Read update error", { error: error.message });
+      return jsonResponse({ ok: false, error: "read_update_failed" }, 500);
+    }
   } else if (chatId) {
-    await supabase
+    const { error } = await supabase
       .from("messages")
       .update({ seen: true })
+      .eq("user_id", account.user_id)
       .eq("thread_id", chatId)
       .eq("direction", "outbound")
       .eq("seen", false);
+    if (error) {
+      log.error("Read thread update error", { error: error.message });
+      return jsonResponse({ ok: false, error: "read_update_failed" }, 500);
+    }
   }
 
   if (chatId && accountId) {
-    const { data: account } = await resolveAccount(accountId);
-    if (account) {
-      const threadPerson = await resolvePersonFromThread(account.user_id, chatId);
+    const threadPerson = await resolvePersonFromThread(account.user_id, chatId);
       const personId = threadPerson?.person_id;
 
       if (personId) {
@@ -963,7 +982,6 @@ async function handleMessageRead(payload: Record<string, unknown>): Promise<Resp
           .eq("direction", "inbound")
           .is("read_at", null);
       }
-    }
   }
 
   return jsonResponse({ ok: true, event: "read" });
@@ -972,6 +990,8 @@ async function handleMessageRead(payload: Record<string, unknown>): Promise<Resp
 async function handleMessageEdited(payload: Record<string, unknown>): Promise<Response> {
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   // Refetch the full message — the webhook payload's body may lag server state
   // if multiple edits coalesced.
@@ -984,6 +1004,7 @@ async function handleMessageEdited(payload: Record<string, unknown>): Promise<Re
   const { error } = await supabase
     .from("messages")
     .update(update)
+    .eq("user_id", account.user_id)
     .eq("external_id", messageId);
 
   if (error) {
@@ -999,10 +1020,13 @@ async function handleMessageEdited(payload: Record<string, unknown>): Promise<Re
 async function handleMessageDeleted(payload: Record<string, unknown>): Promise<Response> {
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   const { error } = await supabase
     .from("messages")
     .update({ deleted: true, deleted_at: new Date().toISOString() })
+    .eq("user_id", account.user_id)
     .eq("external_id", messageId);
 
   if (error) {
@@ -1016,6 +1040,8 @@ async function handleMessageDeleted(payload: Record<string, unknown>): Promise<R
 async function handleMessageDelivered(payload: Record<string, unknown>): Promise<Response> {
   const messageId = (payload.message_id ?? "") as string;
   if (!messageId) return jsonResponse({ ok: true, skipped: "no_message_id" });
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   // Refetch for the authoritative delivered/seen snapshot — in some channels
   // the delivered and seen flags land within milliseconds of each other and
@@ -1030,12 +1056,14 @@ async function handleMessageDelivered(payload: Record<string, unknown>): Promise
   const { error } = await supabase
     .from("messages")
     .update(update)
+    .eq("user_id", account.user_id)
     .eq("external_id", messageId);
 
   if (error) {
     log.error("Delivered update error", {
       code: error.code, message: error.message, details: error.details,
     });
+    return jsonResponse({ ok: false, error: "delivered_update_failed" }, 500);
   }
 
   return jsonResponse({ ok: true, event: "delivered" });
@@ -1044,6 +1072,8 @@ async function handleMessageDelivered(payload: Record<string, unknown>): Promise
 async function handleMailMoved(payload: Record<string, unknown>): Promise<Response> {
   const emailId = (payload.email_id ?? payload.message_id ?? "") as string;
   if (!emailId) return jsonResponse({ ok: true, skipped: "no_email_id" });
+  const account = await resolveWebhookAccount(payload);
+  if (!account) return jsonResponse({ ok: false, error: "unknown_account" }, 400);
 
   const folder = (payload.folder ?? payload.destination ?? "") as string;
   const update: Record<string, unknown> = {};
@@ -1073,10 +1103,15 @@ async function handleMailMoved(payload: Record<string, unknown>): Promise<Respon
   }
 
   if (Object.keys(update).length > 0) {
-    await supabase
+    const { error } = await supabase
       .from("messages")
       .update(update)
+      .eq("user_id", account.user_id)
       .eq("external_id", emailId);
+    if (error) {
+      log.error("mail_moved update error", { error: error.message });
+      return jsonResponse({ ok: false, error: "mail_moved_update_failed" }, 500);
+    }
   }
 
   return jsonResponse({ ok: true, event: "mail_moved" });

@@ -25,7 +25,7 @@ Convolios unifies those channels by person. One row in `persons` per human; many
 - **AI triage** — Gemini classifies inbound messages as `urgent | human | newsletter | notification | noise | unclassified`.
 - **Flagging / starred emails** — mark important messages; star status is synced with the provider for Gmail and Outlook (folder = `STARRED` / `FLAGGED`).
 - **Read-status sync** — opening or replying to a conversation can mark it read on WhatsApp and LinkedIn (toggleable in Preferences).
-- **Realtime + fallback polling** — Supabase Realtime drives live updates; an 8-second polling loop kicks in if the socket dies, with a 2-minute heartbeat that forces a reconnect if no events arrive.
+- **Realtime + fallback polling** — Supabase Realtime drives live updates; React Query polls every 15s when realtime is down and every 60s for list/count safety nets when healthy.
 
 ---
 
